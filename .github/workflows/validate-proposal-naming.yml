@@ -5,7 +5,7 @@ permissions:
 on:
   pull_request:
     paths:
-      - '**'
+      - 'rfcs/**'
     types: [opened, synchronize]
   workflow_dispatch:
     inputs:
@@ -37,8 +37,8 @@ jobs:
 
       - name: Validate proposal naming
         run: |
-          # Get the list of NEW files added (not modifications to existing files)
-          CHANGED_FILES=$(git diff --name-only --diff-filter=A origin/${{ github.base_ref }}...HEAD | grep '^THV-' || true)
+          # Get the list of NEW files added in rfcs/ (not modifications to existing files)
+          CHANGED_FILES=$(git diff --name-only --diff-filter=A origin/${{ github.base_ref }}...HEAD | grep '^rfcs/' || true)
 
           # Skip validation if no new proposal files are being added
           # (modifications to existing proposals don't need naming validation)
