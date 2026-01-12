@@ -1,4 +1,4 @@
-# RFC: Dynamic Webhook Middleware for ToolHive
+# RFC-0017: Dynamic Webhook Middleware for ToolHive
 
 > **Note**: This was originally [THV-2300](https://github.com/stacklok/toolhive/pull/2300) in the toolhive repository.
 
