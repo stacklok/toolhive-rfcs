@@ -41,13 +41,13 @@ This RFC repository serves the entire ToolHive ecosystem, including but not limi
 
 ### 1. Pre-RFC Discussion (Optional)
 
-Before writing a full RFC, consider opening a [GitHub Discussion](https://github.com/stacklok/toolhive-rfcs/discussions) to gather initial feedback on your idea. This can help refine the proposal before investing time in a full RFC.
+Before writing a full RFC, consider opening a thread on [Discord](https://discord.gg/stacklok) to gather initial feedback on your idea. This can help refine the proposal before investing time in a full RFC.
 
 ### 2. Create the RFC
 
 1. Fork this repository
 2. Copy `rfcs/0000-template.md` to `rfcs/XXXX-descriptive-name.md`
-   - Use the next available RFC number (check existing RFCs)
+   - Use the next available Pull Request number for your RFC (check existing RFCs)
    - Use a short, descriptive name with hyphens
 3. Fill in the RFC template
 4. Submit a Pull Request
@@ -76,7 +76,7 @@ Once accepted, the RFC can be implemented. The RFC should be updated with:
 
 ## RFC Numbering
 
-RFCs are numbered sequentially (0001, 0002, etc.). When creating a new RFC, check the existing RFCs and use the next available number.
+RFCs are numbered based on the PR numbers, so they are incremental, but not necessarily sequential (0001, 0002, 0004, etc.). When creating a new RFC, check the existing RFCs and use the next available number. A CI task will ensure you're using the right number.
 
 For RFCs that originate from issues in specific repositories, you may reference the issue number in the RFC (e.g., "This RFC addresses toolhive#1234").
 
