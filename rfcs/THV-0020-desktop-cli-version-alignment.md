@@ -1,4 +1,4 @@
-# RFC-0019: CLI and Desktop App Version Alignment
+# CLI and Desktop App Version Alignment
 
 - **Status**: Draft
 - **Author(s)**: @samuv
