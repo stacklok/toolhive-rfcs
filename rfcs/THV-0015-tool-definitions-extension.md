@@ -1,4 +1,4 @@
-# RFC: Add Tool Definitions to Publisher Extensions
+# RFC-0015: Add Tool Definitions to Publisher Extensions
 
 > **Note**: This was originally [THV-2733](https://github.com/stacklok/toolhive/pull/2733) in the toolhive repository.
 
