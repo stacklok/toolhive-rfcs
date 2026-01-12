@@ -1,4 +1,4 @@
-# RFC: Shared Key Authentication for Local MCP Servers
+# RFC-0016: Shared Key Authentication for Local MCP Servers
 
 > **Note**: This was originally [THV-2570](https://github.com/stacklok/toolhive/pull/2570) in the toolhive repository.
 
