@@ -10,7 +10,7 @@ should help you get started.
 - [Code of conduct](#code-of-conduct)
 - [Reporting security vulnerabilities](#reporting-security-vulnerabilities)
 - [How to contribute](#how-to-contribute)
-  - [Using GitHub Issues and Discussions](#using-github-issues-and-discussions)
+  - [Using Discord Threads](#using-github-issues-and-discussions)
   - [Not sure how to start contributing?](#not-sure-how-to-start-contributing)
   - [RFC submission process](#rfc-submission-process)
   - [RFC file naming format](#rfc-file-naming-format)
@@ -35,11 +35,15 @@ follow this
 
 ## How to contribute
 
-### Using GitHub Issues and Discussions
+### Using Discord Threads
 
-We use GitHub Discussions for RFC ideas and general design conversations. If you
-have an idea for a significant change but aren't sure if it warrants an RFC,
-start a discussion first.
+You can reach out to the team using [Discord](https://discord.gg/stacklok),
+which we use for all our interactions with users and contributors, and also
+for RFC ideas and general design conversations. To avoid confusion, we
+recommend using Discord threads, this will make easier to follow conversations.
+
+If you have an idea for a significant change but aren't sure if it warrants an
+RFC, start a thread first.
 
 GitHub Issues in this repository are used to track RFC status and any
 meta-discussions about the RFC process itself.
@@ -52,18 +56,17 @@ For general usage questions about ToolHive, please ask in
 If you're new to the RFC process:
 
 1. Read through existing RFCs to understand the format and level of detail expected
-2. Start with a GitHub Discussion to validate your idea
+2. Start with a thread on [Discord](https://discord.gg/stacklok) to validate your idea
 3. Review the [RFC template](rfcs/0000-template.md) to understand what sections are required
-4. Reach out on [Discord](https://discord.gg/stacklok) if you have questions
 
 ### RFC submission process
 
-1. **Start a discussion (optional but recommended)**: Open a GitHub Discussion
+1. **Start a thread (optional but recommended)**: Open a thread on Discord
    to gather initial feedback on your idea before investing time in a full RFC.
 
 2. **Fork and create your RFC**:
    - Fork this repository to your own GitHub account
-   - Copy `rfcs/0000-template.md` to `rfcs/XXXX-descriptive-name.md`
+   - Copy `rfcs/0000-template.md` to `rfcs/THV-XXXX-descriptive-name.md`
    - Use the next available RFC number (check existing RFCs)
    - Fill in all required sections of the template
 
@@ -89,17 +92,19 @@ If you're new to the RFC process:
 All RFC files must follow this naming pattern:
 
 ```
-{NUMBER}-{descriptive-name}.md
+THV-{NUMBER}-{descriptive-name}.md
 ```
 
 Where:
-- `{NUMBER}` is a four-digit sequential number (e.g., 0001, 0002)
+- `{NUMBER}` is a four-digit sequential number that must be equal to the PR number (e.g., 0001, 0002)
 - `{descriptive-name}` is a short description in kebab-case
 
 #### Examples of valid RFC names:
-- `0001-token-exchange-middleware.md`
-- `0002-kubernetes-crd-improvements.md`
-- `0003-registry-api-v2.md`
+- `THV-0001-token-exchange-middleware.md`
+- `THV-0002-kubernetes-crd-improvements.md`
+- `THV-0003-registry-api-v2.md`
+
+A CI job will make sure you're following the right numbering.
 
 ### RFC content guidelines
 
