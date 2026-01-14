@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: @ptelang, @therealnb, @aponcedeleonch
 - **Created**: 2026-01-13
-- **Last Updated**: 2026-01-13
+- **Last Updated**: 2026-01-14
 - **Target Repository**: toolhive
 - **Related Issues**:
 
@@ -118,8 +118,8 @@ type FindToolOutput struct {
 }
 
 type ToolMatch struct {
-    Name        string                 `json:"name"`
-    BackendID   string                 `json:"backend_id"`
+    Name        string                 `json:"name"`        // Resolved tool name (e.g., "backend_fetch")
+    BackendID   string                 `json:"backend_id"`  // Informational: source backend for display purposes
     Description string                 `json:"description"`
     Parameters  map[string]interface{} `json:"parameters"`
     Score       float64                `json:"score"`
@@ -134,18 +134,19 @@ type TokenMetrics struct {
 
 **optim.call_tool**
 
-Purpose: Dynamic invocation of any tool on any backend server.
+Purpose: Dynamic invocation of any tool discovered via `find_tool`.
 
 ```go
 // Input parameters
 type CallToolInput struct {
-    BackendID  string                 `json:"backend_id"`  // From find_tool results
-    ToolName   string                 `json:"tool_name"`
+    ToolName   string                 `json:"tool_name"`   // Resolved tool name from find_tool (e.g., "backend_fetch")
     Parameters map[string]interface{} `json:"parameters"`
 }
 
 // Output: Standard MCP CallToolResult
 ```
+
+> **Note:** The `tool_name` parameter expects the resolved tool name as returned by `find_tool`. When using the default prefix conflict resolution strategy, tool names include the backend prefix (e.g., `backend_fetch`). The router uses this name to resolve the correct backend via the existing `RoutingTable`.
 
 #### Request Flow
 
@@ -180,12 +181,12 @@ sequenceDiagram
     participant R as Router
     participant B as Backend
 
-    C->>V: tools/call {name: "optim.call_tool", args}
+    C->>V: tools/call {name: "optim.call_tool", args: {tool_name: "backend_fetch", ...}}
     V->>CT: Execute optimizer tool
-    CT->>CT: Validate backend + tool exist
-    CT->>R: Route to specified backend
-    R-->>CT: BackendTarget
-    CT->>B: Forward request
+    CT->>R: Route tool by name
+    R->>R: Lookup in RoutingTable.Tools
+    R-->>CT: BackendTarget (includes original tool name)
+    CT->>B: Forward request with original tool name
     B-->>CT: Result
     CT-->>V: Wrap result
     V-->>C: Return result
@@ -317,13 +318,13 @@ This design fully reuses vMCP's existing two-boundary authentication model witho
 ### Input Validation
 
 **User Input:**
-- `tool_description`: Free-text search query
-- `tool_keywords`: Space-separated keywords
-- `backend_id`, `tool_name`, `parameters`: Validated against known backends and tools
+- `tool_description`: Free-text search query (for `find_tool`)
+- `tool_keywords`: Space-separated keywords (for `find_tool`)
+- `tool_name`, `parameters`: Tool name and arguments (for `call_tool`)
 
 **Validation:**
 - Input length limits enforced
-- Backend and tool names validated against session capabilities
+- Tool names validated against session routing table
 - Parameters validated against tool schema before invocation
 
 ### Secrets Management
@@ -439,6 +440,7 @@ This design fully reuses vMCP's existing two-boundary authentication model witho
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-01-13 | | Draft | Initial submission |
+| 2026-01-14 | | Draft | Updated based on @jerm-dro feedback |
 
 ### Implementation Tracking
 
