@@ -1,4 +1,4 @@
-# RFC-XXXX: CRD v1beta1 Optimization and Configuration Extraction
+# RFC-0023: CRD v1beta1 Optimization and Configuration Extraction
 
 - **Status**: Draft
 - **Author(s)**: ToolHive Team
