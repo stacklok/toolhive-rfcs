@@ -219,13 +219,20 @@ spec:
     enabled: true
     storage:
       type: sqlite
-      persistentVolumeClaim: vmcp-optimizer-db
     embeddings:
       provider: tei
       tei:
         endpoint: http://tei-service.default.svc.cluster.local:8080
         model: BAAI/bge-small-en-v1.5
 ```
+
+**Storage Architecture:**
+
+The initial implementation uses **ephemeral storage (`emptyDir`)** for each vMCP replica. This design ensures a 1:1 relationship between the vMCP process and its SQLite database, avoiding the complexity of concurrent database access across replicas.
+
+The SQLite database stores tool embeddings as a **regenerable cache**, not persistent state. Embeddings are derived from backend tool descriptions fetched during session initialization and can be regenerated on-demand. On pod restart, the first session will incur a cold-start latency while embeddings are regenerated.
+
+**Extensibility:** The storage layer will be implemented behind an interface to allow future extension to a shared PostgreSQL backend if the overhead of per-replica ephemeral databases becomes a bottleneck at scale.
 
 #### Data Model Changes
 
@@ -312,7 +319,7 @@ This design fully reuses vMCP's existing two-boundary authentication model witho
 - Query embeddings (transient, not persisted)
 
 **Protection Measures:**
-- SQLite database stored on persistent volume with appropriate file permissions
+- SQLite database stored on ephemeral volume (`emptyDir`) with appropriate file permissions; data is regenerable and non-sensitive
 - No sensitive data transmitted to embedding service (only tool descriptions)
 
 ### Input Validation
@@ -441,9 +448,12 @@ This design fully reuses vMCP's existing two-boundary authentication model witho
 |------|----------|----------|-------|
 | 2026-01-13 | | Draft | Initial submission |
 | 2026-01-14 | | Draft | Updated based on @jerm-dro feedback |
+| 2026-01-14 | | Draft | Updated based on @JAORMX feedback |
 
 ### Implementation Tracking
 
 | Repository | PR | Status |
 |------------|-----|--------|
-| toolhive | 22 | Pending |
+| toolhive | 3253 | Draft |
+| toolhive | 3280 | Draft |
+| toolhive | 3282 | Draft |
