@@ -127,6 +127,7 @@ sequenceDiagram
     }
   },
   "mcp_request": {
+    "mcp_version": "2024-11-05",
     "method": "tools/call",
     "resource_id": "database_query",
     "arguments": {
@@ -135,13 +136,21 @@ sequenceDiagram
     }
   },
   "context": {
-    "server_name": "postgres-mcp",
+    "server_name": "my-vmcp-instance",
+    "backend_server": "postgres-mcp",
     "namespace": "production",
     "source_ip": "192.0.2.1",
     "transport": "sse"
   }
 }
 ```
+
+> **Context Fields**:
+> - `server_name`: The ToolHive/vMCP instance name handling the request
+> - `backend_server`: (Optional) The actual MCP server being proxied, when using vMCP
+> - `namespace`: Kubernetes namespace (if applicable)
+> - `source_ip`: Client IP address
+> - `transport`: Connection transport type (sse, stdio, etc.)
 
 **Validating Webhook Response** (200 OK with JSON body):
 ```json
@@ -180,20 +189,25 @@ sequenceDiagram
     "name": "John Doe",
     "groups": ["engineering"]
   },
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "database_query",
-    "arguments": {
-      "query": "SELECT * FROM users",
-      "database": "production"
+  "mcp_request": {
+    "mcp_version": "2024-11-05",
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "database_query",
+      "arguments": {
+        "query": "SELECT * FROM users",
+        "database": "production"
+      }
     }
   },
   "context": {
-    "server_name": "postgres-mcp",
+    "server_name": "my-vmcp-instance",
+    "backend_server": "postgres-mcp",
     "namespace": "production",
-    "source_ip": "192.0.2.1"
+    "source_ip": "192.0.2.1",
+    "transport": "sse"
   }
 }
 ```
@@ -208,17 +222,19 @@ sequenceDiagram
   "patch": [
     {
       "op": "add",
-      "path": "/params/arguments/audit_user",
+      "path": "/mcp_request/params/arguments/audit_user",
       "value": "user@example.com"
     },
     {
       "op": "add",
-      "path": "/params/arguments/department",
+      "path": "/mcp_request/params/arguments/department",
       "value": "engineering"
     }
   ]
 }
 ```
+
+> **Note**: Mutation patches are scoped to the `mcp_request` container. This prevents accidental or malicious modification of `principal`, `context`, or other immutable fields.
 
 #### Failure Modes
 
@@ -268,6 +284,9 @@ validating_webhooks:
     url: https://policy.company.com/validate
     failure_policy: fail  # or "ignore"
     timeout: 5s
+    signing_secret_ref:
+      name: webhook-signing-secret
+      key: hmac-key
     ca_bundle: |
       -----BEGIN CERTIFICATE-----
       ...
@@ -320,6 +339,9 @@ spec:
   url: https://policy.company.com/validate
   failure_policy: fail  # or "ignore"
   timeout: 5s
+  signing_secret_ref:
+    secret_name: webhook-signing-secret
+    key: hmac-key
   client_cert_ref:
     secret_name: webhook-mtls-cert
     cert_key: tls.crt
@@ -350,6 +372,20 @@ Webhook requests contain sensitive information:
 - **TLS/HTTPS**: Required for all webhook endpoints
 - **mTLS**: Optional client certificates for mutual authentication
 - **Bearer Token**: ToolHive can send bearer token in `Authorization` header
+
+**Payload Signing (Recommended)**:
+- ToolHive can sign webhook payloads using HMAC-SHA256
+- Signature sent in `X-ToolHive-Signature` header
+- Webhooks should verify signatures to ensure payload integrity
+- Shared secret configured per-webhook via secret reference
+
+Example headers:
+```
+X-ToolHive-Signature: sha256=abc123...
+X-ToolHive-Timestamp: 1698057000
+```
+
+> **Note**: While mTLS authenticates the connection, payload signing provides defense-in-depth by proving the payload originated from ToolHive and wasn't tampered with. This is especially important if webhook endpoints are reachable by other internal services.
 
 **ToolHive Authorization**:
 - Webhooks run after authentication middleware (principal is validated)
@@ -455,6 +491,7 @@ Log webhook invocations to ToolHive audit log:
 - Validating webhook support with fail-closed/fail-open
 - Mutating webhook support with JSONPatch
 - Multiple webhook instances support
+- Optional HMAC payload signing (`X-ToolHive-Signature` header)
 - CLI flags for webhook configuration
 - RunConfig webhook fields
 - Basic metrics and audit logging
@@ -467,7 +504,6 @@ Log webhook invocations to ToolHive audit log:
 - E2E tests for Kubernetes deployments
 
 ### Phase 3: Advanced Features
-- HMAC signature verification
 - Request field filtering (security)
 - Full request mutation support
 - Circuit breaker pattern
