@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: @samuv
 - **Created**: 2025-01-12
-- **Last Updated**: 2025-01-12
+- **Last Updated**: 2026-01-19
 - **Target Repository**: multiple (toolhive, toolhive-studio)
 - **Related Issues**: [toolhive-studio#1399](https://github.com/stacklok/toolhive-studio/issues/1399)
 
@@ -115,12 +115,26 @@ This RFC builds the foundation. Once compatibility guarantees exist, we can rela
 
 ### Design Principles
 
-1. **Desktop always uses its bundled CLI version** internally and installs that same version for terminal access
+1. **Desktop always uses its bundled CLI version** internally and symlinks to it for terminal access
 2. **Desktop never modifies external installations** (Homebrew, manual) directly, but shadows them in PATH
 3. **CLI binary is bundled** inside Desktop app — no network required for installation
-4. **Atomic upgrades** prevent corruption during version changes
-5. **Validation on every launch** ensures CLI state is correct
+4. **Symlink approach** provides automatic upgrades when Desktop upgrades (macOS/Linux); Windows uses copy fallback
+5. **Validation on every launch** ensures symlink state is correct
 6. **Clear user communication** about what's happening and why
+
+### Tradeoffs (Symlink Approach)
+
+| Benefit | Tradeoff |
+|---------|----------|
+| Automatic CLI upgrades when Desktop upgrades | CLI breaks if Desktop is moved or deleted |
+| No checksum verification needed | Must handle broken symlink scenarios |
+| Simpler installation logic | Windows requires copy fallback (no symlink support without admin) |
+| No binary duplication | Uninstall must clean up symlink or leave it broken |
+
+**Mitigations:**
+- Desktop detects broken symlinks and offers recovery options
+- Explicit uninstall flow cleans up symlink
+- Windows uses copy approach, so CLI persists after Desktop removal
 
 ### High-Level Design
 
@@ -131,24 +145,24 @@ flowchart TD
     B -->|Direct Download| C[Desktop App Installed]
     B -->|Homebrew Cask| C
     B -->|Winget| C
+    B -->|Any Linux PM| C
     
     C --> D[First Launch]
     D --> E{Detect Existing CLI}
     
-    E -->|No CLI found| F[Install CLI to ~/.toolhive/bin]
-    E -->|Desktop CLI found| G[Validate Version]
-    E -->|External CLI found| H[Show Conflict Dialog]
-    
-    G -->|Version matches| I[Ready]
-    G -->|Version mismatch| J[Upgrade CLI]
+    E -->|No CLI found| F[Create symlink to bundled CLI]
+    E -->|External CLI found| H[Show conflict dialog]
+    E -->|Desktop symlink found| G[Validate Symlink]
     
     H -->|User: Install Desktop CLI| F
-    H -->|User: Skip| K[Warn and Continue]
+    
+    G -->|Symlink valid| I[Ready]
+    G -->|Symlink broken| J[Repair symlink]
     
     F --> L[Configure PATH]
-    J --> L
+    J --> I
     L --> I
-    K --> I
+
 ```
 
 **Key insight:** Package managers (Homebrew, Winget) distribute the Desktop app, but Desktop owns CLI installation regardless of how Desktop was installed. Package managers cannot guarantee exact versions, so Desktop must handle this itself.
@@ -183,16 +197,24 @@ function onDesktopLaunch(): void {
     
     if (marker) {
         if (marker.source === "desktop") {
-            const binary = checkBinary("~/.toolhive/bin/thv");
-            if (!binary) {
-                return reinstallCli();
+            const symlink = checkSymlink("~/.toolhive/bin/thv");
+            
+            if (!symlink) {
+                // Symlink was deleted
+                return recreateSymlink();
             }
-            if (binary.checksum !== marker.checksum) {
-                return warnCorruption({ offerReinstall: true });
+            
+            if (!symlink.targetExists) {
+                // Broken symlink - Desktop was moved or deleted
+                return showBrokenSymlinkDialog();
             }
-            if (binary.version !== bundledVersion) {
-                return upgradeCli();
+            
+            if (symlink.target !== getExpectedTarget()) {
+                // Symlink points to wrong location (Desktop was moved)
+                return updateSymlinkTarget();
             }
+            
+            // Symlink valid and points to current Desktop bundle
             return ready();
         } else {
             // Unexpected state, re-run detection
@@ -201,6 +223,17 @@ function onDesktopLaunch(): void {
     } else {
         return runFirstLaunchFlow();
     }
+}
+
+function checkSymlink(path: string): SymlinkInfo | null {
+    if (!isSymlink(path)) return null;
+    
+    const target = readSymlinkTarget(path);
+    return {
+        path,
+        target,
+        targetExists: fileExists(target)
+    };
 }
 ```
 
@@ -218,23 +251,20 @@ flowchart LR
 ```
 
 **Actions:**
-1. Copy bundled CLI to `~/.toolhive/bin/thv.new`
-2. Verify checksum of copied binary
-3. Atomic rename: `thv.new` → `thv`
-4. Add `~/.toolhive/bin` to PATH via shell RC files
-5. Create marker file with version and checksum
+1. Create symlink: `~/.toolhive/bin/thv` → `<Desktop.app>/Contents/Resources/bin/<arch>/thv`
+2. Add `~/.toolhive/bin` to PATH via shell RC files
+3. Create marker file with symlink target path
 
 #### Scenario B: Existing Desktop-Managed CLI
 
 Desktop detects marker file indicating it owns the CLI.
 
-**If version matches:** Ready, no action needed.
+**If symlink valid:** Ready, no action needed. The symlink points to the bundled binary, so upgrades are automatic when Desktop upgrades.
 
-**If version mismatch (Desktop upgraded):**
-1. Copy new bundled CLI to `~/.toolhive/bin/thv.new`
-2. Verify checksum
-3. Atomic rename: `thv.new` → `thv`
-4. Update marker file
+**If symlink target changed (Desktop moved):**
+1. Detect symlink points to old/invalid path
+2. Update symlink to point to new Desktop location
+3. Update marker file with new target path
 
 #### Scenario C: Existing External CLI (Homebrew/Manual)
 
@@ -278,28 +308,31 @@ Desktop detects CLI at Homebrew or other external path, no Desktop marker.
 - Show warning banner in Desktop (dismissible)
 - Do not prompt again unless user requests from Settings
 
-#### Scenario D: CLI Binary Missing (Was Deleted)
+#### Scenario D: Symlink Missing (Was Deleted)
 
-Desktop finds marker file but binary is missing.
+Desktop finds marker file but symlink is missing.
 
-**Action:** Reinstall CLI automatically, notify user:
+**Action:** Recreate symlink automatically, notify user:
 ```
-"CLI was missing and has been reinstalled."
+"CLI symlink was missing and has been recreated."
 ```
 
-#### Scenario E: CLI Binary Corrupted
+#### Scenario E: Broken Symlink (Desktop Moved/Deleted)
 
-Desktop finds marker file, binary exists, but checksum doesn't match.
+Desktop finds marker file, symlink exists, but target is invalid (Desktop app was moved or deleted).
 
-**Action:** Show warning, offer reinstall:
+**Action:** Show warning with recovery options:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  ⚠ CLI Installation Issue                                       │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  The CLI binary appears to be corrupted or was modified.        │
+│  The CLI symlink points to a location that no longer exists.    │
+│  This usually happens if ToolHive Studio was moved or deleted.  │
 │                                                                 │
-│  [Reinstall CLI]  [Continue Anyway]  [Open Settings]            │
+│  Expected: /Applications/ToolHive Studio.app                    │
+│                                                                 │
+│  [Locate App]  [Remove Symlink]  [Open Settings]                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -323,11 +356,27 @@ User has Desktop CLI installed, then runs `brew install toolhive`.
 
 **Location:** `~/.toolhive/.cli-source`
 
-**Schema:**
+**Schema (macOS/Linux — symlink):**
 ```json
 {
   "schema_version": 1,
   "source": "desktop",
+  "install_method": "symlink",
+  "cli_version": "0.5.1",
+  "symlink_target": "/Applications/ToolHive Studio.app/Contents/Resources/bin/darwin-arm64/thv",
+  "installed_at": "2025-01-09T10:30:00Z",
+  "desktop_version": "1.2.0",
+  "user_skipped": false,
+  "skip_warning_dismissed": false
+}
+```
+
+**Schema (Windows — copy):**
+```json
+{
+  "schema_version": 1,
+  "source": "desktop",
+  "install_method": "copy",
   "cli_version": "0.5.1",
   "cli_checksum": "sha256:abc123...",
   "installed_at": "2025-01-09T10:30:00Z",
@@ -337,17 +386,37 @@ User has Desktop CLI installed, then runs `brew install toolhive`.
 }
 ```
 
+**Field descriptions:**
+- `install_method`: Either `"symlink"` (macOS/Linux) or `"copy"` (Windows)
+- `symlink_target`: Absolute path to bundled CLI (only for symlink method)
+- `cli_checksum`: SHA256 of copied binary (only for copy method)
+
 **Permissions:** `0600` (user read/write only)
 
 ### Component 4: PATH Configuration
 
-**Installation location (no elevation required):**
+**Symlink locations and targets:**
 
-| Platform | CLI Location | PATH Modification |
-|----------|--------------|-------------------|
-| macOS | `~/.toolhive/bin/thv` | Prepend to `.zshrc`, `.bashrc`, `.config/fish/config.fish` |
-| Linux | `~/.toolhive/bin/thv` | Prepend to `.bashrc`, `.profile`, `.config/fish/config.fish` |
-| Windows | `%LOCALAPPDATA%\ToolHive\bin\thv.exe` | Prepend to User PATH environment variable |
+| Platform | Symlink Location | Symlink Target | Install Method |
+|----------|------------------|----------------|----------------|
+| macOS | `~/.toolhive/bin/thv` | `/Applications/ToolHive Studio.app/Contents/Resources/bin/<arch>/thv` | Symlink |
+| Linux | `~/.toolhive/bin/thv` | `<AppImage or install path>/resources/bin/<arch>/thv` | Symlink |
+| Windows | `%LOCALAPPDATA%\ToolHive\bin\thv.exe` | N/A (copy from app bundle) | Copy |
+
+**Architecture folder naming:** The `<arch>` folder uses the format `<os>-<cpu>`:
+- macOS: `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel)
+- Linux: `linux-arm64`, `linux-x64`
+- Windows: `win32-x64`, `win32-arm64`
+
+**Note:** On macOS, if Desktop is installed to a non-standard location, the symlink target will reflect that location (e.g., `~/Applications/ToolHive Studio.app/...`).
+
+**PATH modification (no elevation required):**
+
+| Platform | PATH Modification |
+|----------|-------------------|
+| macOS | Prepend `~/.toolhive/bin` to `.zshrc`, `.bashrc`, `.config/fish/config.fish` |
+| Linux | Prepend `~/.toolhive/bin` to `.bashrc`, `.profile`, `.config/fish/config.fish` |
+| Windows | Prepend `%LOCALAPPDATA%\ToolHive\bin` to User PATH environment variable |
 
 **Shell RC modifications:**
 
@@ -370,52 +439,86 @@ PowerShell (User PATH env var):
 
 **Why prepend:** To shadow any existing CLI installations when user chooses Desktop ownership.
 
-### Component 5: Atomic CLI Installation/Upgrade
+### Component 5: Symlink CLI Installation
 
-To prevent corruption from interrupted operations:
+Symlink creation is simpler than copying because:
+- No checksum verification needed (symlink points to bundled binary)
+- No atomic rename dance (symlink creation is atomic on POSIX)
+- Upgrades are automatic (symlink target updates when Desktop upgrades)
 
 ```typescript
-async function installOrUpgradeCli(): Promise<void> {
-    const tempPath = "~/.toolhive/bin/thv.new";
-    const finalPath = "~/.toolhive/bin/thv";
-    const backupPath = "~/.toolhive/bin/thv.old";
+async function installOrUpdateCliSymlink(): Promise<void> {
+    const symlinkPath = "~/.toolhive/bin/thv";
+    const targetPath = getDesktopBundledCliPath(); // e.g., /Applications/ToolHive Studio.app/Contents/Resources/bin/darwin-arm64/thv
     
-    // 1. Extract bundled CLI to temp path
-    await extractBundledCli(tempPath);
+    // 1. Ensure directory exists
+    await ensureDirectory("~/.toolhive/bin");
     
-    // 2. Verify checksum
-    const isValid = await verifyChecksum(tempPath);
-    if (!isValid) {
-        await deleteFile(tempPath);
-        showError("CLI verification failed");
+    // 2. Verify target exists
+    if (!await fileExists(targetPath)) {
+        showError("Bundled CLI not found in Desktop app");
         return;
     }
     
-    // 3. Backup existing binary if present
-    if (await fileExists(finalPath)) {
-        await renameFile(finalPath, backupPath);
+    // 3. Remove existing symlink if present
+    if (await symlinkExists(symlinkPath)) {
+        await removeSymlink(symlinkPath);
     }
     
-    try {
-        // 4. Atomic rename (POSIX)
-        await renameFile(tempPath, finalPath);
-        
-        // 5. Cleanup backup
-        if (await fileExists(backupPath)) {
-            await deleteFile(backupPath);
-        }
-        
-        // 6. Update marker file
-        await updateMarkerFile();
-    } catch (error) {
-        // Restore backup on failure
-        if (await fileExists(backupPath)) {
-            await renameFile(backupPath, finalPath);
-        }
-        reportError(error);
+    // 4. Create symlink (atomic on POSIX)
+    await createSymlink(targetPath, symlinkPath);
+    
+    // 5. Update marker file
+    await updateMarkerFile({
+        source: "desktop",
+        symlink_target: targetPath,
+        cli_version: await getVersionFromBinary(targetPath),
+        desktop_version: getDesktopVersion()
+    });
+}
+
+function getDesktopBundledCliPath(): string {
+    // Platform and architecture-specific paths
+    // arch examples: darwin-arm64, darwin-x64, linux-arm64, linux-x64
+    const arch = `${platform}-${process.arch}`;
+    
+    if (platform === "darwin") {
+        return path.join(getAppPath(), "Contents/Resources/bin", arch, "thv");
+    } else if (platform === "linux") {
+        return path.join(getAppPath(), "resources/bin", arch, "thv");
+    } else {
+        // Windows: fall back to copy approach (see Component 5a)
+        throw new Error("Symlinks not supported on Windows");
     }
 }
 ```
+
+#### Component 5a: Windows Fallback (Copy Approach)
+
+Windows symlinks require either Administrator privileges or Developer Mode enabled. To avoid this complexity, Windows uses the copy approach:
+
+```typescript
+async function installCliWindows(): Promise<void> {
+    const finalPath = "%LOCALAPPDATA%\\ToolHive\\bin\\thv.exe";
+    const targetPath = getDesktopBundledCliPath();
+    
+    // 1. Ensure directory exists
+    await ensureDirectory("%LOCALAPPDATA%\\ToolHive\\bin");
+    
+    // 2. Copy bundled CLI
+    await copyFile(targetPath, finalPath);
+    
+    // 3. Update marker file
+    await updateMarkerFile({
+        source: "desktop",
+        cli_version: await getVersionFromBinary(finalPath),
+        desktop_version: getDesktopVersion(),
+        install_method: "copy" // Windows-specific
+    });
+}
+```
+
+**Note:** On Windows, Desktop upgrades must re-copy the CLI binary. This is handled in Component 7 (Desktop Upgrade Behavior).
 
 ### Component 6: Settings Panel
 
@@ -455,14 +558,19 @@ async function installOrUpgradeCli(): Promise<void> {
 
 ### Component 7: Desktop Upgrade Behavior
 
+**Symlink approach simplifies upgrades:** Since the symlink points to the bundled CLI inside Desktop.app, upgrading Desktop automatically upgrades the CLI — no additional action required.
+
 | Current State | Desktop Action on Upgrade |
 |---------------|---------------------------|
-| Desktop CLI v0.5.1 installed | Upgrade CLI to new bundled version |
+| Desktop symlink exists (macOS/Linux) | No action needed — symlink automatically points to new bundled CLI |
+| Desktop CLI copy exists (Windows) | Re-copy new bundled CLI to replace old version |
 | CLI not installed (user skipped) | Prompt to install new version (once) |
-| External CLI only (shadowed) | Upgrade Desktop CLI, external remains shadowed |
-| CLI corrupted | Reinstall and notify user |
+| External CLI only (shadowed) | Create Desktop symlink, external remains shadowed |
+| Symlink broken (Desktop was moved) | Update symlink to point to new location |
 
 ### Component 8: Desktop Uninstall Behavior
+
+**Important caveat (symlink approach):** On macOS/Linux, the CLI is a symlink pointing to the Desktop app bundle. If the user uninstalls Desktop without using the proper uninstall flow, the symlink becomes broken.
 
 **Direct uninstall (manual or via Desktop UI):**
 ```
@@ -470,15 +578,15 @@ async function installOrUpgradeCli(): Promise<void> {
 │  Uninstall ToolHive Studio                                      │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  Desktop installed CLI v0.5.1 to your system.                   │
+│  Desktop created a CLI symlink at ~/.toolhive/bin/thv           │
 │                                                                 │
-│  ○ Keep CLI installed                                           │
-│    CLI remains at ~/.toolhive/bin/thv                           │
-│    You can continue using it or reinstall Desktop later         │
-│                                                                 │
-│  ○ Remove CLI                                                   │
-│    Removes CLI binary and PATH configuration                    │
+│  ○ Remove symlink (recommended)                                 │
+│    Removes CLI symlink and PATH configuration                   │
 │    Config files in ~/.toolhive are preserved                    │
+│                                                                 │
+│  ○ Keep symlink                                                 │
+│    Warning: Symlink will be broken after uninstall              │
+│    You'll see errors when running `thv` in terminal             │
 │                                                                 │
 │  [Uninstall]  [Cancel]                                          │
 └─────────────────────────────────────────────────────────────────┘
@@ -486,8 +594,18 @@ async function installOrUpgradeCli(): Promise<void> {
 
 **Homebrew/Winget uninstall:**
 - `brew uninstall --cask toolhive-studio` removes Desktop only
-- CLI at `~/.toolhive/bin` remains (not managed by Homebrew)
-- User can remove manually: `rm ~/.toolhive/bin/thv`
+- Symlink at `~/.toolhive/bin/thv` remains but becomes **broken**
+- User must remove manually: `rm ~/.toolhive/bin/thv`
+- Consider adding a `postflight` script to Homebrew cask to clean up symlink
+
+**Drag-to-Trash uninstall (macOS):**
+- If user drags Desktop to Trash, symlink becomes broken immediately
+- Running `thv` in terminal will show: `zsh: no such file or directory: /Applications/ToolHive Studio.app/Contents/Resources/bin/darwin-arm64/thv`
+- User must remove broken symlink manually or reinstall Desktop
+
+**Windows uninstall:**
+- Since Windows uses copy approach, the CLI binary persists after Desktop uninstall
+- This is intentional — CLI continues working without Desktop
 
 ### Component 9: Package Manager Configuration
 
@@ -587,21 +705,21 @@ ManifestVersion: 1.6.0
 
 | Threat | Description | Likelihood | Impact |
 |--------|-------------|------------|--------|
-| Malicious CLI replacement | Attacker replaces CLI binary | Low | High |
+| Symlink target manipulation | Attacker changes symlink to point to malicious binary | Low | High |
 | PATH hijacking | Attacker places malicious binary earlier in PATH | Medium | High |
 | Shell RC injection | Attacker exploits Desktop's RC modification | Low | High |
 | Marker file tampering | Attacker modifies ownership marker | Low | Medium |
-| TOCTOU during install | Race condition during atomic rename | Very Low | Medium |
+| Desktop app replacement | Attacker replaces Desktop.app with malicious version | Low | High |
 
 ### Mitigations
 
 | Threat | Mitigation |
 |--------|------------|
-| Malicious CLI replacement | Verify checksum on every launch against marker file |
-| PATH hijacking | Desktop uses absolute path internally; prepend to PATH so Desktop CLI is first |
+| Symlink target manipulation | Validate symlink target matches expected Desktop path; verify target is inside a code-signed app bundle (macOS) |
+| PATH hijacking | Desktop uses absolute path internally; prepend to PATH so Desktop symlink is first |
 | Shell RC injection | Use exact, predictable RC format with start/end markers; validate paths |
-| Marker file tampering | Validate schema, use restrictive permissions (0600), verify checksums |
-| TOCTOU during install | Atomic rename operations; backup and restore on failure |
+| Marker file tampering | Validate schema, use restrictive permissions (0600), verify symlink target matches marker |
+| Desktop app replacement | macOS: Gatekeeper validates code signature; Windows: copy approach uses checksum verification |
 
 ### File Permissions
 
@@ -609,12 +727,15 @@ ManifestVersion: 1.6.0
 |----------------|-------------|-----------|
 | `~/.toolhive/` | 0700 | User access only |
 | `~/.toolhive/bin/` | 0755 | Executable directory |
-| `~/.toolhive/bin/thv` | 0755 | Executable binary |
+| `~/.toolhive/bin/thv` | lrwxr-xr-x | Symlink (permissions on target, not symlink) |
 | `~/.toolhive/.cli-source` | 0600 | Sensitive marker, user only |
+
+**Note:** On Windows, `~/.toolhive/bin/thv.exe` is a regular file (copy) with 0755 equivalent permissions.
 
 ### Input Validation
 
 - CLI version strings validated against semver regex
+- Symlink targets validated: must point to expected path inside Desktop app bundle
 - File paths sanitized: reject paths containing `..`, null bytes, or shell metacharacters
 - Marker file JSON validated against schema before use
 - Shell RC modifications use exact format, never interpolate untrusted input
@@ -660,13 +781,18 @@ Add version negotiation to `thv serve` API, similar to Docker's approach.
 
 This RFC provides the necessary foundation — Desktop-managed CLI installation — which version negotiation would build upon. The two are complementary, not mutually exclusive.
 
-### Alternative 5: Symlinks to App Bundle
+### Alternative 5: Copy Binary Instead of Symlink
 
-Instead of copying CLI, symlink to binary inside Desktop.app.
+Instead of symlinking to the bundled CLI, copy it to `~/.toolhive/bin/thv`.
 
-**Pros:** No duplication, automatic version alignment
-**Cons:** CLI breaks if Desktop moved/deleted; complex on Windows; confusing when Desktop not running
-**Why not chosen:** Copying is more robust and predictable
+**Pros:** CLI continues working if Desktop is moved/deleted; simpler cross-platform behavior
+**Cons:** Requires re-copy on every Desktop upgrade; checksum verification needed; more complex atomic installation logic
+**Why not chosen:** Symlinks provide simpler upgrade semantics — the CLI automatically updates when Desktop upgrades, with no additional logic required. The tradeoff (CLI breaking if Desktop is moved/deleted) is acceptable because:
+1. Moving the Desktop app is uncommon
+2. Desktop can detect and recover from broken symlinks
+3. Uninstall flow can clean up the symlink
+
+**Note:** Windows uses the copy approach as a fallback because symlinks require Administrator privileges or Developer Mode.
 
 ## Compatibility
 
@@ -694,24 +820,26 @@ Instead of copying CLI, symlink to binary inside Desktop.app.
 ### Phase 1: Core Infrastructure
 
 - [ ] CLI detection across all platforms
-- [ ] Marker file read/write with schema validation
-- [ ] Atomic CLI installation (copy, verify, rename)
-- [ ] Checksum verification logic
+- [ ] Marker file read/write with schema validation (symlink and copy variants)
+- [ ] Symlink creation and validation (macOS/Linux)
+- [ ] Copy installation with checksum verification (Windows fallback)
 
 ### Phase 2: First Launch Flow
 
 - [ ] Fresh install dialog and flow
 - [ ] External CLI conflict dialog
+- [ ] Symlink creation to bundled CLI
 - [ ] PATH configuration for bash, zsh
 - [ ] PATH configuration for fish
 - [ ] PATH configuration for Windows
 
 ### Phase 3: Ongoing Validation
 
-- [ ] Every-launch validation logic
-- [ ] Corruption detection and recovery
-- [ ] Missing binary detection and reinstall
-- [ ] Desktop upgrade triggers CLI upgrade
+- [ ] Every-launch symlink validation logic
+- [ ] Broken symlink detection and recovery dialog
+- [ ] Missing symlink detection and recreation
+- [ ] Symlink target update when Desktop moved
+- [ ] Windows: Desktop upgrade triggers CLI re-copy
 
 ### Phase 4: Settings and Recovery
 
@@ -751,39 +879,45 @@ Instead of copying CLI, symlink to binary inside Desktop.app.
 
 ### Unit Tests
 
-- Marker file parsing and validation
+- Marker file parsing and validation (both symlink and copy schemas)
 - Version comparison logic
 - PATH modification generation (per shell)
-- Checksum calculation and verification
-- Atomic rename operations
+- Symlink creation and validation
+- Symlink target resolution
+- Windows: checksum calculation and verification
 
 ### Integration Tests
 
 - CLI detection on each platform
-- Fresh install flow
+- Fresh install flow (symlink on macOS/Linux, copy on Windows)
 - External CLI detection (mock Homebrew paths)
-- Upgrade flow (v0.5.1 → v0.5.3)
-- Corruption recovery
+- Symlink validation (target exists, target missing)
+- Symlink update when Desktop moved
+- Windows: upgrade flow (copy replacement)
 
 ### End-to-End Tests
 
 | Scenario | Expected Result |
 |----------|-----------------|
-| Fresh Desktop install (no CLI) | CLI installed, PATH configured, marker created |
-| Desktop install + Homebrew CLI v0.6.0 | Dialog shown, Desktop CLI installed, shadows Homebrew |
+| Fresh Desktop install (no CLI) | Symlink created, PATH configured, marker created |
+| Desktop install + Homebrew CLI v0.6.0 | Dialog shown, Desktop symlink created, shadows Homebrew |
 | Desktop install, user skips CLI | Desktop works, warning shown, no re-prompt |
-| Desktop upgrade (v1.2→v1.3, bundles v0.5.3) | CLI upgraded atomically |
-| CLI binary deleted | Detected on launch, reinstalled automatically |
-| CLI binary corrupted | Warning shown, reinstall offered |
-| `brew install --cask toolhive-studio` | Desktop installed, first launch installs CLI |
-| `brew uninstall --cask toolhive-studio` | Desktop removed, CLI remains |
-| User runs `brew install toolhive` after Desktop | Desktop CLI still shadows, settings shows both |
+| Desktop upgrade (v1.2→v1.3) | No action needed — symlink already points to bundled CLI |
+| Symlink deleted | Detected on launch, symlink recreated automatically |
+| Symlink broken (Desktop moved) | Warning shown, offer to locate app or remove symlink |
+| Desktop moved to different location | Symlink updated to point to new location |
+| `brew install --cask toolhive-studio` | Desktop installed, first launch creates symlink |
+| `brew uninstall --cask toolhive-studio` | Desktop removed, **symlink broken** (known caveat) |
+| Drag Desktop to Trash (macOS) | Symlink broken, user must clean up manually |
+| User runs `brew install toolhive` after Desktop | Desktop symlink still shadows, settings shows both |
+| Windows: Desktop upgrade | CLI binary re-copied from new bundle |
+| Windows: Desktop uninstall | CLI binary persists (copy approach) |
 
 ### Platform-Specific Tests
 
-- **macOS:** Homebrew detection at `/opt/homebrew` and `/usr/local`, zsh/bash/fish PATH
-- **Linux:** Detection paths, bash/fish PATH, .profile handling
-- **Windows:** Winget, User PATH environment variable
+- **macOS:** Symlink to `/Applications/ToolHive Studio.app/.../bin/darwin-arm64/thv` or `darwin-x64`, broken symlink detection, Homebrew detection at `/opt/homebrew` and `/usr/local`, zsh/bash/fish PATH
+- **Linux:** Symlink to AppImage/install path with `linux-arm64` or `linux-x64` arch folder, broken symlink detection, bash/fish PATH, .profile handling
+- **Windows:** Copy approach (no symlink), copy from `win32-x64` or `win32-arm64` folder, re-copy on upgrade, Winget detection, User PATH environment variable
 
 ## Documentation
 
@@ -793,8 +927,10 @@ Instead of copying CLI, symlink to binary inside Desktop.app.
 - Installation Guide: Homebrew, Winget, direct download paths
 - FAQ: "Why does Desktop install its own CLI?"
 - FAQ: "I installed CLI from Homebrew, what happens?"
-- FAQ: "How do I update the CLI?"
-- Troubleshooting: PATH issues, shadowed CLI, recovery steps
+- FAQ: "How do I update the CLI?" (Answer: it updates automatically when Desktop upgrades)
+- FAQ: "I moved/deleted Desktop and now `thv` doesn't work" (Answer: symlink is broken, reinstall Desktop or remove symlink)
+- FAQ: "Why is Windows different?" (Answer: symlinks require admin, so we copy instead)
+- Troubleshooting: PATH issues, shadowed CLI, broken symlink recovery
 
 ### Developer Documentation
 
@@ -820,7 +956,7 @@ Instead of copying CLI, symlink to binary inside Desktop.app.
 | Silent install vs dialog? | Always show dialog on first launch | Silent modification feels invasive; transparency builds trust |
 | Warn every launch if user skipped? | Warn once, store dismissal | Respect user choice; don't nag |
 | Apple Silicon vs Intel? | Universal binary | Simpler distribution and cask definition |
-| Symlink vs copy? | Copy binary | More robust; works when Desktop not installed |
+| Symlink vs copy? | Symlink (macOS/Linux), copy (Windows) | Simpler upgrades; symlink auto-updates when Desktop upgrades; Windows fallback due to symlink restrictions |
 | Package naming? | `toolhive` (CLI) / `toolhive-studio` (Desktop) | Distinct names avoid Docker-style conflicts |
 | Rely on Homebrew `conflicts_with`? | No, handle in-app | Homebrew deprecated `conflicts_with formula:`; it never worked |
 
@@ -844,6 +980,7 @@ Instead of copying CLI, symlink to binary inside Desktop.app.
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2025-01-12 | @samuv | Draft | Initial submission |
+| 2026-01-19 | @samuv | Update | Switched to A2 symlink approach based on team feedback |
 
 ### Implementation Tracking
 
