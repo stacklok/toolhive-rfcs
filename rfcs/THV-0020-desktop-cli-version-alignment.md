@@ -2,7 +2,7 @@
 
 - **Status**: Draft
 - **Author(s)**: @samuv
-- **Created**: 2025-01-12
+- **Created**: 2026-01-12
 - **Last Updated**: 2026-01-19
 - **Target Repository**: multiple (toolhive, toolhive-studio)
 - **Related Issues**: [toolhive-studio#1399](https://github.com/stacklok/toolhive-studio/issues/1399)
@@ -32,14 +32,7 @@ This RFC establishes version alignment between ToolHive CLI and ToolHive Studio 
 
 ### Why Exact Version Pinning Is Required
 
-ToolHive's constraints are:
-
-| Factor | ToolHive | Docker |
-|--------|----------|--------|
-| API stability | Alpha, breaking changes expected | Stable, backward-compatible |
-| UI coupling | 1:1 reflection of API | Independent products |
-| Version negotiation | None | Built-in |
-| Mismatch impact | UI breaks, API errors | Graceful degradation |
+The `thv serve` API is in alpha with breaking changes expected. Desktop's UI is a 1:1 reflection of this API, meaning any version mismatch causes immediate failures — not graceful degradation.
 
 Exact version pinning is necessary until:
 1. The `thv serve` API exits alpha
@@ -47,48 +40,6 @@ Exact version pinning is necessary until:
 3. API version negotiation is implemented (allowing Desktop to work with a range of CLI versions)
 
 Even after alpha, this infrastructure remains valuable — it provides the foundation for controlled rollouts, ensures users have a working CLI, and can be relaxed to allow version ranges once compatibility guarantees exist.
-
-### Core Conflict Scenarios
-
-| Scenario | Problem |
-|----------|---------|
-| Homebrew CLI v0.6.0 exists, Desktop (bundles v0.5.1) installed | API mismatch, Desktop UI may break |
-| Desktop installed first, user installs Homebrew CLI v0.6.0 | Newer CLI may expose API Desktop can't handle |
-| User runs `thv` in terminal | Which binary executes? Does it match Desktop's expectations? |
-| User upgrades Homebrew CLI after Desktop installed | PATH shadowing may confuse user |
-
-### Lessons from Docker Desktop
-
-Docker Desktop faces similar challenges with its CLI/Desktop relationship. Their experience informs our approach:
-
-#### What Docker Does
-
-- **Separate packages:** `brew install docker` (CLI formula) vs `brew install --cask docker-desktop` (Desktop cask)
-- **CLI location changed:** Docker Desktop now installs CLI to `$HOME/.docker/bin` (user space) by default
-- **PATH not auto-configured:** Users must manually add to PATH or enable "System" mode (requires admin)
-- **Hard conflicts:** Installing both formula and cask causes file conflicts and installation failures
-- **`conflicts_with formula:` is useless:** Homebrew deprecated this cask directive — it never actually worked
-
-#### Why Our Approach Is Better
-
-| Problem | Docker's Experience | ToolHive Solution |
-|---------|---------------------|-------------------|
-| Name confusion | Same name (`docker`) for formula and cask causes issues | Distinct names: `toolhive` (CLI) and `toolhive-studio` (Desktop) |
-| Installation conflicts | Hard failures when both installed | Shadow in PATH, no file conflicts |
-| CLI availability | Not in PATH by default after Desktop install | Auto-configure PATH on first launch |
-| User choice complexity | "System" vs "User" mode selection | Single user-space approach, no elevation needed |
-| Version alignment | API negotiation handles mismatches | Exact version required (Alpha API), Desktop manages CLI |
-
-#### Key Insight
-
-Docker can tolerate version mismatches because their API is stable with built-in negotiation. ToolHive cannot — yet. The `thv serve` API is in alpha with breaking changes expected, and no backward-compatibility policy exists. This justifies our stricter version control approach.
-
-**Important:** This infrastructure is needed regardless of alpha status. Even with a stable API, we need:
-- A mechanism to install CLI for Desktop users (this RFC)
-- A backward-compatibility policy (separate effort)
-- API version negotiation (future enhancement)
-
-This RFC builds the foundation. Once compatibility guarantees exist, we can relax from "exact version" to "minimum version" constraints.
 
 ## Goals
 
@@ -148,18 +99,23 @@ flowchart TD
     B -->|Any Linux PM| C
     
     C --> D[First Launch]
-    D --> E{Detect Existing CLI}
+    D --> E{Detect External CLI}
     
-    E -->|No CLI found| F[Create symlink to bundled CLI]
-    E -->|External CLI found| H[Show conflict dialog]
-    E -->|Desktop symlink found| G[Validate Symlink]
+    E -->|External CLI found| H[HARD STOP: Uninstall required]
+    E -->|No external CLI| F{Check Desktop symlink}
     
-    H -->|User: Install Desktop CLI| F
+    H -->|User uninstalls, restarts| D
     
-    G -->|Symlink valid| I[Ready]
-    G -->|Symlink broken| J[Repair symlink]
+    F -->|No symlink| G[Create symlink to bundled CLI]
+    F -->|Symlink exists| K{Validate symlink target}
     
-    F --> L[Configure PATH]
+    K -->|Points to our binary| I[Ready]
+    K -->|Points elsewhere| M[HARD STOP: Symlink tampered]
+    K -->|Target missing| J[Repair symlink]
+    
+    M -->|User fixes| D
+    
+    G --> L[Configure PATH]
     J --> I
     L --> I
 
@@ -193,6 +149,13 @@ For each found binary:
 
 ```typescript
 function onDesktopLaunch(): void {
+    // First, check for external CLI installations (Homebrew, Winget, manual)
+    const externalCli = detectExternalCli();
+    if (externalCli) {
+        // HARD STOP: External CLI detected, user must resolve before continuing
+        return showHardStopDialog(externalCli);
+    }
+    
     const marker = readMarkerFile();
     
     if (marker) {
@@ -209,8 +172,13 @@ function onDesktopLaunch(): void {
                 return showBrokenSymlinkDialog();
             }
             
+            // HARD STOP: Symlink exists but points to unexpected location
+            if (!isOurBinary(symlink.target)) {
+                return showSymlinkTamperedDialog(symlink);
+            }
+            
             if (symlink.target !== getExpectedTarget()) {
-                // Symlink points to wrong location (Desktop was moved)
+                // Symlink points to old Desktop location (Desktop was moved)
                 return updateSymlinkTarget();
             }
             
@@ -223,6 +191,35 @@ function onDesktopLaunch(): void {
     } else {
         return runFirstLaunchFlow();
     }
+}
+
+function detectExternalCli(): ExternalCliInfo | null {
+    // Check known external locations
+    const externalPaths = {
+        darwin: ["/opt/homebrew/bin/thv", "/usr/local/bin/thv"],
+        linux: ["/usr/local/bin/thv", "/usr/bin/thv"],
+        win32: [`${process.env.ProgramFiles}\\toolhive\\thv.exe`]
+    };
+    
+    for (const path of externalPaths[platform]) {
+        if (fileExists(path)) {
+            return {
+                path,
+                version: getVersionFromBinary(path),
+                source: detectSource(path) // "homebrew", "winget", "manual"
+            };
+        }
+    }
+    return null;
+}
+
+function isOurBinary(symlinkTarget: string): boolean {
+    // Verify symlink points to a path inside our Desktop app bundle
+    const expectedPattern = platform === "darwin"
+        ? /ToolHive Studio\.app\/Contents\/Resources\/bin\//
+        : /toolhive-studio.*\/resources\/bin\//;
+    
+    return expectedPattern.test(symlinkTarget);
 }
 
 function checkSymlink(path: string): SymlinkInfo | null {
@@ -266,49 +263,76 @@ Desktop detects marker file indicating it owns the CLI.
 2. Update symlink to point to new Desktop location
 3. Update marker file with new target path
 
-#### Scenario C: Existing External CLI (Homebrew/Manual)
+#### Scenario C: Existing External CLI (Homebrew/Winget/Manual) — HARD STOP
 
-Desktop detects CLI at Homebrew or other external path, no Desktop marker.
+Desktop detects CLI at Homebrew, Winget, or other external path. **This is a blocking dialog — user cannot proceed until resolved.**
+
+**Rationale for hard stop:** Allowing mixed CLI installations causes version conflicts, config corruption, and difficult-to-debug issues. The cost of supporting this edge case outweighs the benefit.
 
 **Dialog:**
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Existing ToolHive CLI Detected                                 │
+│  ⛔ External ToolHive CLI Detected                               │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  Found: thv v0.6.0 at /opt/homebrew/bin/thv                     │
-│  Desktop requires: v0.5.1 (exact version for API compatibility) │
+│  Source: Homebrew                                               │
 │                                                                 │
-│  The Desktop UI requires a specific CLI version because the     │
-│  CLI API is in Alpha and versions are not interchangeable.      │
+│  ToolHive Studio cannot run while an external CLI is installed. │
+│  This prevents version conflicts and configuration issues.      │
 │                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ ● Install Desktop CLI (recommended)                     │    │
-│  │   Installs CLI v0.5.1 to ~/.toolhive/bin                │    │
-│  │   This version will be used in your terminal            │    │
-│  │   Your existing v0.6.0 remains at its current location  │    │
-│  │                                                         │    │
-│  │ ○ Skip CLI installation                                 │    │
-│  │   Desktop will work using its internal CLI, but         │    │
-│  │   terminal `thv` commands will use v0.6.0 which may     │    │
-│  │   cause compatibility issues with Desktop's config      │    │
-│  └─────────────────────────────────────────────────────────┘    │
+│  Please uninstall the external CLI first:                       │
 │                                                                 │
-│  [Continue]                                                     │
+│    brew uninstall toolhive                                      │
+│                                                                 │
+│  After uninstalling, restart ToolHive Studio.                   │
+│                                                                 │
+│  [Copy Uninstall Command]  [Open Documentation]  [Quit]         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**If user installs Desktop CLI:**
-- CLI installed to `~/.toolhive/bin`
-- PATH configured to prepend this directory
-- External CLI remains but is shadowed
+**Platform-specific uninstall commands shown:**
+- **Homebrew (macOS/Linux):** `brew uninstall toolhive`
+- **Winget (Windows):** `winget uninstall Stacklok.ToolHive`
+- **Manual:** "Remove the binary at [path]"
 
-**If user skips:**
-- Store "skipped" preference in marker file
-- Show warning banner in Desktop (dismissible)
-- Do not prompt again unless user requests from Settings
+**User must:**
+1. Quit Desktop
+2. Uninstall the external CLI
+3. Restart Desktop
 
-#### Scenario D: Symlink Missing (Was Deleted)
+**After uninstall:** Desktop proceeds with fresh install flow (Scenario A).
+
+#### Scenario D: Symlink Tampered (Points to Wrong Binary) — HARD STOP
+
+Desktop finds symlink at `~/.toolhive/bin/thv` but it points to a location outside the Desktop app bundle. **This is a blocking dialog — user cannot proceed until resolved.**
+
+**Rationale for hard stop:** A symlink pointing to an unexpected binary is a security concern and will cause version mismatches.
+
+**Dialog:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ⛔ CLI Symlink Issue Detected                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  The CLI symlink does not point to ToolHive Studio's binary.    │
+│                                                                 │
+│  Current target: /some/other/path/thv                           │
+│  Expected: ToolHive Studio.app bundle                           │
+│                                                                 │
+│  This may indicate the symlink was modified manually or by      │
+│  another application.                                           │
+│                                                                 │
+│  [Replace Symlink]  [Remove Symlink]  [Quit]                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Actions:**
+- **Replace Symlink:** Remove existing symlink, create new one pointing to Desktop bundle
+- **Remove Symlink:** Delete symlink, user can reinstall from Settings later
+- **Quit:** Exit Desktop without changes
+
+#### Scenario E: Symlink Missing (Was Deleted)
 
 Desktop finds marker file but symlink is missing.
 
@@ -317,7 +341,7 @@ Desktop finds marker file but symlink is missing.
 "CLI symlink was missing and has been recreated."
 ```
 
-#### Scenario E: Broken Symlink (Desktop Moved/Deleted)
+#### Scenario F: Broken Symlink (Desktop Moved/Deleted)
 
 Desktop finds marker file, symlink exists, but target is invalid (Desktop app was moved or deleted).
 
@@ -336,21 +360,21 @@ Desktop finds marker file, symlink exists, but target is invalid (Desktop app wa
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-#### Scenario F: User Installs Homebrew CLI After Desktop
+#### Scenario G: User Installs Homebrew/Winget CLI After Desktop — HARD STOP
 
-User has Desktop CLI installed, then runs `brew install toolhive`.
+User has Desktop CLI installed, then runs `brew install toolhive` or `winget install Stacklok.ToolHive`.
 
 **On next Desktop launch:**
-- Desktop detects both CLIs
-- Desktop CLI still shadows Homebrew in PATH (no change)
-- Settings panel shows: "Other CLI detected: v0.6.0 at /opt/homebrew/bin/thv (shadowed)"
+- Desktop detects external CLI at Homebrew/Winget path
+- **Hard stop dialog** (same as Scenario C)
+- User must uninstall external CLI before Desktop will launch
 
-**On user running `brew upgrade toolhive`:**
-- Homebrew upgrades its copy
-- Desktop CLI still shadows it
-- User may be confused why `thv --version` shows old version
+**Why hard stop instead of shadowing:** While PATH shadowing technically works, it creates confusion:
+- User expects `brew upgrade toolhive` to update their CLI, but it doesn't affect the active version
+- Two installations to maintain, potential for config drift
+- Support burden from "I upgraded but nothing changed" issues
 
-**Mitigation:** Settings panel explains PATH shadowing, links to documentation.
+**Prevention:** Documentation and Homebrew cask caveats warn users not to install CLI separately when using Desktop.
 
 ### Component 3: Marker File
 
@@ -364,10 +388,8 @@ User has Desktop CLI installed, then runs `brew install toolhive`.
   "install_method": "symlink",
   "cli_version": "0.5.1",
   "symlink_target": "/Applications/ToolHive Studio.app/Contents/Resources/bin/darwin-arm64/thv",
-  "installed_at": "2025-01-09T10:30:00Z",
-  "desktop_version": "1.2.0",
-  "user_skipped": false,
-  "skip_warning_dismissed": false
+  "installed_at": "2026-01-09T10:30:00Z",
+  "desktop_version": "1.2.0"
 }
 ```
 
@@ -379,12 +401,12 @@ User has Desktop CLI installed, then runs `brew install toolhive`.
   "install_method": "copy",
   "cli_version": "0.5.1",
   "cli_checksum": "sha256:abc123...",
-  "installed_at": "2025-01-09T10:30:00Z",
-  "desktop_version": "1.2.0",
-  "user_skipped": false,
-  "skip_warning_dismissed": false
+  "installed_at": "2026-01-09T10:30:00Z",
+  "desktop_version": "1.2.0"
 }
 ```
+
+**Note:** The `user_skipped` field was removed because external CLI detection now requires a hard stop — users cannot skip this step.
 
 **Field descriptions:**
 - `install_method`: Either `"symlink"` (macOS/Linux) or `"copy"` (Windows)
@@ -617,7 +639,7 @@ async function installCliWindows(): Promise<void> {
 | Desktop | Homebrew Cask | `toolhive-studio` | Distinct from CLI, matches app name |
 | Desktop | Winget | `Stacklok.ToolHiveStudio` | Standard Winget naming convention |
 
-**Why distinct names matter:** Docker uses `docker` for both its CLI formula and Desktop cask (now `docker-desktop`), which historically caused significant user confusion and installation failures. By using distinct names from the start, we avoid this entirely.
+**Why distinct names matter:** Using the same name for both CLI and Desktop packages causes user confusion and potential installation conflicts. Distinct names (`toolhive` vs `toolhive-studio`) make it clear which package is being installed.
 
 #### Homebrew Limitations
 
@@ -766,11 +788,9 @@ Build `thvm` tool for managing multiple CLI versions.
 **Cons:** Massive complexity, still doesn't solve config compatibility, maintenance burden
 **Why not chosen:** Overkill for problem scope
 
-### Alternative 4: API Version Negotiation (Docker Model)
+### Alternative 4: API Version Negotiation
 
-Add version negotiation to `thv serve` API, similar to Docker's approach.
-
-**How Docker does it:** The Docker CLI and Engine perform API version negotiation at connection time, selecting the highest mutually supported version. The API is backward-compatible, so older clients work with newer daemons (with reduced functionality).
+Add version negotiation to `thv serve` API so Desktop can work with a range of CLI versions.
 
 **Pros:** Would allow version ranges instead of exact pinning; graceful degradation for mismatched versions
 **Cons:** Requires stabilizing API first; significant engineering investment; adds complexity to both CLI and Desktop
@@ -900,18 +920,21 @@ Instead of symlinking to the bundled CLI, copy it to `~/.toolhive/bin/thv`.
 | Scenario | Expected Result |
 |----------|-----------------|
 | Fresh Desktop install (no CLI) | Symlink created, PATH configured, marker created |
-| Desktop install + Homebrew CLI v0.6.0 | Dialog shown, Desktop symlink created, shadows Homebrew |
-| Desktop install, user skips CLI | Desktop works, warning shown, no re-prompt |
+| Desktop install + Homebrew CLI exists | **HARD STOP**: Dialog shown, Desktop won't launch until CLI uninstalled |
+| Desktop install + Winget CLI exists | **HARD STOP**: Dialog shown, Desktop won't launch until CLI uninstalled |
+| User uninstalls external CLI, restarts | Fresh install flow proceeds normally |
 | Desktop upgrade (v1.2→v1.3) | No action needed — symlink already points to bundled CLI |
 | Symlink deleted | Detected on launch, symlink recreated automatically |
+| Symlink points to wrong binary | **HARD STOP**: Dialog shown, user must fix or remove symlink |
 | Symlink broken (Desktop moved) | Warning shown, offer to locate app or remove symlink |
 | Desktop moved to different location | Symlink updated to point to new location |
 | `brew install --cask toolhive-studio` | Desktop installed, first launch creates symlink |
 | `brew uninstall --cask toolhive-studio` | Desktop removed, **symlink broken** (known caveat) |
 | Drag Desktop to Trash (macOS) | Symlink broken, user must clean up manually |
-| User runs `brew install toolhive` after Desktop | Desktop symlink still shadows, settings shows both |
+| User runs `brew install toolhive` after Desktop | **HARD STOP** on next Desktop launch |
 | Windows: Desktop upgrade | CLI binary re-copied from new bundle |
 | Windows: Desktop uninstall | CLI binary persists (copy approach) |
+| Windows: Winget CLI exists | **HARD STOP**: Dialog shown, Desktop won't launch until CLI uninstalled |
 
 ### Platform-Specific Tests
 
@@ -926,7 +949,7 @@ Instead of symlinking to the bundled CLI, copy it to `~/.toolhive/bin/thv`.
 - Getting Started: Updated with first-launch CLI installation
 - Installation Guide: Homebrew, Winget, direct download paths
 - FAQ: "Why does Desktop install its own CLI?"
-- FAQ: "I installed CLI from Homebrew, what happens?"
+- FAQ: "I installed CLI from Homebrew, what happens?" (Answer: Desktop requires you to uninstall it first)
 - FAQ: "How do I update the CLI?" (Answer: it updates automatically when Desktop upgrades)
 - FAQ: "I moved/deleted Desktop and now `thv` doesn't work" (Answer: symlink is broken, reinstall Desktop or remove symlink)
 - FAQ: "Why is Windows different?" (Answer: symlinks require admin, so we copy instead)
@@ -953,20 +976,17 @@ Instead of symlinking to the bundled CLI, copy it to `~/.toolhive/bin/thv`.
 |----------|----------|-----------|
 | Which shells to support? | Bash, Zsh, Fish, PowerShell | Covers >95% of users |
 | Homebrew tap vs core? | `stacklok/homebrew-tap` initially | Faster iteration; move to core later if desired |
-| Silent install vs dialog? | Always show dialog on first launch | Silent modification feels invasive; transparency builds trust |
-| Warn every launch if user skipped? | Warn once, store dismissal | Respect user choice; don't nag |
-| Apple Silicon vs Intel? | Universal binary | Simpler distribution and cask definition |
+| External CLI detected? | Hard stop, require uninstall | Prevents version conflicts, config corruption, support burden |
+| Symlink points to wrong binary? | Hard stop, require fix | Security concern, prevents version mismatches |
+| Allow skipping CLI install? | No | Hard stop ensures consistent environment; reduces support complexity |
+| Apple Silicon vs Intel? | Separate binaries per architecture | Already building separate artifacts; symlink points to arch-specific folder (e.g., `darwin-arm64`, `darwin-x64`) |
 | Symlink vs copy? | Symlink (macOS/Linux), copy (Windows) | Simpler upgrades; symlink auto-updates when Desktop upgrades; Windows fallback due to symlink restrictions |
-| Package naming? | `toolhive` (CLI) / `toolhive-studio` (Desktop) | Distinct names avoid Docker-style conflicts |
+| Package naming? | `toolhive` (CLI) / `toolhive-studio` (Desktop) | Distinct names avoid confusion and conflicts |
 | Rely on Homebrew `conflicts_with`? | No, handle in-app | Homebrew deprecated `conflicts_with formula:`; it never worked |
 
 ## References
 
 - [Issue #1399: Change UI installer to expose CLI binary](https://github.com/stacklok/toolhive-studio/issues/1399)
-- [Docker Desktop CLI Integration](https://docs.docker.com/desktop/)
-- [Docker API Version Negotiation](https://docs.docker.com/reference/api/engine/)
-- [Docker/Homebrew conflict issues](https://github.com/Homebrew/homebrew-cask/issues/146078) — illustrates problems with same-name formula/cask
-- [Homebrew `conflicts_with formula:` deprecation](https://github.com/Homebrew/brew/pull/20499) — why we can't rely on Homebrew to prevent conflicts
 - [VS Code "Install 'code' command in PATH"](https://code.visualstudio.com/docs/setup/mac)
 - [Homebrew Cask Documentation](https://docs.brew.sh/Cask-Cookbook)
 - [Winget Manifest Documentation](https://learn.microsoft.com/en-us/windows/package-manager/package/manifest)
@@ -979,7 +999,7 @@ Instead of symlinking to the bundled CLI, copy it to `~/.toolhive/bin/thv`.
 
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
-| 2025-01-12 | @samuv | Draft | Initial submission |
+| 2026-01-12 | @samuv | Draft | Initial submission |
 | 2026-01-19 | @samuv | Update | Switched to A2 symlink approach based on team feedback |
 
 ### Implementation Tracking
