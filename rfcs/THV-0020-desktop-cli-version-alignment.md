@@ -98,7 +98,7 @@ flowchart TD
     B -->|Winget| C
     B -->|Any Linux PM| C
     
-    C --> D[First Launch]
+    C --> D[Desktop Startup]
     D --> E{Detect External CLI}
     
     E -->|External CLI found| H[HARD STOP: Uninstall required]
