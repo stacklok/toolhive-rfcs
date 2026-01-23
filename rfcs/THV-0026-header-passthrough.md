@@ -1,9 +1,9 @@
-# THV-0020: Configurable Header Passthrough for Remote MCP Servers
+# THV-0026: Configurable Header Passthrough for Remote MCP Servers
 
 - **Status**: Draft
 - **Author(s)**: Jakub Hrozek (@jhrozek)
 - **Created**: 2026-01-21
-- **Last Updated**: 2026-01-21
+- **Last Updated**: 2026-01-23
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3316](https://github.com/stacklok/toolhive/issues/3316)
 
@@ -92,9 +92,10 @@ type HeaderForwardConfig struct {
     // For sensitive values (API keys, tokens), use AddHeadersFromSecret instead.
     AddPlaintextHeaders map[string]string `json:"addPlaintextHeaders,omitempty" yaml:"addPlaintextHeaders,omitempty"`
 
-    // AddHeadersFromSecret is a map of header names to secret references.
+    // AddHeadersFromSecret is a map of header names to secret names.
     // CLI: References secrets stored in ToolHive's secrets manager.
-    //      Format: "secret-name,target=header_value" (resolved at runtime)
+    //      The map key is the header name, the value is the secret name.
+    //      Resolved at runtime via WithSecrets().
     // K8s: See addHeadersFromSecrets in CRD (uses SecretKeyRef)
     AddHeadersFromSecret map[string]string `json:"addHeadersFromSecret,omitempty" yaml:"addHeadersFromSecret,omitempty"`
 }
@@ -104,23 +105,66 @@ type HeaderForwardConfig struct {
 - `AddPlaintextHeaders`: Values stored as-is in RunConfig (persisted to disk). Use only for non-sensitive values.
 - `AddHeadersFromSecret`: Only the secret *reference* is stored. Actual values are resolved at runtime from the secrets provider and never written to disk.
 
+#### Restricted Headers
+
+The middleware rejects configuration of headers that could compromise proxy behavior, violate HTTP semantics, or spoof client identity. Validation uses canonical header names and fails fast at creation time.
+
+```go
+// restrictedHeaders are headers that cannot be configured for forwarding.
+// All names are in canonical form (as returned by http.CanonicalHeaderKey).
+var restrictedHeaders = map[string]struct{}{
+    "Host":                 {}, // Backend routing manipulation
+    "Connection":           {}, // Hop-by-hop (RFC 7230 §6.1)
+    "Keep-Alive":           {}, // Hop-by-hop
+    "Transfer-Encoding":    {}, // Request smuggling vector
+    "Te":                   {}, // Hop-by-hop (RFC 7230 §4.3)
+    "Trailer":              {}, // Hop-by-hop (RFC 7230 §4.4)
+    "Upgrade":              {}, // Protocol hijacking
+    "Proxy-Authorization":  {}, // Hop-by-hop (RFC 7235)
+    "Proxy-Authenticate":   {}, // Hop-by-hop (RFC 7235)
+    "Proxy-Connection":     {}, // Non-standard hop-by-hop
+    "Content-Length":        {}, // Request smuggling (CL/TE desync)
+    "X-Forwarded-For":      {}, // Client identity spoofing
+    "X-Forwarded-Host":     {}, // Routing confusion
+    "X-Forwarded-Proto":    {}, // Protocol downgrade
+    "X-Real-Ip":            {}, // Client identity spoofing
+}
+```
+
+**Design rationale:**
+- A **blocklist** (rather than allowlist) is used because the feature's purpose is forwarding arbitrary custom headers. An allowlist would be too restrictive and require constant updates.
+- The threat model is operator misconfiguration, not adversarial input. Configuration comes from trusted operators (CLI users with filesystem access, or K8s RBAC-controlled CRD authors).
+- `Authorization` is intentionally **not** blocked — it is a valid use case for static tokens via `addHeadersFromSecret`. A warning is emitted instead (see below).
+
+**Note on `httputil.ReverseProxy`:** Go's reverse proxy strips some hop-by-hop headers from the outgoing clone, but the blocklist does not rely on this stdlib behavior. Headers like `X-Forwarded-For`, `Content-Length`, and `Host` are NOT stripped by Go's reverse proxy, so the blocklist provides defense-in-depth independent of stdlib internals.
+
 #### Middleware Implementation
 
 The middleware injects configured headers into every request before forwarding to the remote server. By the time the middleware runs, all secret references have been resolved to actual values (via `WithSecrets()` in CLI or env var mounting in K8s).
 
+The function returns an error if restricted headers are configured, providing defense-in-depth independent of CLI/CRD validation.
+
 ```go
 // CreateHeaderForwardMiddleware creates middleware that injects configured headers
 // into requests before they are forwarded to the remote server.
-// Header names are pre-canonicalized at creation time.
-func CreateHeaderForwardMiddleware(addHeaders map[string]string) types.MiddlewareFunction {
+// Returns an error if any configured header is in the restricted set.
+func CreateHeaderForwardMiddleware(addHeaders map[string]string) (types.MiddlewareFunction, error) {
     if len(addHeaders) == 0 {
-        return func(next http.Handler) http.Handler { return next }
+        return func(next http.Handler) http.Handler { return next }, nil
     }
 
-    // Pre-canonicalize header names
+    // Pre-canonicalize header names and validate against blocklist
     canonicalHeaders := make(map[string]string, len(addHeaders))
     for name, value := range addHeaders {
-        canonicalHeaders[http.CanonicalHeaderKey(name)] = value
+        canonical := http.CanonicalHeaderKey(name)
+        if _, blocked := restrictedHeaders[canonical]; blocked {
+            return nil, fmt.Errorf("header %q is restricted and cannot be configured for forwarding", name)
+        }
+        if canonical == "Authorization" {
+            logger.Warnf("Header forward: configuring Authorization header directly; " +
+                "ensure this does not conflict with token injection/exchange middleware")
+        }
+        canonicalHeaders[canonical] = value
     }
 
     // Log header names once at startup (never log values)
@@ -133,7 +177,7 @@ func CreateHeaderForwardMiddleware(addHeaders map[string]string) types.Middlewar
             }
             next.ServeHTTP(w, r)
         })
-    }
+    }, nil
 }
 ```
 
@@ -149,6 +193,20 @@ This ordering ensures:
 1. Headers are only injected for authenticated requests
 2. Injected headers are the final state before forwarding (can't be accidentally overwritten)
 3. Clear separation: all "outgoing request modification" happens at the end
+
+#### Interaction with Token Exchange/Injection Middleware
+
+Because header forward runs last, it will **overwrite** any header previously set by token injection or token exchange middleware. This creates a potential conflict when both are configured for the same header (e.g., `Authorization`).
+
+To prevent silent misconfiguration, **configuration-time validation** rejects conflicting setups. This follows the existing `hasTokenExchangeMiddleware()` pattern in `pkg/transport/http.go`, which already prevents token injection from being added when token exchange is configured.
+
+The validation checks:
+- If token exchange is configured, header forward must not configure the header that token exchange targets (`Authorization` for the default/replace strategy, or the custom header name for the custom strategy).
+- If token injection (OAuth token source) is configured, header forward must not configure the `Authorization` header.
+
+Violations produce a clear startup error explaining the conflict, rather than allowing silent credential overwrites at runtime.
+
+**Kubernetes CRD validation:** An equivalent CEL validation rule on the `MCPRemoteProxy` CRD rejects manifests that configure both `oidcConfig` (token exchange) and `headerForward` with conflicting headers.
 
 #### Why This Works
 
@@ -203,6 +261,10 @@ thv proxy my-server --target-uri http://api.example.com \
 2. RunConfig is saved to disk with reference only (e.g., `my-api-key,target=header_x_api_key`)
 3. At runtime, `WithSecrets()` resolves the reference from the secrets provider
 4. Actual secret value is only held in memory, never persisted
+
+**CLI validation:**
+- Restricted headers (see [Restricted Headers](#restricted-headers)) are rejected at flag parse time with a descriptive error
+- If token exchange or token injection is also configured, conflicting headers are rejected at startup
 
 #### Kubernetes CRD Changes
 
@@ -351,7 +413,10 @@ The feature provides two distinct paths for header values:
 ### Input Validation
 
 - Header names are normalized using `http.CanonicalHeaderKey()` for consistent matching
+- **Restricted header blocklist**: Security-sensitive headers (see [Restricted Headers](#restricted-headers) section) are rejected at both CLI parse time and middleware creation time, preventing operators from accidentally configuring headers that could compromise proxy behavior or spoof client identity
+- **Middleware conflict detection**: Configurations that would cause header forward to silently overwrite headers set by token exchange or token injection are rejected at startup (see [Interaction with Token Exchange/Injection Middleware](#interaction-with-token-exchangeinjection-middleware))
 - K8s controller validates that referenced Secrets and keys exist during reconciliation
+- K8s CRD uses CEL validation rules to reject restricted headers and middleware conflicts at admission time
 - CLI validates secret references can be parsed before storing
 
 ### Audit and Logging
@@ -366,6 +431,9 @@ The feature provides two distinct paths for header values:
 2. **Secrets integration**: First-class support for sensitive values via secrets manager
 3. **No plaintext secrets in config**: Secret values never written to RunConfig or ConfigMaps
 4. **Debug-only logging**: Header names only, never values
+5. **Restricted header blocklist**: Prevents injection of headers that could compromise proxy behavior (hop-by-hop), enable request smuggling (`Content-Length`, `Transfer-Encoding`), or spoof client identity (`X-Forwarded-For`, `X-Real-IP`)
+6. **Middleware conflict detection**: Fail-fast validation prevents silent overwrites of `Authorization` headers set by token exchange or injection middleware
+7. **Authorization header warning**: When `Authorization` is configured via header forward, a startup warning is emitted to alert operators to potential middleware interactions
 
 ### Backward Compatibility
 
