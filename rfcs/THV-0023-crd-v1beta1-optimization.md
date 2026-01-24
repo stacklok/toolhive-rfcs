@@ -669,38 +669,7 @@ When CRD spec types differ from application config types, integration tests that
 | **Validation** | Separate CRD webhook validation and server startup validation | Single validation implementation, used at both admission and runtime |
 | **Developer Experience** | Adding features requires changes in multiple places | Adding features touches fewer files |
 
-**Trade-offs of Unified Types:**
 
-While Option B (Unified Types) addresses most challenges, it introduces nuance:
-
-- **Controllers may need to resolve or transform certain config values** before passing to the server (e.g., resolving Kubernetes-native references, injecting defaults). This means some config fields, if provided directly to the server without controller resolution, will be structurally valid types but semantically invalid configuration. For example, VirtualMCPServer config supports:
-
-  ```go
-  // CompositeTools defines inline composite tool workflows.
-  // Full workflow definitions are embedded in the configuration.
-  // For Kubernetes, complex workflows can also reference VirtualMCPCompositeToolDefinition CRDs.
-  CompositeTools []CompositeToolConfig `json:"compositeTools,omitempty"`
-  
-  // CompositeToolRefs references VirtualMCPCompositeToolDefinition resources
-  // for complex, reusable workflows. Only applicable when running in Kubernetes.
-  // Referenced resources must be in the same namespace as the VirtualMCPServer.
-  CompositeToolRefs []CompositeToolRef `json:"compositeToolRefs,omitempty"`
-  ```
-
-  And for tool filtering:
-
-  ```go
-  // ToolConfigRef references an MCPToolConfig resource for tool filtering and renaming.
-  // If specified, Filter and Overrides are ignored.
-  // Only used when running in Kubernetes with the operator.
-  ToolConfigRef *ToolConfigRef `json:"toolConfigRef,omitempty"`
-  ```
-
-  This pattern allows mixing static and dynamic configuration in a single type. It's possible users could misconfigure the server if running it directly. To mitigate the misconfiguration risk, we document when fields are resolved by the reconciler. To go even further, we could augment runtime validation to ensure Kubernetes-specific reference fields have been resolved before execution.
-
-- **K8s-specific fields** (`podTemplateSpec`, `serviceType`) must remain separate from the application config at the CRD spec level
-
-- **JSON/YAML tag conventions** must align with Kubernetes expectations (`camelCase`)
 
 #### Proposal
 
@@ -770,7 +739,6 @@ These CRD changes are **Kubernetes-only**. CLI mode (`thv run`) continues to use
 
 - Inline configuration in RunConfig JSON
 - No CRD references (RunConfig is self-contained)
-- RunConfig remains a distinct type from the embedded config types
 
 The portability principle is maintained: a workload can be exported from K8s (with dereferenced config) and run via CLI, or vice versa.
 
