@@ -705,7 +705,7 @@ For example, with `VirtualMCPServer` & `MCPTelemetryConfig` this pattern would l
    }
    ```
 
-3. **The VirtualMCPServer supports a reference, the config supports literal**:
+3. **The VirtualMCPServerSpec supports a reference, the config supports a literal**:
 
    ```go
    // In pkg/vmcp/config/config.go
@@ -719,7 +719,7 @@ For example, with `VirtualMCPServer` & `MCPTelemetryConfig` this pattern would l
        // ... other fields
    }
    ```
-   Remember, the `VirtualMCPServer` fully embeds the application config in its CRD. The above snippet simultaneously demonstrates adding support for a reference in the CRD and the equivalent type to
+   Recall, the `VirtualMCPServerSpec` fully embeds the application config in its CRD. The above snippet simultaneously demonstrates adding support for a reference in the CRD and the equivalent type to
    the application config. For the example above, the controller resolves `TelemetryRef` and populates `Telemetry` before passing to the server.
    
 
