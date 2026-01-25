@@ -320,9 +320,9 @@ spec:
 
 **Controller Behavior:**
 
-When `authServerClientConfig.clientCert` is specified, the MCPServer controller:
+When `authServerClientConfig` is specified, the MCPServer controller:
 
-1. **Creates a cert-manager Certificate:**
+1. **Creates a cert-manager Certificate** (if `clientCert` specified):
    ```yaml
    apiVersion: cert-manager.io/v1
    kind: Certificate
@@ -341,15 +341,23 @@ When `authServerClientConfig.clientCert` is specified, the MCPServer controller:
        kind: ClusterIssuer
    ```
 
-2. **Mounts the Secret to the proxyrunner pod:**
+2. **Mounts certificates to the proxyrunner pod:**
    ```yaml
    volumes:
+     # Client certificate for mTLS (if clientCert specified)
      - name: authserver-client-cert
        secret:
          secretName: github-tools-proxyrunner-client-tls
+     # CA bundle for verifying authserver (if caBundle specified)
+     - name: authserver-ca-bundle
+       configMap:
+         name: toolhive-mtls-ca-bundle
    volumeMounts:
      - name: authserver-client-cert
        mountPath: /etc/toolhive/authserver-mtls
+       readOnly: true
+     - name: authserver-ca-bundle
+       mountPath: /etc/toolhive/authserver-ca
        readOnly: true
    ```
 
@@ -360,7 +368,7 @@ When `authServerClientConfig.clientCert` is specified, the MCPServer controller:
        "url": "https://mcp-authserver.toolhive-system.svc.cluster.local",
        "client_cert_path": "/etc/toolhive/authserver-mtls/tls.crt",
        "client_key_path": "/etc/toolhive/authserver-mtls/tls.key",
-       "ca_bundle_path": "/etc/toolhive/authserver-mtls/ca.crt"
+       "ca_bundle_path": "/etc/toolhive/authserver-ca/ca.crt"
      }
    }
    ```
@@ -519,11 +527,12 @@ The `authorization_servers` field tells clients where the authserver is located.
 
 #### Why mTLS Between Proxyrunner and Authserver?
 
-The authserver stores **upstream IDP tokens** (access tokens, refresh tokens) and links them to the JWTs it issues via the `tsid` (token session ID) claim. When a proxyrunner receives a client request with a JWT, it may need to:
+The authserver stores **upstream IDP tokens** (access tokens, refresh tokens) and links them to the JWTs it issues via the `tsid` (token session ID) claim. When a proxyrunner receives a client request with an authserver-issued JWT, it may need to:
 
 1. **Retrieve the upstream access token** to pass to backend MCP servers that require the original IDP token
 2. **Exchange tokens** (RFC 8693) to get a backend-specific token
-3. **Refresh expired upstream tokens** on behalf of the client
+
+Note: The proxyrunner doesn't refresh client JWTs - clients refresh their authserver-issued JWTs directly via the authserver's `/oauth/token` endpoint with `grant_type=refresh_token`. (This endpoint is currently TODO and needs implementation.) When the proxyrunner calls the token exchange endpoint, the authserver internally refreshes expired upstream IDP tokens if needed.
 
 This is sensitive because:
 - **Upstream tokens are valuable** - they grant access to external services (Google, GitHub, etc.)
@@ -570,6 +579,20 @@ Each MCPServer gets its own client certificate. This allows the authserver to id
 - **Audit**: Logs can show "MCPServer 'github-tools' retrieved token for session X"
 - **Access control**: Could restrict which proxyrunners can access which sessions
 - **Revocation**: Can revoke a single proxyrunner's access without affecting others
+
+#### How Proxyrunner Verifies Authserver Identity
+
+Before sending sensitive data (client JWTs, session IDs), the proxyrunner must verify it's connecting to a legitimate authserver:
+
+1. **Server Certificate Verification**:
+   - Authserver presents its server certificate during TLS handshake
+   - Proxyrunner validates the certificate chain against the CA bundle (from `authServerClientConfig.caBundle`)
+   - Certificate must have DNS names matching the authserver URL
+
+2. **Trust Establishment**:
+   - Both use the same cert-manager CA (`toolhive-mtls-ca`)
+   - Proxyrunner's CA bundle contains the CA certificate that signed the authserver's cert
+   - If verification fails, connection is rejected (prevents MITM attacks)
 
 #### How Proxyrunner Authenticates to Authserver
 
@@ -1267,8 +1290,11 @@ func (c *AuthServerClient) doTokenExchange(ctx context.Context, clientJWT string
 
     req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
+    // TLS handshake verifies authserver's certificate against CA bundle (configured in NewAuthServerClient)
+    // and presents client certificate for mTLS authentication
     resp, err := c.httpClient.Do(req)
     if err != nil {
+        // Fails if: server cert invalid, client cert rejected, or connection error
         return nil, fmt.Errorf("token exchange request failed: %w", err)
     }
     defer resp.Body.Close()
@@ -1427,16 +1453,20 @@ func (c *TokenCache) cleanup() {
 }
 ```
 
+**JWT Verification against MCPAuthServer JWKS:**
+
+The existing auth middleware in [pkg/auth/token.go](pkg/auth/token.go) validates incoming JWTs against the authserver's JWKS. When `oidcConfig.issuer` points to the MCPAuthServer, the middleware fetches JWKS from `{issuer}/.well-known/jwks.json` and validates JWT signatures, issuer, audience, and expiration.
+
 **Integration with tokenexchange middleware:**
 
-Update the existing token exchange middleware to use the authserver client when configured:
+After the auth middleware validates the JWT, the tokenexchange middleware exchanges it for upstream tokens:
 
 ```go
 // pkg/auth/tokenexchange/middleware.go (updated)
 
-// In the middleware function, check for authserver config
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    // ... existing code to extract identity and subject token ...
+    // JWT already validated by auth middleware - extract from Authorization header
+    subjectToken := extractBearerToken(r)
 
     // If authserver client is configured, use it to get upstream token
     if m.authServerClient != nil {
@@ -1488,6 +1518,8 @@ type AuthServerClientConfig struct {
 
 | File | Purpose |
 |------|---------|
+| `cmd/thv-authserver/main.go` | Authserver service entry point |
+| `cmd/thv-authserver/app/serve.go` | Serve command with mTLS HTTP server |
 | `cmd/thv-operator/api/v1alpha1/certmanager_types.go` | Shared types (CertManagerIssuerReference) |
 | `cmd/thv-operator/api/v1alpha1/mcpauthserver_types.go` | MCPAuthServer CRD with mTLS config |
 | `cmd/thv-operator/controllers/mcpauthserver_controller.go` | MCPAuthServer reconciler |
@@ -1501,10 +1533,11 @@ type AuthServerClientConfig struct {
 | File | Changes |
 |------|---------|
 | `cmd/thv-operator/api/v1alpha1/mcpserver_types.go` | Add `AuthServerClientConfig` for mTLS client certs |
-| `cmd/thv-operator/controllers/mcpserver_controller.go` | Create cert-manager Certificate for proxyrunner |
+| `cmd/thv-operator/controllers/mcpserver_controller.go` | Create cert-manager Certificate for proxyrunner, mount CA bundle |
 | `pkg/networking/http_client.go` | Add `WithClientCertificate()` to HttpClientBuilder |
-| `pkg/authserver/server/handlers/handler.go` | Add `subjectValidator` field, update `NewHandler()` |
+| `pkg/authserver/server/handlers/handler.go` | Add `subjectValidator` field, update `NewHandler()`, register token exchange route |
 | `pkg/authserver/storage/types.go` | Add `GetUpstreamTokensForRefresh(ctx, tsid)` method (bypasses expiry check) |
+| `pkg/authserver/storage/memory.go` | Implement `GetUpstreamTokensForRefresh()` |
 | `pkg/runner/config.go` | Add `AuthServerConfig` struct |
 | `pkg/auth/tokenexchange/middleware.go` | Integrate authserver client for token exchange |
 
@@ -1512,13 +1545,15 @@ type AuthServerClientConfig struct {
 
 ## Implementation Phases
 
-### Phase 1: CRD and Operator Foundation
+### Phase 1: MCPAuthServer CRD and Shared Types
 
 **Shared Types:**
+
 1. Create `certmanager_types.go` with shared types:
    - `CertManagerIssuerReference` (used by both MCPAuthServer and MCPServer)
 
 **MCPAuthServer CRD:**
+
 2. Create `mcpauthserver_types.go` with CRD types:
    - `MCPAuthServerSpec` (issuer, replicas, upstreamIdp, signingKey, tls)
    - `AuthServerTLSConfig` (serverCert, clientAuth)
@@ -1526,16 +1561,11 @@ type AuthServerClientConfig struct {
    - `ClientAuthConfig` (caBundle, allowedSubjects)
    - `AllowedSubjects` (organizationalUnits, commonNamePattern)
 3. Run `make generate` and `make manifests`
-4. Create `mcpauthserver_controller.go` with basic reconciliation
-
-**MCPServer CRD Updates:**
-5. Add `AuthServerClientConfig` to `MCPServerSpec`
-6. Add `ClientCertificateConfig` type (uses shared `CertManagerIssuerReference`)
-7. Run `make generate` and `make manifests`
 
 ### Phase 2: Authserver Server-Side mTLS
 
 **Handler Updates (`pkg/authserver/server/handlers/`):**
+
 1. Create `subject_validator.go`:
    - `SubjectValidator` struct
    - `NewSubjectValidator()` function
@@ -1551,12 +1581,21 @@ type AuthServerClientConfig struct {
 4. Update `handler.go` Routes() to register `/internal/token-exchange`
 
 **Storage Updates (`pkg/authserver/storage/`):**
-5. Add `GetUpstreamTokens(ctx, tsid)` to `UpstreamTokenStorage` interface
+
+5. Add `GetUpstreamTokensForRefresh(ctx, tsid)` to `UpstreamTokenStorage` interface
 6. Implement in `memory.go` (and later Redis)
+
+**Unit Tests:**
+
+7. Test `SubjectValidator` with various OU/CN patterns
+8. Test `extractProxyRunnerIdentity()` with valid/invalid certs
+9. Test `TokenExchangeHandler()` mTLS validation and token exchange
+10. Test `GetUpstreamTokensForRefresh()` in storage
 
 ### Phase 3: HttpClientBuilder mTLS Support
 
 **Networking Package (`pkg/networking/`):**
+
 1. Add fields to `HttpClientBuilder`:
    - `clientCertPath string`
    - `clientKeyPath string`
@@ -1571,6 +1610,7 @@ type AuthServerClientConfig struct {
 ### Phase 4: ProxyRunner Authserver Client
 
 **New Package (`pkg/auth/authserver/`):**
+
 1. Create `client.go`:
    - `Config` struct
    - `AuthServerClient` struct
@@ -1582,35 +1622,58 @@ type AuthServerClientConfig struct {
    - `TokenCache` struct
    - `NewTokenCache()` constructor
    - `Get()`, `Set()`, `cleanup()` methods
-3. Add unit tests
+
+**Unit Tests:**
+
+3. Test `AuthServerClient` token exchange with mock HTTP server
+4. Test `TokenCache` expiry and cleanup
+5. Test `extractTSIDFromJWT()` with valid/invalid JWTs
 
 ### Phase 5: RunConfig and Middleware Integration
 
 **RunConfig (`pkg/runner/config.go`):**
+
 1. Add `AuthServerConfig` field to `RunConfig`
 2. Add `AuthServerClientConfig` struct
 
 **Token Exchange Middleware (`pkg/auth/tokenexchange/`):**
+
 3. Add `authServerClient` field to middleware
 4. Update middleware factory to create authserver client if configured
 5. Update `ServeHTTP` to use authserver client when available
 6. Add fallback to direct exchange if authserver fails
 
-### Phase 6: MCPServer Controller Integration
+**Unit Tests:**
+
+7. Test middleware with mock authserver client
+8. Test fallback behavior when authserver fails
+
+### Phase 6: MCPServer CRD Updates
+
+**CRD Changes (`cmd/thv-operator/api/v1alpha1/mcpserver_types.go`):**
+
+1. Add `AuthServerClientConfig` to `MCPServerSpec`
+2. Add `ClientCertificateConfig` type (uses shared `CertManagerIssuerReference`)
+3. Run `make generate` and `make manifests`
+
+### Phase 7: MCPServer Controller Integration
 
 **Controller Updates (`cmd/thv-operator/controllers/mcpserver_controller.go`):**
+
 1. Check for `authServerClientConfig` in spec
 2. If `clientCert` specified:
    - Create cert-manager `Certificate` resource
    - Wait for certificate to be ready
-3. Mount client cert Secret to proxyrunner pod:
-   - Add volume from Secret
-   - Add volumeMount to `/etc/toolhive/authserver-mtls`
+3. Mount client cert Secret and CA bundle ConfigMap to proxyrunner pod:
+   - Add volume from Secret (client cert)
+   - Add volume from ConfigMap (CA bundle)
+   - Add volumeMounts to `/etc/toolhive/authserver-mtls` and `/etc/toolhive/authserver-ca`
 4. Configure runconfig with authserver client paths
 
-### Phase 7: Authserver Service Binary
+### Phase 8: Authserver Service Binary
 
 **New Entry Point (`cmd/thv-authserver/`):**
+
 1. Create `main.go` with Cobra CLI
 2. Create `app/commands.go` with root command
 3. Create `app/serve.go` with serve command:
@@ -1629,6 +1692,7 @@ type AuthServerClientConfig struct {
    ```
 
 **HTTP Server with mTLS (`pkg/authserver/server/`):**
+
 4. Create `server.go`:
    - `Server` struct with `net/http.Server`
    - `NewServer(config, handler)` constructor
@@ -1647,13 +1711,15 @@ type AuthServerClientConfig struct {
 6. Add readiness endpoint at `/readyz`
 
 **Container Image:**
+
 7. Add Dockerfile at `cmd/thv-authserver/Dockerfile`
 8. Add to `Taskfile.yaml` build targets
 9. Push to container registry
 
-### Phase 8: MCPAuthServer Controller
+### Phase 9: MCPAuthServer Controller
 
 **Controller (`cmd/thv-operator/controllers/mcpauthserver_controller.go`):**
+
 1. Create Deployment with authserver container
 2. Configure server TLS from `certificateRef`
 3. Mount client CA bundle for mTLS verification
@@ -1661,15 +1727,21 @@ type AuthServerClientConfig struct {
 5. Create ConfigMap for authserver configuration
 6. Handle status conditions and reconciliation
 
-### Phase 9: Testing and Production Readiness
+### Phase 10: Integration and E2E Testing
 
-**Testing:**
-1. Unit tests for all new packages
-2. Integration tests for mTLS handshake
-3. E2E test: client → proxyrunner → authserver → upstream token
+**Integration Tests:**
 
-**Production Features:**
-4. Redis-backed storage for distributed sessions
-5. Metrics for token exchange latency and cache hit rate
-6. Audit logging for mTLS identity and token access
-7. Certificate rotation handling
+1. mTLS handshake between proxyrunner and authserver
+2. Token exchange flow with upstream token refresh
+
+**E2E Tests:**
+
+3. Full flow: client → proxyrunner → authserver → upstream token
+4. Kubernetes operator tests with cert-manager integration
+
+**Production Features (future):**
+
+5. Redis-backed storage for distributed sessions
+6. Metrics for token exchange latency and cache hit rate
+7. Audit logging for mTLS identity and token access
+8. Certificate rotation handling
