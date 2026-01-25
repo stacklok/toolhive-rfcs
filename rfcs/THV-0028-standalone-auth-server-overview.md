@@ -1,4 +1,4 @@
-# RFC-XXXX: Standalone Auth Server Kubernetes Deployment
+# RFC-0028: Standalone Auth Server Kubernetes Deployment
 
 - **Status**: Draft
 - **Author(s)**: Trey Grunnagle
@@ -89,7 +89,7 @@ flowchart TB
 
 ### Detailed Design
 
-Refer to [THV-00XX-standalone-auth-server-design.md](./THV-00XX-standalone-auth-server-design.md) for code snippets and additional details.
+Refer to [THV-0028-standalone-auth-server-design.md](./THV-0028-standalone-auth-server-design.md) for code snippets and additional details.
 
 #### New MCPAuthServer CRD
 
