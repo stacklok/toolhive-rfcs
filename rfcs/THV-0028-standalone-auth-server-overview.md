@@ -106,20 +106,25 @@ spec:
   replicas: 2
   port: 8443
 
-  upstreamIdp:
-    type: oidc
-    oidc:
-      issuer: "https://accounts.google.com"
-      clientId: "..."
-      clientSecretRef:
-        name: authserver-secrets
-        key: oidc-client-secret
+  # Upstream identity providers (single IDP supported now; multiple planned for vMCP)
+  upstreamIdps:
+    - name: google
+      type: oidc
+      oidc:
+        issuer: "https://accounts.google.com"
+        clientId: "..."
+        clientSecretRef:
+          name: authserver-secrets
+          key: oidc-client-secret
 
-  signingKey:
-    secretRef:
-      name: authserver-signing-key
-      key: private.pem
-    algorithm: RS256
+  # Signing keys for JWT issuance and JWKS endpoint
+  # First key is active; subsequent keys advertised on JWKS for rotation
+  # Key IDs (kid) computed using RFC 7638 thumbprints
+  signingKeys:
+    - secretRef:
+        name: authserver-signing-key
+        key: private.pem
+      algorithm: RS256
 
   tls:
     serverCert:
@@ -137,9 +142,11 @@ spec:
       # Uses SPIFFE URI format: spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}
       allowedSubjects:
         trustDomain: "toolhive.local"
-        allowedNamespaces:
+        allowedNamespaces:  # Optional: restrict by namespace
           - "toolhive-system"
           - "mcp-servers"
+        allowedNames:     # Optional: restrict to specific MCPServer names
+          - "github-tools"
 ```
 
 The MCPAuthServer controller creates:
@@ -303,7 +310,7 @@ func (b *HttpClientBuilder) WithClientCertificate(certPath, keyPath string) *Htt
 - **Proxyrunner → Authserver**: mTLS with per-MCPServer client certificates
 - **Client → Authserver**: OAuth 2.0 with PKCE
 - **Certificate Identity**: SPIFFE URI SAN (`spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}`) provides standardized workload identity; CN is human-readable for audit logs
-- **Subject Validation**: Configurable `allowedSubjects` restricts access by trust domain and allowed namespaces
+- **Subject Validation**: Configurable `allowedSubjects` restricts access by trust domain, allowed namespaces, and optionally specific MCPServer names
 
 ### Data Security
 

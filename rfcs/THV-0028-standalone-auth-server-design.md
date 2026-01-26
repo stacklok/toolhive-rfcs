@@ -58,20 +58,31 @@ spec:
   replicas: 2
   port: 8443
 
-  upstreamIdp:
-    type: oidc
-    oidc:
-      issuer: "https://accounts.google.com"
-      clientId: "..."
-      clientSecretRef:
-        name: authserver-secrets
-        key: oidc-client-secret
+  # Upstream identity providers for user authentication
+  # Currently supports a single IDP; multiple IDPs planned for vMCP use case
+  upstreamIdps:
+    - name: google  # Unique identifier for this IDP
+      type: oidc
+      oidc:
+        issuer: "https://accounts.google.com"
+        clientId: "..."
+        clientSecretRef:
+          name: authserver-secrets
+          key: oidc-client-secret
 
-  signingKey:
-    secretRef:
-      name: authserver-signing-key
-      key: private.pem
-    algorithm: RS256
+  # Signing keys for JWT issuance and JWKS endpoint
+  # First key is the active signing key; subsequent keys are advertised on JWKS for rotation
+  # Key IDs (kid) are computed using RFC 7638 thumbprints
+  signingKeys:
+    - secretRef:
+        name: authserver-signing-key
+        key: private.pem
+      algorithm: RS256
+    # Previous key still advertised on JWKS during rotation period
+    # - secretRef:
+    #     name: authserver-signing-key-old
+    #     key: private.pem
+    #   algorithm: RS256
 
   tls:
     # Issuer for server certificate (controller creates the Certificate resource)
@@ -95,16 +106,119 @@ spec:
       allowedSubjects:
         # Trust domain for SPIFFE URIs (required)
         trustDomain: "toolhive.local"
-        # Allow proxyrunners from specific namespaces
+        # Allow proxyrunners from specific namespaces (optional)
         allowedNamespaces:
           - "toolhive-system"
           - "mcp-servers"
           - "mcp-production"
+        # Allow only specific MCPServer names (optional)
+        # If not specified, all MCPServers in allowed namespaces are permitted
+        allowedNames:
+          - "github-tools"
+          - "slack-bot"
 ```
 
-**MCPAuthServer CRD mTLS Types:**
+**MCPAuthServer CRD Types:**
 
 ```go
+// MCPAuthServerSpec defines the desired state of MCPAuthServer
+type MCPAuthServerSpec struct {
+    // Issuer is the OAuth 2.0/OIDC issuer URL for this authserver
+    // This is the base URL used in token "iss" claims and discovery endpoints
+    // +kubebuilder:validation:Required
+    Issuer string `json:"issuer"`
+
+    // Replicas is the number of authserver pod replicas
+    // +kubebuilder:default=1
+    // +optional
+    Replicas *int32 `json:"replicas,omitempty"`
+
+    // Port is the HTTPS port for the authserver (default: 8443)
+    // +kubebuilder:default=8443
+    // +optional
+    Port int32 `json:"port,omitempty"`
+
+    // UpstreamIdps configures upstream identity providers for user authentication
+    // The authserver federates authentication to these IDPs
+    // Currently only a single IDP is supported; multiple IDPs planned for vMCP use case
+    // +kubebuilder:validation:MinItems=1
+    // +kubebuilder:validation:MaxItems=1
+    // +kubebuilder:validation:Required
+    UpstreamIdps []UpstreamIdpConfig `json:"upstreamIdps"`
+
+    // SigningKeys configures JWT signing keys for the authserver
+    // The first key in the list is the active signing key used for new tokens
+    // Subsequent keys are included in the JWKS endpoint to support key rotation
+    // This allows clients to verify tokens signed with previous keys during rotation
+    // Key IDs (kid) are computed using RFC 7638 JWK Thumbprints
+    // +kubebuilder:validation:MinItems=1
+    // +kubebuilder:validation:Required
+    SigningKeys []SigningKeyConfig `json:"signingKeys"`
+
+    // TLS configures TLS and mTLS for the authserver
+    // +kubebuilder:validation:Required
+    TLS AuthServerTLSConfig `json:"tls"`
+}
+
+// UpstreamIdpType represents the type of upstream identity provider
+type UpstreamIdpType string
+
+const (
+    // UpstreamIdpTypeOIDC is for OpenID Connect providers
+    UpstreamIdpTypeOIDC UpstreamIdpType = "oidc"
+)
+
+// UpstreamIdpConfig configures an upstream identity provider for user authentication
+type UpstreamIdpConfig struct {
+    // Name is a unique identifier for this IDP within the MCPAuthServer
+    // Used to reference the IDP in logs and potentially in multi-IDP routing (future)
+    // +kubebuilder:validation:Required
+    // +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+    Name string `json:"name"`
+
+    // Type is the type of identity provider
+    // +kubebuilder:validation:Enum=oidc
+    // +kubebuilder:validation:Required
+    Type UpstreamIdpType `json:"type"`
+
+    // OIDC configures an OpenID Connect identity provider
+    // Required when Type is "oidc"
+    // +optional
+    OIDC *OIDCIdpConfig `json:"oidc,omitempty"`
+}
+
+// OIDCIdpConfig configures an OIDC identity provider
+type OIDCIdpConfig struct {
+    // Issuer is the OIDC issuer URL (e.g., "https://accounts.google.com")
+    // +kubebuilder:validation:Required
+    Issuer string `json:"issuer"`
+
+    // ClientID is the OAuth 2.0 client identifier
+    // +kubebuilder:validation:Required
+    ClientID string `json:"clientId"`
+
+    // ClientSecretRef references a Kubernetes Secret containing the client secret
+    // +kubebuilder:validation:Required
+    ClientSecretRef SecretKeyRef `json:"clientSecretRef"`
+
+    // Scopes is the list of OAuth 2.0 scopes to request (default: ["openid", "profile", "email"])
+    // +optional
+    Scopes []string `json:"scopes,omitempty"`
+}
+
+// SigningKeyConfig configures a JWT signing key for the authserver
+// The key ID (kid) is computed using RFC 7638 JWK Thumbprint
+type SigningKeyConfig struct {
+    // SecretRef references a Kubernetes Secret containing the private key
+    // +kubebuilder:validation:Required
+    SecretRef SecretKeyRef `json:"secretRef"`
+
+    // Algorithm is the JWT signing algorithm to use with this key
+    // +kubebuilder:validation:Enum=RS256;RS384;RS512;ES256;ES384;ES512;EdDSA
+    // +kubebuilder:validation:Required
+    Algorithm string `json:"algorithm"`
+}
+
 // AuthServerTLSConfig configures TLS and mTLS for the authserver
 type AuthServerTLSConfig struct {
     // ServerCert configures automatic server certificate provisioning
@@ -160,6 +274,12 @@ type AllowedSubjects struct {
     // If empty, all namespaces are allowed (only trustDomain is validated)
     // +optional
     AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
+
+    // AllowedNames is a list of MCPServer names that are allowed to connect
+    // When specified, only MCPServers with matching names are permitted
+    // If empty, all MCPServer names are allowed (subject to namespace restrictions)
+    // +optional
+    AllowedNames []string `json:"allowedNames,omitempty"`
 }
 ```
 
@@ -979,6 +1099,8 @@ type SubjectValidator struct {
     trustDomain spiffeid.TrustDomain
     // allowedNamespaces is a set of allowed Kubernetes namespaces (nil means all allowed)
     allowedNamespaces map[string]bool
+    // allowedNames is a set of allowed MCPServer names (nil means all allowed)
+    allowedNames map[string]bool
 }
 
 // NewSubjectValidator creates a validator from MCPAuthServer CRD configuration
@@ -1006,6 +1128,14 @@ func NewSubjectValidator(allowedSubjects *AllowedSubjects) (*SubjectValidator, e
         }
     }
 
+    // Build allowed names set
+    if len(allowedSubjects.AllowedNames) > 0 {
+        validator.allowedNames = make(map[string]bool, len(allowedSubjects.AllowedNames))
+        for _, name := range allowedSubjects.AllowedNames {
+            validator.allowedNames[name] = true
+        }
+    }
+
     return validator, nil
 }
 
@@ -1015,6 +1145,7 @@ func NewSubjectValidator(allowedSubjects *AllowedSubjects) (*SubjectValidator, e
 // Validates:
 // 1. SPIFFE trust domain matches the configured trust domain
 // 2. Namespace is in the allowed list (if configured)
+// 3. MCPServer name is in the allowed list (if configured)
 //
 // Returns nil if allowed, error if rejected.
 func (v *SubjectValidator) validateSubjectAllowed(identity *ProxyRunnerIdentity) error {
@@ -1033,6 +1164,13 @@ func (v *SubjectValidator) validateSubjectAllowed(identity *ProxyRunnerIdentity)
     if v.allowedNamespaces != nil {
         if !v.allowedNamespaces[identity.Namespace] {
             return fmt.Errorf("namespace %q is not in allowed list", identity.Namespace)
+        }
+    }
+
+    // Check name restriction (if configured)
+    if v.allowedNames != nil {
+        if !v.allowedNames[identity.Name] {
+            return fmt.Errorf("MCPServer name %q is not in allowed list", identity.Name)
         }
     }
 
@@ -1616,11 +1754,11 @@ type AuthServerClientConfig struct {
 **MCPAuthServer CRD:**
 
 2. Create `mcpauthserver_types.go` with CRD types:
-   - `MCPAuthServerSpec` (issuer, replicas, upstreamIdp, signingKey, tls)
+   - `MCPAuthServerSpec` (issuer, replicas, upstreamIdps, signingKeys, tls)
    - `AuthServerTLSConfig` (serverCert, clientAuth)
    - `ServerCertConfig` (issuerRef, duration, renewBefore)
    - `ClientAuthConfig` (caBundle, allowedSubjects)
-   - `AllowedSubjects` (trustDomain, allowedNamespaces) - uses SPIFFE URI patterns
+   - `AllowedSubjects` (trustDomain, allowedNamespaces, allowedNames) - uses SPIFFE URI patterns
 3. Run `make generate` and `make manifests`
 
 ### Phase 2: Authserver Server-Side mTLS
