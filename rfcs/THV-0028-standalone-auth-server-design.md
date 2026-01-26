@@ -91,14 +91,15 @@ spec:
           key: ca.crt
 
       # Allowed client certificate patterns (for access control)
+      # Uses SPIFFE URI format: spiffe://{trust.domain}/ns/{namespace}/mcpserver/{name}
       allowedSubjects:
+        # Trust domain for SPIFFE URIs (required)
+        trustDomain: "toolhive.local"
         # Allow proxyrunners from specific namespaces
-        organizationalUnits:
+        allowedNamespaces:
           - "toolhive-system"
           - "mcp-servers"
           - "mcp-production"
-        # CN pattern: {mcpserver-name}.proxyrunner.{namespace}.toolhive.local
-        commonNamePattern: "^[a-z0-9-]+\\.proxyrunner\\.[a-z0-9-]+\\.toolhive\\.local$"
 ```
 
 **MCPAuthServer CRD mTLS Types:**
@@ -147,15 +148,18 @@ type ClientAuthConfig struct {
 }
 
 // AllowedSubjects defines which certificate subjects are allowed to connect
+// Uses SPIFFE URI format: spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}
 type AllowedSubjects struct {
-    // OrganizationalUnits is a list of allowed OU values (typically namespaces)
-    // Client cert must have at least one matching OU
-    // +optional
-    OrganizationalUnits []string `json:"organizationalUnits,omitempty"`
+    // TrustDomain is the SPIFFE trust domain for validating client certificate URIs
+    // Example: "toolhive.local"
+    // +kubebuilder:validation:Required
+    TrustDomain string `json:"trustDomain"`
 
-    // CommonNamePattern is a regex pattern for allowed CN values
+    // AllowedNamespaces is a list of Kubernetes namespaces whose MCPServers are allowed
+    // The SPIFFE URI must match: spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}
+    // If empty, all namespaces are allowed (only trustDomain is validated)
     // +optional
-    CommonNamePattern string `json:"commonNamePattern,omitempty"`
+    AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
 }
 ```
 
@@ -212,35 +216,49 @@ The controller watches for changes to the MCPAuthServer CR and reconciles the de
 
 ---
 
-#### 1.2 MCPServer Updates
+#### 1.2 MCPExternalAuthConfig Updates (authServer type)
 
-Add a new field to `MCPServerSpec` for configuring the client certificate used when the proxyrunner communicates with the authserver:
+Add a new external auth type `authServer` to `MCPExternalAuthConfig` for configuring the proxyrunner's mTLS client authentication to the standalone authserver. This leverages the existing `MCPExternalAuthConfig` pattern and allows the same authserver configuration to be shared across multiple MCPServer resources.
 
-**CRD Addition** ([cmd/thv-operator/api/v1alpha1/mcpserver_types.go](cmd/thv-operator/api/v1alpha1/mcpserver_types.go)):
+**CRD Addition** ([cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go](cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go)):
 
 ```go
-// MCPServerSpec defines the desired state of MCPServer
-type MCPServerSpec struct {
+// Add new auth type constant
+const (
+    // ExternalAuthTypeAuthServer is the type for standalone authserver mTLS authentication
+    // Used when proxyrunner needs to exchange client JWTs for upstream tokens via the authserver
+    ExternalAuthTypeAuthServer ExternalAuthType = "authServer"
+)
+
+// MCPExternalAuthConfigSpec defines the desired state of MCPExternalAuthConfig.
+type MCPExternalAuthConfigSpec struct {
+    // Type is the type of external authentication to configure
+    // +kubebuilder:validation:Enum=tokenExchange;headerInjection;bearerToken;unauthenticated;authServer
+    // +kubebuilder:validation:Required
+    Type ExternalAuthType `json:"type"`
+
     // ... existing fields ...
 
-    // AuthServerClientConfig configures how the proxyrunner authenticates to the authserver
+    // AuthServer configures mTLS client authentication to a standalone authserver
+    // Only used when Type is "authServer"
     // +optional
-    AuthServerClientConfig *AuthServerClientConfig `json:"authServerClientConfig,omitempty"`
+    AuthServer *AuthServerConfig `json:"authServer,omitempty"`
 }
 
-// AuthServerClientConfig configures mTLS client authentication to the authserver
-type AuthServerClientConfig struct {
+// AuthServerConfig configures mTLS client authentication to the standalone authserver
+type AuthServerConfig struct {
     // URL is the authserver base URL
     // +kubebuilder:validation:Required
     URL string `json:"url"`
 
     // ClientCert configures automatic client certificate provisioning for mTLS
-    // If specified, the controller creates the Certificate and mounts it to the pod
+    // If specified, the MCPExternalAuthConfig controller creates the Certificate
+    // and the MCPServer controller mounts it to the proxyrunner pod
     // +optional
     ClientCert *ClientCertificateConfig `json:"clientCert,omitempty"`
 
     // CABundle references a ConfigMap containing the CA bundle for verifying authserver
-    // Reuses existing CABundleSource type (defined at mcpserver_types.go:493-499)
+    // Reuses existing CABundleSource type
     // +optional
     CABundle *CABundleSource `json:"caBundle,omitempty"`
 }
@@ -251,19 +269,17 @@ type ClientCertificateConfig struct {
     // +kubebuilder:validation:Required
     IssuerRef CertManagerIssuerReference `json:"issuerRef"`
 
-    // Duration is the certificate validity period (default: 2160h / 90 days)
-    // +kubebuilder:default="2160h"
-    // +optional
-    Duration string `json:"duration,omitempty"`
+    // TrustDomain is the SPIFFE trust domain for the client certificate URI SAN
+    // The certificate will include: spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}
+    // +kubebuilder:validation:Required
+    TrustDomain string `json:"trustDomain"`
 
-    // RenewBefore is when to renew before expiry (default: 360h / 15 days)
-    // +kubebuilder:default="360h"
-    // +optional
-    RenewBefore string `json:"renewBefore,omitempty"`
+    // Note: duration and renewBefore use reasonable defaults (90 days / 15 days)
+    // and are not exposed in the CRD to keep the API simple
 }
 
 // CertManagerIssuerReference references a cert-manager Issuer or ClusterIssuer
-// NOTE: This type is shared between MCPAuthServer and MCPServer CRDs.
+// NOTE: This type is shared between MCPAuthServer and MCPExternalAuthConfig CRDs.
 // Define in cmd/thv-operator/api/v1alpha1/certmanager_types.go (new file)
 type CertManagerIssuerReference struct {
     // Name of the issuer
@@ -276,7 +292,39 @@ type CertManagerIssuerReference struct {
 }
 ```
 
-**Example MCPServer with mTLS:**
+**Example MCPExternalAuthConfig for authServer:**
+
+```yaml
+apiVersion: toolhive.stacklok.dev/v1alpha1
+kind: MCPExternalAuthConfig
+metadata:
+  name: main-authserver-client
+  namespace: mcp-servers
+spec:
+  type: authServer
+
+  authServer:
+    url: "https://mcp-authserver.toolhive-system.svc.cluster.local"
+
+    # Controller will create a cert-manager Certificate with:
+    # - CN: {mcpserver-name} (human-readable for audit logs)
+    # - URI SAN: spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}
+    # The certificate uses reasonable defaults: 90 days validity, renew at 15 days before expiry
+    clientCert:
+      # Trust domain for SPIFFE URIs in client certificates
+      trustDomain: "toolhive.local"
+      issuerRef:
+        name: toolhive-mtls-ca
+        kind: ClusterIssuer
+
+    # CA bundle for verifying authserver's server certificate
+    caBundle:
+      configMapRef:
+        name: toolhive-mtls-ca-bundle
+        key: ca.crt
+```
+
+**Example MCPServer referencing the authServer config:**
 
 ```yaml
 apiVersion: toolhive.stacklok.dev/v1alpha1
@@ -296,58 +344,43 @@ spec:
       issuer: "https://mcp-authserver.toolhive-system.svc.cluster.local"
       audience: "github-tools"
 
-  # NEW: mTLS client config for proxyrunner → authserver communication
-  authServerClientConfig:
-    url: "https://mcp-authserver.toolhive-system.svc.cluster.local"
-
-    # Controller will create a cert-manager Certificate with:
-    # - CN: github-tools.proxyrunner.mcp-servers.toolhive.local
-    # - O: ToolHive ProxyRunner
-    # - OU: mcp-servers
-    clientCert:
-      issuerRef:
-        name: toolhive-mtls-ca
-        kind: ClusterIssuer
-      duration: "2160h"    # 90 days
-      renewBefore: "360h"  # 15 days
-
-    # CA bundle for verifying authserver's server certificate
-    caBundle:
-      configMapRef:
-        name: toolhive-mtls-ca-bundle
-        key: ca.crt
+  # Reference the MCPExternalAuthConfig for authserver mTLS
+  externalAuthConfigRef:
+    name: main-authserver-client
 ```
 
 **Controller Behavior:**
 
-When `authServerClientConfig` is specified, the MCPServer controller:
+When an `MCPExternalAuthConfig` with `type: authServer` is referenced by an MCPServer:
 
-1. **Creates a cert-manager Certificate** (if `clientCert` specified):
+1. **MCPExternalAuthConfig Controller creates a cert-manager Certificate** (if `clientCert` specified):
    ```yaml
    apiVersion: cert-manager.io/v1
    kind: Certificate
    metadata:
-     name: github-tools-proxyrunner-client
+     name: github-tools-mtls
      namespace: mcp-servers
    spec:
-     secretName: github-tools-proxyrunner-client-tls
-     commonName: github-tools.proxyrunner.mcp-servers.toolhive.local
-     subject:
-       organizations: ["ToolHive ProxyRunner"]
-       organizationalUnits: ["mcp-servers"]
-     usages: ["client auth"]
+     secretName: github-tools-mtls
+     duration: 2160h    # 90 days (default)
+     renewBefore: 360h  # 15 days (default)
+     commonName: github-tools  # Human-readable for audit logs
+     uris:
+       - "spiffe://toolhive.local/ns/mcp-servers/mcpserver/github-tools"
+     usages:
+       - client auth
      issuerRef:
        name: toolhive-mtls-ca
        kind: ClusterIssuer
    ```
 
-2. **Mounts certificates to the proxyrunner pod:**
+2. **MCPServer Controller mounts certificates to the proxyrunner pod:**
    ```yaml
    volumes:
      # Client certificate for mTLS (if clientCert specified)
      - name: authserver-client-cert
        secret:
-         secretName: github-tools-proxyrunner-client-tls
+         secretName: github-tools-mtls
      # CA bundle for verifying authserver (if caBundle specified)
      - name: authserver-ca-bundle
        configMap:
@@ -361,7 +394,7 @@ When `authServerClientConfig` is specified, the MCPServer controller:
        readOnly: true
    ```
 
-3. **Sets environment variables or runconfig:**
+3. **MCPServer Controller sets runconfig:**
    ```json
    {
      "authserver_config": {
@@ -564,8 +597,9 @@ Each MCPServer gets its own client certificate. This allows the authserver to id
 │  Server Cert  │      │  Client Cert  │      │  Client Cert  │
 │ (server auth) │      │ (client auth) │      │ (client auth) │
 │               │      │               │      │               │
-│ CN: mcp-auth  │      │ CN: a.proxy   │      │ CN: b.proxy   │
-│     server... │      │    runner...  │      │    runner...  │
+│ CN: mcp-auth  │      │ CN: server-a  │      │ CN: server-b  │
+│     server... │      │ URI: spiffe://│      │ URI: spiffe://│
+│               │      │  .../server-a │      │  .../server-b │
 └───────────────┘      └───────────────┘      └───────────────┘
         │                      │                      │
         │                      │                      │
@@ -596,17 +630,21 @@ Before sending sensitive data (client JWTs, session IDs), the proxyrunner must v
 
 #### How Proxyrunner Authenticates to Authserver
 
-1. **Client Certificate Identity**:
+1. **Client Certificate Identity (SPIFFE URI)**:
    ```
-   CN=myserver.proxyrunner.mcp-servers.toolhive.local
-   O=ToolHive ProxyRunner
-   OU=mcp-servers  (namespace)
+   CN=github-tools                                              # Human-readable for audit logs
+   URI SAN=spiffe://toolhive.local/ns/mcp-servers/mcpserver/github-tools
    ```
+
+   The SPIFFE URI encodes:
+   - **Trust domain**: `toolhive.local` (organization-specific)
+   - **Namespace**: `mcp-servers` (Kubernetes namespace)
+   - **MCPServer name**: `github-tools`
 
 2. **mTLS Handshake**:
    - Proxyrunner presents client certificate signed by shared CA
    - Authserver verifies certificate chain against trusted CA
-   - Authserver extracts identity from certificate subject
+   - Authserver extracts identity from SPIFFE URI SAN
 
 3. **Identity Binding**:
    - Authserver binds proxyrunner identity to token exchange requests
@@ -819,21 +857,32 @@ The authserver exposes an internal endpoint for proxyrunners to exchange client 
 ```go
 // pkg/authserver/server/handlers/token_exchange.go
 
+import (
+    "github.com/spiffe/go-spiffe/v2/spiffeid"
+)
+
 // ProxyRunnerIdentity represents the identity extracted from a proxyrunner's mTLS client certificate
 type ProxyRunnerIdentity struct {
-    // Name is the MCPServer name (extracted from CN before ".proxyrunner")
-    Name string
-    // Namespace is the Kubernetes namespace (from OU)
+    // SpiffeID is the parsed SPIFFE ID from the certificate URI SAN
+    SpiffeID spiffeid.ID
+    // TrustDomain is the SPIFFE trust domain (e.g., "toolhive.local")
+    TrustDomain spiffeid.TrustDomain
+    // Namespace is the Kubernetes namespace (from SPIFFE URI path)
     Namespace string
-    // FullCN is the complete Common Name
-    FullCN string
+    // Name is the MCPServer name (from SPIFFE URI path)
+    Name string
+    // CommonName is the human-readable CN (for audit logs)
+    CommonName string
     // CertificateSerial is the certificate serial number (for audit logging)
     CertificateSerial string
 }
 
 // extractProxyRunnerIdentity extracts the proxyrunner identity from the mTLS client certificate.
-// Returns an error if no client certificate is present or if the certificate doesn't match
-// the expected proxyrunner certificate format.
+// The certificate must contain a SPIFFE URI SAN in the format:
+// spiffe://{trust.domain}/ns/{namespace}/mcpserver/{name}
+//
+// Returns an error if no client certificate is present or if the certificate doesn't have
+// a valid SPIFFE URI SAN.
 func extractProxyRunnerIdentity(r *http.Request) (*ProxyRunnerIdentity, error) {
     // Check for TLS connection
     if r.TLS == nil {
@@ -848,40 +897,41 @@ func extractProxyRunnerIdentity(r *http.Request) (*ProxyRunnerIdentity, error) {
     // Use the leaf certificate (first in chain)
     cert := r.TLS.PeerCertificates[0]
 
-    // Extract namespace from OU (Organizational Unit)
-    // Certificate format: OU=mcp-servers (the namespace)
-    var namespace string
-    if len(cert.Subject.OrganizationalUnit) > 0 {
-        namespace = cert.Subject.OrganizationalUnit[0]
-    } else {
-        return nil, errors.New("client certificate missing OU (namespace)")
+    // Find and parse SPIFFE ID from certificate URI SANs
+    var spiffeID spiffeid.ID
+    var found bool
+    for _, uri := range cert.URIs {
+        if uri.Scheme == "spiffe" {
+            var err error
+            spiffeID, err = spiffeid.FromURI(uri)
+            if err != nil {
+                return nil, fmt.Errorf("invalid SPIFFE URI in certificate: %w", err)
+            }
+            found = true
+            break
+        }
     }
 
-    // Extract MCPServer name from CN
-    // Certificate format: CN=github-tools.proxyrunner.mcp-servers.toolhive.local
-    cn := cert.Subject.CommonName
-    if cn == "" {
-        return nil, errors.New("client certificate missing CN")
+    if !found {
+        return nil, errors.New("client certificate missing SPIFFE URI SAN")
     }
 
-    // Parse CN to extract MCPServer name
-    // Expected format: {mcpserver-name}.proxyrunner.{namespace}.toolhive.local
-    parts := strings.Split(cn, ".")
-    if len(parts) < 4 || parts[1] != "proxyrunner" {
-        return nil, fmt.Errorf("invalid CN format: expected {name}.proxyrunner.{ns}.toolhive.local, got %s", cn)
+    // Parse path segments: /ns/{namespace}/mcpserver/{name}
+    // spiffeid.ID.Path() returns the path without leading slash
+    pathSegments := strings.Split(spiffeID.Path(), "/")
+    if len(pathSegments) != 4 || pathSegments[0] != "ns" || pathSegments[2] != "mcpserver" {
+        return nil, fmt.Errorf("invalid SPIFFE ID path format: expected ns/{namespace}/mcpserver/{name}, got %s", spiffeID.Path())
     }
-    mcpServerName := parts[0]
 
-    // Verify namespace in CN matches OU
-    cnNamespace := parts[2]
-    if cnNamespace != namespace {
-        return nil, fmt.Errorf("CN namespace (%s) doesn't match OU namespace (%s)", cnNamespace, namespace)
-    }
+    namespace := pathSegments[1]
+    mcpServerName := pathSegments[3]
 
     return &ProxyRunnerIdentity{
-        Name:              mcpServerName,
+        SpiffeID:          spiffeID,
+        TrustDomain:       spiffeID.TrustDomain(),
         Namespace:         namespace,
-        FullCN:            cn,
+        Name:              mcpServerName,
+        CommonName:        cert.Subject.CommonName, // For audit logging
         CertificateSerial: cert.SerialNumber.String(),
     }, nil
 }
@@ -923,12 +973,12 @@ func NewHandler(
     }, nil
 }
 
-// SubjectValidator validates client certificate subjects against allowed patterns
+// SubjectValidator validates client certificate SPIFFE IDs against allowed patterns
 type SubjectValidator struct {
-    // allowedOUs is a set of allowed Organizational Unit values (typically namespaces)
-    allowedOUs map[string]bool
-    // cnPattern is a compiled regex for validating Common Name format
-    cnPattern *regexp.Regexp
+    // trustDomain is the required SPIFFE trust domain
+    trustDomain spiffeid.TrustDomain
+    // allowedNamespaces is a set of allowed Kubernetes namespaces (nil means all allowed)
+    allowedNamespaces map[string]bool
 }
 
 // NewSubjectValidator creates a validator from MCPAuthServer CRD configuration
@@ -938,23 +988,22 @@ func NewSubjectValidator(allowedSubjects *AllowedSubjects) (*SubjectValidator, e
         return &SubjectValidator{}, nil
     }
 
-    validator := &SubjectValidator{}
-
-    // Build allowed OU set
-    if len(allowedSubjects.OrganizationalUnits) > 0 {
-        validator.allowedOUs = make(map[string]bool, len(allowedSubjects.OrganizationalUnits))
-        for _, ou := range allowedSubjects.OrganizationalUnits {
-            validator.allowedOUs[ou] = true
-        }
+    // Parse and validate trust domain
+    td, err := spiffeid.TrustDomainFromString(allowedSubjects.TrustDomain)
+    if err != nil {
+        return nil, fmt.Errorf("invalid trustDomain %q: %w", allowedSubjects.TrustDomain, err)
     }
 
-    // Compile CN pattern
-    if allowedSubjects.CommonNamePattern != "" {
-        pattern, err := regexp.Compile(allowedSubjects.CommonNamePattern)
-        if err != nil {
-            return nil, fmt.Errorf("invalid commonNamePattern: %w", err)
+    validator := &SubjectValidator{
+        trustDomain: td,
+    }
+
+    // Build allowed namespaces set
+    if len(allowedSubjects.AllowedNamespaces) > 0 {
+        validator.allowedNamespaces = make(map[string]bool, len(allowedSubjects.AllowedNamespaces))
+        for _, ns := range allowedSubjects.AllowedNamespaces {
+            validator.allowedNamespaces[ns] = true
         }
-        validator.cnPattern = pattern
     }
 
     return validator, nil
@@ -963,24 +1012,27 @@ func NewSubjectValidator(allowedSubjects *AllowedSubjects) (*SubjectValidator, e
 // validateSubjectAllowed checks if a proxyrunner identity is allowed based on
 // the allowedSubjects configuration from the MCPAuthServer CRD.
 //
+// Validates:
+// 1. SPIFFE trust domain matches the configured trust domain
+// 2. Namespace is in the allowed list (if configured)
+//
 // Returns nil if allowed, error if rejected.
 func (v *SubjectValidator) validateSubjectAllowed(identity *ProxyRunnerIdentity) error {
-    // If no restrictions configured, allow all
-    if v.allowedOUs == nil && v.cnPattern == nil {
+    // If no trust domain configured, allow all
+    if v.trustDomain.IsZero() {
         return nil
     }
 
-    // Check OU (namespace) restriction
-    if v.allowedOUs != nil {
-        if !v.allowedOUs[identity.Namespace] {
-            return fmt.Errorf("namespace %q is not in allowed list", identity.Namespace)
-        }
+    // Check trust domain matches
+    if !identity.TrustDomain.Equal(v.trustDomain) {
+        return fmt.Errorf("trust domain %q does not match required %q",
+            identity.TrustDomain, v.trustDomain)
     }
 
-    // Check CN pattern restriction
-    if v.cnPattern != nil {
-        if !v.cnPattern.MatchString(identity.FullCN) {
-            return fmt.Errorf("CN %q does not match allowed pattern", identity.FullCN)
+    // Check namespace restriction (if configured)
+    if v.allowedNamespaces != nil {
+        if !v.allowedNamespaces[identity.Namespace] {
+            return fmt.Errorf("namespace %q is not in allowed list", identity.Namespace)
         }
     }
 
@@ -988,14 +1040,14 @@ func (v *SubjectValidator) validateSubjectAllowed(identity *ProxyRunnerIdentity)
 }
 
 // validateSessionAudience verifies that the proxyrunner is authorized to access this session.
-// The session's audience (from the JWT) should match the MCPServer identified by the client cert.
+// The session's audience (from the JWT) should match the MCPServer identified by the SPIFFE ID.
 //
 // This prevents a compromised proxyrunner in namespace A from requesting tokens for sessions
 // that were intended for a different MCPServer in namespace B.
 //
 // Audience matching rules:
 // 1. If JWT has "aud" claim, it must match the proxyrunner's MCPServer name
-// 2. The namespace/name combination provides additional binding
+// 2. The SPIFFE ID namespace/name combination provides additional binding
 func (h *Handler) validateSessionAudience(claims map[string]interface{}, identity *ProxyRunnerIdentity) error {
     // Extract audience from JWT claims
     // Audience can be a string or array of strings
@@ -1025,10 +1077,12 @@ func (h *Handler) validateSessionAudience(claims map[string]interface{}, identit
     // Accept either:
     // - Just the MCPServer name: "github-tools"
     // - Fully qualified: "github-tools.mcp-servers" (name.namespace)
+    // - SPIFFE ID: "spiffe://toolhive.local/ns/mcp-servers/mcpserver/github-tools"
     // - Service URL format: "https://github-tools.mcp-servers.svc.cluster.local"
     expectedAudiences := map[string]bool{
         identity.Name: true,
         fmt.Sprintf("%s.%s", identity.Name, identity.Namespace): true,
+        identity.SpiffeID.String(): true,
     }
 
     // Check if any JWT audience matches expected
@@ -1046,29 +1100,29 @@ func (h *Handler) validateSessionAudience(claims map[string]interface{}, identit
         }
     }
 
-    return fmt.Errorf("token audience %v does not match proxyrunner %s/%s",
-        audiences, identity.Namespace, identity.Name)
+    return fmt.Errorf("token audience %v does not match proxyrunner SPIFFE ID %s",
+        audiences, identity.SpiffeID)
 }
 
 func (h *Handler) TokenExchangeHandler(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
 
-    // 1. Extract proxyrunner identity from mTLS client cert
+    // 1. Extract proxyrunner identity from mTLS client cert SPIFFE ID
     identity, err := extractProxyRunnerIdentity(r)
     if err != nil {
-        logger.Warnf("mTLS identity extraction failed: %v", err)
-        h.writeError(w, fosite.ErrAccessDenied.WithHint("mTLS client certificate required"))
+        logger.Warnf("SPIFFE identity extraction failed: %v", err)
+        h.writeError(w, fosite.ErrAccessDenied.WithHint("mTLS client certificate with SPIFFE URI required"))
         return
     }
 
-    logger.Infof("Token exchange request from proxyrunner %s/%s (cert serial: %s)",
-        identity.Namespace, identity.Name, identity.CertificateSerial)
+    logger.Infof("Token exchange request from proxyrunner %s (cert serial: %s)",
+        identity.SpiffeID, identity.CertificateSerial)
 
-    // 2. Validate proxyrunner is allowed based on allowedSubjects from MCPAuthServer CRD
+    // 2. Validate proxyrunner SPIFFE ID is allowed based on allowedSubjects from MCPAuthServer CRD
     //    h.subjectValidator is initialized from config at startup
     if err := h.subjectValidator.validateSubjectAllowed(identity); err != nil {
-        logger.Warnf("Proxyrunner %s/%s rejected by subject policy: %v",
-            identity.Namespace, identity.Name, err)
+        logger.Warnf("Proxyrunner %s rejected by subject policy: %v",
+            identity.SpiffeID, err)
         h.writeError(w, fosite.ErrAccessDenied.WithHintf(
             "proxyrunner not allowed: %s", err.Error()))
         return
@@ -1112,10 +1166,10 @@ func (h *Handler) TokenExchangeHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     // 6. Verify proxyrunner is authorized for this specific session
-    //    The session's audience should match the MCPServer making the request
+    //    The session's audience should match the MCPServer identified by the SPIFFE ID
     if err := h.validateSessionAudience(claims, identity); err != nil {
-        logger.Warnf("Session audience mismatch for proxyrunner %s/%s: %v",
-            identity.Namespace, identity.Name, err)
+        logger.Warnf("Session audience mismatch for proxyrunner %s: %v",
+            identity.SpiffeID, err)
         h.writeError(w, fosite.ErrAccessDenied.WithHintf(
             "proxyrunner not authorized for this session: %s", err.Error()))
         return
@@ -1524,16 +1578,23 @@ type AuthServerClientConfig struct {
 | `cmd/thv-operator/api/v1alpha1/mcpauthserver_types.go` | MCPAuthServer CRD with mTLS config |
 | `cmd/thv-operator/controllers/mcpauthserver_controller.go` | MCPAuthServer reconciler |
 | `pkg/authserver/server/handlers/token_exchange.go` | Token exchange endpoint for proxyrunners |
-| `pkg/authserver/server/handlers/subject_validator.go` | mTLS subject validation (allowedSubjects) |
+| `pkg/authserver/server/handlers/subject_validator.go` | SPIFFE ID validation (allowedSubjects) |
 | `pkg/auth/authserver/client.go` | Client for proxyrunner → authserver mTLS calls |
 | `pkg/auth/authserver/cache.go` | Token cache for exchanged tokens |
+
+### New Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `github.com/spiffe/go-spiffe/v2/spiffeid` | SPIFFE ID parsing and validation for mTLS client certificates |
 
 ### Modified Files
 
 | File | Changes |
 |------|---------|
-| `cmd/thv-operator/api/v1alpha1/mcpserver_types.go` | Add `AuthServerClientConfig` for mTLS client certs |
-| `cmd/thv-operator/controllers/mcpserver_controller.go` | Create cert-manager Certificate for proxyrunner, mount CA bundle |
+| `cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go` | Add `authServer` type and `AuthServerConfig` struct for mTLS client certs |
+| `cmd/thv-operator/controllers/mcpexternalauthconfig_controller.go` | Create cert-manager Certificate for proxyrunner when `type: authServer` |
+| `cmd/thv-operator/controllers/mcpserver_controller.go` | Mount CA bundle and client cert Secret from MCPExternalAuthConfig |
 | `pkg/networking/http_client.go` | Add `WithClientCertificate()` to HttpClientBuilder |
 | `pkg/authserver/server/handlers/handler.go` | Add `subjectValidator` field, update `NewHandler()`, register token exchange route |
 | `pkg/authserver/storage/types.go` | Add `GetUpstreamTokensForRefresh(ctx, tsid)` method (bypasses expiry check) |
@@ -1550,7 +1611,7 @@ type AuthServerClientConfig struct {
 **Shared Types:**
 
 1. Create `certmanager_types.go` with shared types:
-   - `CertManagerIssuerReference` (used by both MCPAuthServer and MCPServer)
+   - `CertManagerIssuerReference` (used by both MCPAuthServer and MCPExternalAuthConfig)
 
 **MCPAuthServer CRD:**
 
@@ -1559,7 +1620,7 @@ type AuthServerClientConfig struct {
    - `AuthServerTLSConfig` (serverCert, clientAuth)
    - `ServerCertConfig` (issuerRef, duration, renewBefore)
    - `ClientAuthConfig` (caBundle, allowedSubjects)
-   - `AllowedSubjects` (organizationalUnits, commonNamePattern)
+   - `AllowedSubjects` (trustDomain, allowedNamespaces) - uses SPIFFE URI patterns
 3. Run `make generate` and `make manifests`
 
 ### Phase 2: Authserver Server-Side mTLS
@@ -1648,27 +1709,37 @@ type AuthServerClientConfig struct {
 7. Test middleware with mock authserver client
 8. Test fallback behavior when authserver fails
 
-### Phase 6: MCPServer CRD Updates
+### Phase 6: MCPExternalAuthConfig CRD Updates
 
-**CRD Changes (`cmd/thv-operator/api/v1alpha1/mcpserver_types.go`):**
+**CRD Changes (`cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go`):**
 
-1. Add `AuthServerClientConfig` to `MCPServerSpec`
-2. Add `ClientCertificateConfig` type (uses shared `CertManagerIssuerReference`)
-3. Run `make generate` and `make manifests`
+1. Add `ExternalAuthTypeAuthServer` constant to enum
+2. Add `AuthServer *AuthServerConfig` field to `MCPExternalAuthConfigSpec`
+3. Add `AuthServerConfig` struct (url, clientCert, caBundle)
+4. Add `ClientCertificateConfig` type (issuerRef, trustDomain for SPIFFE URIs)
+5. Run `make generate` and `make manifests`
+
+**Controller Updates (`cmd/thv-operator/controllers/mcpexternalauthconfig_controller.go`):**
+
+6. When `type: authServer`, create cert-manager `Certificate` for each referencing MCPServer:
+   - Certificate name: `{mcpserver-name}-mtls`
+   - CN: `{mcpserver-name}` (human-readable for audit logs)
+   - URI SAN: `spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}`
+   - Uses default duration (90 days) and renewBefore (15 days)
+7. Track certificate readiness in status
 
 ### Phase 7: MCPServer Controller Integration
 
 **Controller Updates (`cmd/thv-operator/controllers/mcpserver_controller.go`):**
 
-1. Check for `authServerClientConfig` in spec
-2. If `clientCert` specified:
-   - Create cert-manager `Certificate` resource
-   - Wait for certificate to be ready
-3. Mount client cert Secret and CA bundle ConfigMap to proxyrunner pod:
+1. When `externalAuthConfigRef` references an MCPExternalAuthConfig with `type: authServer`:
+   - Resolve the MCPExternalAuthConfig
+   - Get the client cert Secret name for this MCPServer
+2. Mount client cert Secret and CA bundle ConfigMap to proxyrunner pod:
    - Add volume from Secret (client cert)
    - Add volume from ConfigMap (CA bundle)
    - Add volumeMounts to `/etc/toolhive/authserver-mtls` and `/etc/toolhive/authserver-ca`
-4. Configure runconfig with authserver client paths
+3. Configure runconfig with authserver client paths
 
 ### Phase 8: Authserver Service Binary
 

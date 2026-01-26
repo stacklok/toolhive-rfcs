@@ -9,7 +9,7 @@
 
 ## Summary
 
-This RFC proposes deploying `pkg/authserver` as a standalone Kubernetes service with mutual TLS (mTLS) authentication between the authserver and proxyrunner components. The design introduces a new `MCPAuthServer` CRD, extends the `MCPServer` CRD for mTLS client configuration, and implements a secure token exchange flow where proxyrunners can retrieve upstream IDP tokens from the authserver.
+This RFC proposes deploying `pkg/authserver` as a standalone Kubernetes service with mutual TLS (mTLS) authentication between the authserver and proxyrunner components. The design introduces a new `MCPAuthServer` CRD, adds a new `authServer` type to `MCPExternalAuthConfig` for mTLS client configuration, and implements a secure token exchange flow where proxyrunners can retrieve upstream IDP tokens from the authserver. Client certificate identity uses SPIFFE URIs for standardized workload identification.
 
 ## Problem Statement
 
@@ -134,11 +134,12 @@ spec:
         configMapRef:
           name: toolhive-mtls-ca-bundle
           key: ca.crt
+      # Uses SPIFFE URI format: spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}
       allowedSubjects:
-        organizationalUnits:
+        trustDomain: "toolhive.local"
+        allowedNamespaces:
           - "toolhive-system"
           - "mcp-servers"
-        commonNamePattern: "^[a-z0-9-]+\\.proxyrunner\\.[a-z0-9-]+\\.toolhive\\.local$"
 ```
 
 The MCPAuthServer controller creates:
@@ -148,9 +149,38 @@ The MCPAuthServer controller creates:
 4. **ConfigMap** for runtime configuration
 5. **ServiceAccount** for RBAC
 
-#### MCPServer CRD Updates
+#### MCPExternalAuthConfig Updates (authServer type)
 
-Add `authServerClientConfig` to configure mTLS client certificates for proxyrunners:
+Add a new `authServer` type to `MCPExternalAuthConfig` for configuring mTLS client certificates. This leverages the existing external auth config pattern and allows the same authserver configuration to be shared across multiple MCPServer resources.
+
+**MCPExternalAuthConfig for authServer:**
+
+```yaml
+apiVersion: toolhive.stacklok.dev/v1alpha1
+kind: MCPExternalAuthConfig
+metadata:
+  name: main-authserver-client
+  namespace: mcp-servers
+spec:
+  type: authServer
+
+  authServer:
+    url: "https://mcp-authserver.toolhive-system.svc.cluster.local"
+
+    # Controller creates cert-manager Certificate with SPIFFE URI SAN
+    clientCert:
+      trustDomain: "toolhive.local"
+      issuerRef:
+        name: toolhive-mtls-ca
+        kind: ClusterIssuer
+
+    caBundle:
+      configMapRef:
+        name: toolhive-mtls-ca-bundle
+        key: ca.crt
+```
+
+**MCPServer referencing the authServer config:**
 
 ```yaml
 apiVersion: toolhive.stacklok.dev/v1alpha1
@@ -168,19 +198,14 @@ spec:
       issuer: "https://mcp-authserver.toolhive-system.svc.cluster.local"
       audience: "github-tools"
 
-  authServerClientConfig:
-    url: "https://mcp-authserver.toolhive-system.svc.cluster.local"
-    clientCert:
-      issuerRef:
-        name: toolhive-mtls-ca
-        kind: ClusterIssuer
-      duration: "2160h"
-      renewBefore: "360h"
-    caBundle:
-      configMapRef:
-        name: toolhive-mtls-ca-bundle
-        key: ca.crt
+  # Reference the MCPExternalAuthConfig for authserver mTLS
+  externalAuthConfigRef:
+    name: main-authserver-client
 ```
+
+The controller generates a cert-manager Certificate with:
+- **CN**: `{mcpserver-name}` (human-readable for audit logs)
+- **URI SAN**: `spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}`
 
 #### OAuth Discovery Flow (RFC 9728)
 
@@ -210,13 +235,16 @@ When a proxyrunner needs upstream IDP tokens (e.g., to call a GitHub API):
 | Component | Changes |
 |-----------|---------|
 | `pkg/networking/http_client.go` | Add `WithClientCertificate()` method to `HttpClientBuilder` |
-| `pkg/authserver/server/handlers/` | Add token exchange endpoint, subject validator, mTLS identity extraction |
+| `pkg/authserver/server/handlers/` | Add token exchange endpoint, SPIFFE ID validator, mTLS identity extraction |
 | `pkg/authserver/storage/` | Add `GetUpstreamTokensForRefresh()` method |
 | `pkg/auth/authserver/` | New package for proxyrunner authserver client with caching |
 | `pkg/runner/config.go` | Add `AuthServerConfig` struct |
 | `cmd/thv-authserver/` | New service binary entry point |
-| `cmd/thv-operator/api/v1alpha1/` | New CRD types for MCPAuthServer and shared cert-manager types |
-| `cmd/thv-operator/controllers/` | New MCPAuthServer controller, updates to MCPServer controller |
+| `cmd/thv-operator/api/v1alpha1/` | New MCPAuthServer CRD, shared cert-manager types, `authServer` type added to MCPExternalAuthConfig |
+| `cmd/thv-operator/controllers/` | New MCPAuthServer controller, updates to MCPExternalAuthConfig and MCPServer controllers |
+
+**New Dependency:**
+| `github.com/spiffe/go-spiffe/v2/spiffeid` | SPIFFE ID parsing and validation for mTLS client certificates |
 
 #### API Changes
 
@@ -274,8 +302,8 @@ func (b *HttpClientBuilder) WithClientCertificate(certPath, keyPath string) *Htt
 
 - **Proxyrunner → Authserver**: mTLS with per-MCPServer client certificates
 - **Client → Authserver**: OAuth 2.0 with PKCE
-- **Certificate Identity**: CN includes MCPServer name and namespace; OU contains namespace for access control
-- **Subject Validation**: Configurable `allowedSubjects` restricts which namespaces/certificates can connect
+- **Certificate Identity**: SPIFFE URI SAN (`spiffe://{trustDomain}/ns/{namespace}/mcpserver/{name}`) provides standardized workload identity; CN is human-readable for audit logs
+- **Subject Validation**: Configurable `allowedSubjects` restricts access by trust domain and allowed namespaces
 
 ### Data Security
 
@@ -326,8 +354,9 @@ func (b *HttpClientBuilder) WithClientCertificate(certPath, keyPath string) *Htt
 
 ### Backward Compatibility
 
-- Existing MCPServer deployments without `authServerClientConfig` continue to work unchanged
-- The `authServerClientConfig` field is optional
+- Existing MCPServer deployments without `externalAuthConfigRef` continue to work unchanged
+- The `externalAuthConfigRef` field is optional
+- Existing MCPExternalAuthConfig types (tokenExchange, headerInjection, bearerToken, unauthenticated) continue to work
 - Existing proxyrunner OIDC validation continues to work (can point directly to upstream IDP or to authserver)
 
 ### Forward Compatibility
@@ -335,57 +364,6 @@ func (b *HttpClientBuilder) WithClientCertificate(certPath, keyPath string) *Htt
 - CRD design accommodates future storage backends (Redis) via abstraction
 - Certificate configuration extensible to support additional issuer types
 - Token exchange endpoint follows RFC 8693 patterns for future scope expansion
-
-## Implementation Plan
-
-### Phase 1: MCPAuthServer CRD and Shared Types
-- Create shared `CertManagerIssuerReference` type
-- Create MCPAuthServer CRD types
-- Run code generation
-
-### Phase 2: Authserver Server-Side mTLS
-- Implement `SubjectValidator` for certificate validation
-- Implement `extractProxyRunnerIdentity()` for mTLS identity extraction
-- Implement `TokenExchangeHandler` endpoint
-- Add storage methods for token refresh
-
-### Phase 3: HttpClientBuilder mTLS Support
-- Add `WithClientCertificate()` method
-- Update `Build()` to configure client certificates
-
-### Phase 4: ProxyRunner Authserver Client
-- Create `AuthServerClient` with mTLS configuration
-- Implement `TokenCache` for caching exchanged tokens
-- Implement token exchange logic
-
-### Phase 5: RunConfig and Middleware Integration
-- Extend `RunConfig` with authserver configuration
-- Update token exchange middleware to use authserver client
-
-### Phase 6: MCPServer CRD Updates
-- Add `AuthServerClientConfig` to MCPServerSpec
-- Add `ClientCertificateConfig` type
-
-### Phase 7: MCPServer Controller Integration
-- Create cert-manager Certificate for proxyrunner client certs
-- Mount certificates and CA bundle to pods
-- Configure runconfig with certificate paths
-
-### Phase 8: Authserver Service Binary
-- Create `cmd/thv-authserver/` entry point
-- Implement HTTP server with mTLS
-- Add health/readiness endpoints
-- Create Dockerfile and build configuration
-
-### Phase 9: MCPAuthServer Controller
-- Implement controller reconciliation logic
-- Create Deployment, Service, ConfigMap resources
-- Handle certificate readiness
-
-### Phase 10: Integration and E2E Testing
-- mTLS handshake tests
-- Token exchange flow tests
-- Full end-to-end tests with cert-manager
 
 ## Testing Strategy
 
@@ -410,9 +388,11 @@ func (b *HttpClientBuilder) WithClientCertificate(certPath, keyPath string) *Htt
 
 - [RFC 9728: OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
 - [RFC 8693: OAuth 2.0 Token Exchange](https://datatracker.ietf.org/doc/html/rfc8693)
+- [SPIFFE: Secure Production Identity Framework for Everyone](https://spiffe.io/)
+- [go-spiffe Library](https://github.com/spiffe/go-spiffe)
 - [cert-manager Documentation](https://cert-manager.io/docs/)
 - [Fosite OAuth2 Framework](https://github.com/ory/fosite)
-- [THV-00XX-standalone-auth-server-design.md](THV-00XX-standalone-auth-server-design.md) - Detailed design document
+- [THV-0028-standalone-auth-server-design.md](THV-0028-standalone-auth-server-design.md) - Detailed design document
 
 ---
 
