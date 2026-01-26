@@ -64,8 +64,8 @@ flowchart TB
     subgraph Registry["Registry Server"]
         Sync["Sync Handler"]
         DB[(Database)]
-        ExtAPI["Extension API<br/>/v0.1/x/dev.toolhive/skills"]
-        CoreAPI["Core API<br/>/registry/v0.1/servers"]
+        ExtAPI["Extension API<br/>/{regName}/v0.1/x/dev.toolhive/skills"]
+        CoreAPI["Core API<br/>/{regName}/v0.1/servers"]
     end
 
     subgraph Clients["Clients"]
@@ -99,7 +99,9 @@ The skill data model follows the [Agent Skills specification](https://agentskill
 | `namespace` | string | 3-128 chars, reverse-DNS pattern | Ownership scope (e.g., `io.github.stacklok`) |
 | `name` | string | 1-64 chars, lowercase alphanumeric + hyphens | Skill identifier |
 | `description` | string | 1-1024 chars | Human-readable description |
-| `version` | string | Semantic version pattern | Version identifier |
+| `version` | string | Any non-empty string | Version identifier (derived from OCI tag or Git ref if not in SKILL.md metadata) |
+
+> **Note on versioning:** While the Agent Skills specification treats `version` as optional metadata in SKILL.md, the registry requires version as part of the unique identifier (`namespace/name/version`). When publishing a skill, if the SKILL.md does not include a version, it can be derived from the OCI image tag (e.g., `ghcr.io/org/skill:v1.0.0` → version `v1.0.0`) or Git ref. The version field accepts any non-empty string format (semver, commit hashes, dates, etc.).
 
 **Optional Fields:**
 
@@ -149,16 +151,16 @@ The implementation should include appropriate indexes for common query patterns 
 
 #### API Changes
 
-New endpoints follow the upstream MCP Registry extension specification using the `/v0.1/x/<namespace>/<extension>` pattern:
+New endpoints follow the upstream MCP Registry extension specification using the `/{regName}/v0.1/x/<namespace>/<extension>` pattern. All endpoints are **registry-scoped** (not aggregated across all registries) to match the pattern established for MCP servers:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/v0.1/x/dev.toolhive/skills` | List all skills (paginated) |
-| GET | `/v0.1/x/dev.toolhive/skills/{namespace}/{name}` | Get latest version |
-| GET | `/v0.1/x/dev.toolhive/skills/{namespace}/{name}/versions` | List all versions |
-| GET | `/v0.1/x/dev.toolhive/skills/{namespace}/{name}/versions/{version}` | Get specific version |
-| POST | `/v0.1/x/dev.toolhive/registries/{regName}/skills` | Publish skill |
-| DELETE | `/v0.1/x/dev.toolhive/registries/{regName}/skills/{namespace}/{name}/versions/{version}` | Delete skill |
+| GET | `/{regName}/v0.1/x/dev.toolhive/skills` | List skills in registry (paginated, latest versions) |
+| GET | `/{regName}/v0.1/x/dev.toolhive/skills/{namespace}/{name}` | Get latest version |
+| GET | `/{regName}/v0.1/x/dev.toolhive/skills/{namespace}/{name}/versions` | List all versions |
+| GET | `/{regName}/v0.1/x/dev.toolhive/skills/{namespace}/{name}/versions/{version}` | Get specific version |
+| POST | `/{regName}/v0.1/x/dev.toolhive/skills` | Publish skill (version required) |
+| DELETE | `/{regName}/v0.1/x/dev.toolhive/skills/{namespace}/{name}/versions/{version}` | Delete specific version |
 
 **Query Parameters (List endpoints):**
 
@@ -166,7 +168,7 @@ New endpoints follow the upstream MCP Registry extension specification using the
 |-----------|------|-------------|
 | `search` | string | Filter by name/description substring |
 | `namespace` | string | Filter by namespace |
-| `status` | string | Filter by status (active/deprecated/archived) |
+| `status` | string | Filter by status; supports comma-separated values for IN filtering (e.g., `status=active,deprecated`). Default: all statuses |
 | `limit` | integer | Max results (default: 50, max: 100) |
 | `cursor` | string | Pagination cursor |
 
