@@ -1,4 +1,4 @@
-# RFC-XXXX: Skills Lifecycle Management in ToolHive CLI
+# RFC-0030: Skills Lifecycle Management in ToolHive CLI
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
