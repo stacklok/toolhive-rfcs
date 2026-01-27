@@ -46,35 +46,52 @@ Integrate the ToolHive authorization server (`pkg/authserver/`) into the proxy r
 flowchart TB
     subgraph "Kubernetes Cluster"
         subgraph "Proxy Runner Pod"
-            PR[Proxy Runner]
-            EAS[Embedded Auth Server]
-            MCP[MCP Proxy]
+            subgraph "Proxy Runner Container"
+                subgraph "HTTP Server :8080"
+                    AuthRoutes["/oauth/*, /.well-known/*<br/>(Auth Server Handler)"]
+                    MCPRoutes["/mcp, /sse<br/>(MCP Proxy Handler)"]
+                end
+                AuthServer["Embedded Auth Server<br/>(fosite, storage, upstream)"]
+                MCPProxy["MCP Transport<br/>(SSE/Streamable-HTTP)"]
+            end
         end
 
-        subgraph "Secrets"
-            SK[Signing Keys Secret]
+        subgraph "Mounted Secrets"
+            SK[Signing Keys]
             HS[HMAC Secrets]
-            CS[Client Secret]
         end
 
-        RC[RunConfig ConfigMap]
+        subgraph "Mounted ConfigMaps"
+            RC[RunConfig]
+        end
+
+        CS[Upstream Client Secret<br/>via Env Var]
     end
 
     UP[Upstream IDP<br/>Okta/Azure AD/etc.]
     Client[MCP Client]
 
-    Client -->|1. GET /oauth/authorize| EAS
-    EAS -->|2. Redirect to IDP| UP
-    UP -->|3. Callback with code| EAS
-    EAS -->|4. Exchange code| UP
-    EAS -->|5. Issue access token| Client
-    Client -->|6. MCP request + token| MCP
+    AuthRoutes --> AuthServer
+    MCPRoutes --> MCPProxy
 
-    SK -.->|Volume mount| PR
-    HS -.->|Volume mount| PR
-    CS -.->|Volume mount| PR
-    RC -.->|Volume mount| PR
+    Client -->|1. GET /oauth/authorize| AuthRoutes
+    AuthServer -->|2. Redirect to IDP| UP
+    UP -->|3. Callback with code| AuthRoutes
+    AuthServer -->|4. Exchange code| UP
+    AuthServer -->|5. Issue JWT access token| Client
+    Client -->|6. MCP request + Bearer token| MCPRoutes
+
+    SK -.->|Volume: /etc/toolhive/authserver/keys/| AuthServer
+    HS -.->|Volume: /etc/toolhive/authserver/hmac/| AuthServer
+    CS -.->|TOOLHIVE_UPSTREAM_CLIENT_SECRET| AuthServer
+    RC -.->|Volume: /etc/runconfig/| MCPProxy
 ```
+
+**Architecture Notes:**
+- **Single container**: The proxy runner is one container running one HTTP server
+- **Shared HTTP server**: Auth server routes (`/oauth/*`, `/.well-known/*`) and MCP proxy routes (`/mcp`, `/sse`) are mounted on the same HTTP server
+- **Route priority**: Auth server routes are registered first, MCP proxy routes handle remaining paths
+- **In-process**: Embedded auth server runs as Go code within the proxy runner process (not a separate sidecar)
 
 ### Detailed Design
 
