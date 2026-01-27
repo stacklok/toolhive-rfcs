@@ -93,7 +93,13 @@ const (
 **2. New Controller Utility: Volume Generation**
 
 New file [cmd/thv-operator/pkg/controllerutil/authserver.go](cmd/thv-operator/pkg/controllerutil/authserver.go):
-- `GenerateAuthServerVolumes()` - Creates volume and mount configs for signing keys, HMAC secrets, and upstream client secrets
+- `GenerateAuthServerVolumes()` - Creates volume and mount configs for signing keys and HMAC secrets
+  - Follows pgpass pattern from [registryapi/podtemplatespec.go](cmd/thv-operator/pkg/registryapi/podtemplatespec.go)
+  - Uses `corev1.SecretVolumeSource` with `Items[].KeyToPath` mapping
+  - Sets `DefaultMode: 0400` for restrictive permissions
+- `GenerateAuthServerEnvVars()` - Creates env var for upstream client secret
+  - Follows pattern from [tokenexchange.go](cmd/thv-operator/pkg/controllerutil/tokenexchange.go) and [oidc.go](cmd/thv-operator/pkg/controllerutil/oidc.go)
+  - Uses `SecretKeyRef` for `TOOLHIVE_UPSTREAM_CLIENT_SECRET`
 - `AddEmbeddedAuthServerConfigOptions()` - Adds auth server config to runner options
 
 **3. New Runner Component: Embedded Auth Server Wrapper**
@@ -202,15 +208,27 @@ type RunConfig struct {
 type EmbeddedAuthServerConfig struct {
     Enabled              bool                    `json:"enabled"`
     Issuer               string                  `json:"issuer"`
-    KeysDir              string                  `json:"keys_dir"`
-    SigningKeyFile       string                  `json:"signing_key_file"`
-    FallbackKeyFiles     []string                `json:"fallback_key_files,omitempty"`
-    HMACSecretFiles      []string                `json:"hmac_secret_files"`
+    KeysDir              string                  `json:"keys_dir"`              // Volume mount path
+    SigningKeyFile       string                  `json:"signing_key_file"`       // Filename (relative to KeysDir)
+    FallbackKeyFiles     []string                `json:"fallback_key_files,omitempty"` // Filenames for rotation
+    HMACSecretFiles      []string                `json:"hmac_secret_files"`      // Volume mount paths
     AccessTokenLifespan  time.Duration           `json:"access_token_lifespan"`
     RefreshTokenLifespan time.Duration           `json:"refresh_token_lifespan"`
     AuthCodeLifespan     time.Duration           `json:"auth_code_lifespan"`
     AllowedAudiences     []string                `json:"allowed_audiences,omitempty"`
     UpstreamProvider     *UpstreamProviderConfig `json:"upstream_provider"`
+}
+
+type UpstreamProviderConfig struct {
+    Type                  string   `json:"type"` // "oidc" or "oauth2"
+    IssuerURL             string   `json:"issuer_url,omitempty"`             // OIDC only
+    AuthorizationEndpoint string   `json:"authorization_endpoint,omitempty"` // OAuth2 only
+    TokenEndpoint         string   `json:"token_endpoint,omitempty"`         // OAuth2 only
+    UserInfoEndpoint      string   `json:"userinfo_endpoint,omitempty"`      // OAuth2 only
+    ClientID              string   `json:"client_id"`
+    ClientSecretEnvVar    string   `json:"client_secret_env_var,omitempty"`  // Env var name (follows existing pattern)
+    RedirectURI           string   `json:"redirect_uri"`
+    Scopes                []string `json:"scopes,omitempty"`
 }
 ```
 
@@ -264,15 +282,51 @@ spec:
 
 #### Data Model Changes
 
-**Volume Mount Paths:**
+**Secret Mounting Strategy (follows existing precedent):**
 
-| Secret Type | Mount Path |
-|-------------|------------|
-| Signing Key (index N) | `/etc/toolhive/authserver/keys/key-{N}.pem` |
-| HMAC Secret (index N) | `/etc/toolhive/authserver/hmac/hmac-{N}` |
-| Upstream Client Secret | `/etc/toolhive/authserver/upstream/client-secret` |
+ToolHive uses two patterns for secrets in K8s deployments:
 
-All volumes mounted with `0400` permissions (read-only for owner).
+1. **Environment Variables** (via `SecretKeyRef`): For simple string secrets
+   - Examples: `TOOLHIVE_TOKEN_EXCHANGE_CLIENT_SECRET`, `TOOLHIVE_OIDC_CLIENT_SECRET`
+   - Pattern: [tokenexchange.go](cmd/thv-operator/pkg/controllerutil/tokenexchange.go), [oidc.go](cmd/thv-operator/pkg/controllerutil/oidc.go)
+
+2. **Secret Volumes**: For file-based secrets (PEM files, credential files)
+   - Precedent: pgpass mounting in [registryapi/podtemplatespec.go](cmd/thv-operator/pkg/registryapi/podtemplatespec.go)
+   - Uses `corev1.SecretVolumeSource` with `Items[].KeyToPath` mapping
+
+For embedded auth server:
+- **Signing keys** (PEM files): Must use volume mounts - multi-line binary content too large for env vars
+- **HMAC secrets**: Use volume mounts for consistency with signing keys
+- **Upstream client secret**: Use environment variable (simple string, follows existing pattern)
+
+**Volume Mount Configuration:**
+
+```go
+// Following pgpass precedent from registryapi/podtemplatespec.go
+volumes = append(volumes, corev1.Volume{
+    Name: "signing-key-0",
+    VolumeSource: corev1.VolumeSource{
+        Secret: &corev1.SecretVolumeSource{
+            SecretName: secretRef.Name,
+            Items: []corev1.KeyToPath{{
+                Key:  secretRef.Key,
+                Path: "key-0.pem",
+            }},
+            DefaultMode: ptr.To(int32(0400)), // Read-only for owner
+        },
+    },
+})
+```
+
+**Mount Paths:**
+
+| Secret Type | Mount Method | Path/Variable |
+|-------------|--------------|---------------|
+| Signing Key (index N) | Volume | `/etc/toolhive/authserver/keys/key-{N}.pem` |
+| HMAC Secret (index N) | Volume | `/etc/toolhive/authserver/hmac/hmac-{N}` |
+| Upstream Client Secret | Env Var | `TOOLHIVE_UPSTREAM_CLIENT_SECRET` |
+
+All secret volumes mounted with `0400` permissions (read-only for owner), following the pgpass precedent.
 
 ---
 
@@ -310,11 +364,16 @@ All volumes mounted with `0400` permissions (read-only for owner).
 
 ### Secrets Management
 
-| Secret | Storage | Rotation Support |
-|--------|---------|------------------|
-| Signing keys | K8s Secret → Volume | Yes, via list (first active, rest for verification) |
-| HMAC secrets | K8s Secret → Volume | Yes, via list (first current, rest for decryption) |
-| Upstream client secret | K8s Secret → Volume | Manual (update secret, restart pod) |
+| Secret | Mount Method | Env Var / Path | Rotation Support |
+|--------|--------------|----------------|------------------|
+| Signing keys | Volume (SecretVolumeSource) | `/etc/toolhive/authserver/keys/` | Yes, via list (first active, rest for verification) |
+| HMAC secrets | Volume (SecretVolumeSource) | `/etc/toolhive/authserver/hmac/` | Yes, via list (first current, rest for decryption) |
+| Upstream client secret | Env Var (SecretKeyRef) | `TOOLHIVE_UPSTREAM_CLIENT_SECRET` | Manual (update secret, restart pod) |
+
+**Alignment with existing patterns:**
+- Upstream client secret uses env var pattern (same as `TOOLHIVE_OIDC_CLIENT_SECRET`)
+- Signing keys use volume pattern (same as pgpass in registry API)
+- HMAC secrets use volume pattern for consistency with signing keys
 
 ### Audit and Logging
 
