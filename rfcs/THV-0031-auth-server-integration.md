@@ -1,11 +1,11 @@
-# RFC-XXXX: Embedded Authorization Server in Proxy Runner
+# RFC-0031: Embedded Authorization Server in Proxy Runner
 
 - **Status**: Draft
 - **Author(s)**: @tgrunnagle
 - **Created**: 2026-01-27
 - **Last Updated**: 2026-01-27
 - **Target Repository**: toolhive
-- **Related Issues**: TBD
+- **Related Issues**: #195
 
 ## Summary
 
