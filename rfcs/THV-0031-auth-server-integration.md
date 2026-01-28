@@ -1,6 +1,6 @@
 # RFC-0031: Embedded Authorization Server in Proxy Runner
 
-- **Status**: Draft
+- **Status**: Accepted
 - **Author(s)**: @tgrunnagle
 - **Created**: 2026-01-27
 - **Last Updated**: 2026-01-27
@@ -583,6 +583,7 @@ None - all design questions resolved.
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-01-27 | TBD | Draft | Initial submission |
+| 2026-01-28 | @jhrozek | Accepted | |
 
 ### Implementation Tracking
 
