@@ -23,7 +23,7 @@ Integrate the ToolHive authorization server (`pkg/authserver/`) into the proxy r
 
 - Add a new `embeddedAuthServer` type to `MCPExternalAuthConfig` CRD
 - Support signing key rotation via list of secret references (first is active, rest are on JWKS for verification)
-- Support HMAC secret rotation for internal token encryption
+- Support HMAC secret rotation for internal token signing
 - Support upstream identity providers (OIDC with discovery, OAuth2 with explicit endpoints)
 - Mount signing keys and HMAC secrets as volumes (not environment variables) for better security
 - Run the authorization server in-process with the proxy runner
@@ -31,7 +31,8 @@ Integrate the ToolHive authorization server (`pkg/authserver/`) into the proxy r
 
 ## Non-Goals
 
-- **Multi-replica support**: Memory-based storage limits to single replica (existing constraint)
+- **vMCP support**: The design for embedding the Authorization Server in the vMCP binary will be a separate RFC
+- **Multi-replica support**: Memory-based storage limits to single replica (existing constraint); the implementation allows for a distributed (e.g. Redis) solution to be plugged in later
 - **Standalone auth server deployment**: This RFC focuses on in-process integration only
 - **Multiple upstream IDPs**: Initially only one upstream provider is supported (error if multiple configured)
 - **Local CLI support**: Kubernetes deployments only
@@ -121,7 +122,7 @@ New file [cmd/thv-operator/pkg/controllerutil/authserver.go](cmd/thv-operator/pk
 
 **3. New Runner Component: Embedded Auth Server Wrapper**
 
-New file [pkg/runner/authserver.go](pkg/runner/authserver.go):
+New file [pkg/authserver/runner/authserver.go](pkg/authserver/runner/authserver.go):
 - `EmbeddedAuthServer` struct wrapping auth server lifecycle
 - `NewEmbeddedAuthServer()` - Initializes from RunConfig
 - `Handler()` - Returns HTTP handler for routes
@@ -134,11 +135,28 @@ Modify [pkg/runner/runner.go](pkg/runner/runner.go):
 - Mount auth server handler on transport config
 - Cleanup on shutdown
 
-**5. Transport Integration**
+**5. Transport Integration (Generic PrefixHandlers)**
 
-Modify [pkg/transport/http.go](pkg/transport/http.go):
-- Add `AuthServerHandler` field to transport config
-- Mount auth server routes before MCP proxy routes
+Add generic route mounting capability to transport (keeps transport agnostic to auth server):
+
+Modify [pkg/transport/types/transport.go](pkg/transport/types/transport.go):
+- Add `PrefixHandlers map[string]http.Handler` field to `Config` struct
+- Generic mechanism for mounting additional HTTP handlers at path prefixes
+
+Modify [pkg/transport/proxy/transparent/transparent_proxy.go](pkg/transport/proxy/transparent/transparent_proxy.go):
+- Add `prefixHandlers` field
+- Iterate and mount handlers in `Start()` before the catch-all proxy handler
+- Go's `http.ServeMux` longest-match routing ensures specific paths take precedence
+
+**Usage by auth server** (in `pkg/runner/runner.go`):
+```go
+transportConfig.PrefixHandlers = map[string]http.Handler{
+    "/oauth/":                                authServer.OAuthHandler(),
+    "/.well-known/oauth-authorization-server": authServer.MetadataHandler(),
+}
+```
+
+**Note**: The existing `/.well-known/` handler for RFC 9728 `oauth-protected-resource` continues to work - Go's ServeMux routes `/.well-known/oauth-authorization-server` (specific) before `/.well-known/` (prefix).
 
 #### API Changes
 
@@ -436,6 +454,22 @@ All secret volumes mounted with `0400` permissions (read-only for owner), follow
   - Cannot issue tokens bound to specific MCP servers
 - **Why not chosen**: Need custom token issuance with MCP-specific claims and audiences
 
+### Alternative 3: Auth Server Sidecar Container
+
+- **Description**: Deploy auth server as a sidecar container in the same pod as the proxy runner, communicating over localhost
+- **Pros**:
+  - Better secret isolation (volume mounts are per-container in K8s; MCPServer ServiceAccount can't access secrets not mounted to its container)
+  - Stronger process isolation (RCE in proxy runner doesn't mean RCE in auth server)
+  - Token session ID (tsid) enforcement via network API rather than in-process function calls
+  - No TLS needed for localhost communication within the pod
+- **Cons**:
+  - Requires implementing token exchange API for proxy runner to obtain tokens
+  - Must monitor health and readiness of both containers
+  - Requires separate container image for auth server
+  - Harder logging and debugging across two containers
+  - More complex deployment configuration
+- **Why not chosen**: Additional implementation complexity (token exchange API) and operational overhead (multi-container monitoring, separate image management, debugging across containers) outweigh the incremental security benefits. The embedded approach provides sufficient isolation through per-workload deployment while keeping operational complexity low.
+
 ---
 
 ## Compatibility
@@ -475,14 +509,17 @@ All secret volumes mounted with `0400` permissions (read-only for owner), follow
 
 ### Phase 4: Proxy Runner Integration
 
-- Create `pkg/runner/authserver.go` with `EmbeddedAuthServer` wrapper
-- Modify `Runner.Run()` to start auth server and mount routes
+- Create `pkg/authserver/runner/authserver.go` with `EmbeddedAuthServer` wrapper
+- Modify proxy runner's `Runner.Run()` in `pkg/runner/runner.go` to start auth server and mount routes
 - Add cleanup logic
 
-### Phase 5: Transport Integration
+### Phase 5: Transport Integration (Generic)
 
-- Add `AuthServerHandler` to transport config types
-- Mount auth server routes in HTTP transport
+- Add `PrefixHandlers map[string]http.Handler` to `types.Config` in `pkg/transport/types/transport.go`
+- Pass through `factory.Create()` to transport constructors
+- Add field to `HTTPTransport` and `TransparentProxy`
+- Mount prefix handlers in `TransparentProxy.Start()` before catch-all proxy handler
+- No auth-server-specific code in transport package (keeps it generic)
 
 ### Dependencies
 
