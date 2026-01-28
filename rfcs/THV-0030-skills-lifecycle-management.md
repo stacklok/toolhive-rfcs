@@ -335,7 +335,7 @@ Skills integrate with ToolHive's existing groups system:
 **Behavior:**
 - `thv skill install --group development` adds skill to group
 - `thv skill uninstall` removes skill from any groups
-- `thv group list` shows skills alongside workloads
+- `thv skill list --group <name>` shows skills installed in a group
 
 ### OCI Artifact Format
 
