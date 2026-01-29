@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
 - **Created**: 2026-01-27
-- **Last Updated**: 2026-01-27
+- **Last Updated**: 2026-01-29
 - **Target Repository**: toolhive
 - **Related Issues**: N/A
 
@@ -141,6 +141,7 @@ thv skill install <reference> [flags]
 
 Arguments:
   reference    OCI reference (e.g., ghcr.io/stacklok/skills/commit-message:v1.0.0)
+               Or skill name when using -u with an already-installed skill
 
 Flags:
   --client string    Target AI client (required)
@@ -148,16 +149,23 @@ Flags:
   --local            Install locally (project-specific)
   --group string     Add skill to specified group
   --force            Overwrite existing unmanaged skill
+  -u, --upgrade      Upgrade an already-installed skill
 ```
 
 **Behavior:**
-- Requires explicit `--client` selection (no default)
+- Requires explicit `--client` selection (see rationale in Alternatives Considered)
 - Pulls OCI artifact from registry
 - Extracts skill files to client directory
 - Creates `.thv-skill.json` metadata file
 - Updates skill index
 - If `--group` specified, adds skill to group state
 - Reports status: `installed`, `upgraded`, or `unchanged`
+
+**Upgrade Behavior (`-u` flag):**
+- When reference is a skill name (not full OCI reference): resolves the original registry reference from `.thv-skill.json` metadata and pulls the latest tag
+- When reference is a full OCI reference: installs the specified version as an upgrade
+- Fails if skill is not already installed (use install without `-u` for new installations)
+- Preserves group membership across upgrades
 
 #### `thv skill uninstall`
 
@@ -197,6 +205,27 @@ Flags:
   --format string    Output format: table, json, yaml (default "table")
 ```
 
+#### `thv skill validate`
+
+Validates a skill directory without packaging it.
+
+```
+thv skill validate <path> [flags]
+
+Arguments:
+  path    Path to skill directory (must contain SKILL.md)
+
+Flags:
+  --format string    Output format: table, json, yaml (default "table")
+```
+
+**Validation Checks:**
+- SKILL.md exists and has valid YAML frontmatter
+- Required fields present (name, description)
+- Name follows naming convention (`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`)
+- Optional scripts are executable (warning if not)
+- No path traversal patterns in file structure
+
 #### `thv skill build`
 
 Packages a skill directory into an OCI artifact.
@@ -211,6 +240,8 @@ Flags:
   --tag string         Tag for the artifact (default: extracted from SKILL.md version)
   --platform strings   Target platforms (default: linux/amd64,linux/arm64)
 ```
+
+**Note:** Build implicitly runs validation and fails if the skill is invalid.
 
 #### `thv skill push`
 
@@ -298,12 +329,16 @@ type mcpClientConfig struct {
 
 #### Initial Skill Support
 
-| Client | Supports Skills | Global Skills Path | Local Skills Path |
-|--------|-----------------|-------------------|-------------------|
-| Claude Code CLI | Yes | `~/.claude/skills/` | `.claude/skills/` |
-| Cursor | TBD | TBD | TBD |
-| VS Code (Copilot) | TBD | TBD | TBD |
-| Others | No (initially) | - | - |
+The following clients are supported, matching Skillet's existing implementation:
+
+| Client | ID | Global Skills Path | Local Skills Path |
+|--------|-----|-------------------|-------------------|
+| Claude Code | `claude` | `~/.claude/skills/` | `.claude/skills/` |
+| OpenAI Codex CLI | `codex` | `~/.codex/skills/` | `.codex/skills/` |
+| GitHub Copilot | `copilot` | `~/.copilot/skills/` | `.github/skills/` |
+| OpenCode | `opencode` | - | `.opencode/skill/` |
+
+**Note:** Skills installed via Claude's plugin system (`~/.claude/plugins/cache/.../skills/`) are outside the scope of thv management. Those are managed by Claude's plugin infrastructure, not thv.
 
 #### SkillManager Interface
 
@@ -339,6 +374,21 @@ Skills integrate with ToolHive's existing groups system:
 
 ### OCI Artifact Format
 
+Skills are distributed as **OCI artifacts** stored in standard container registries (GHCR, ECR, Docker Hub, etc.). These are **not runnable containers** - they use OCI as a packaging and distribution format, similar to how Helm charts can be stored in OCI registries.
+
+**Artifact Structure:**
+```
+OCI Image Artifact
+├── Image Index (multi-platform: linux/amd64, linux/arm64)
+├── Image Manifest
+├── Config Blob (skill metadata stored in OCI labels)
+└── Content Layer (tar.gz)
+    ├── SKILL.md
+    ├── scripts/
+    ├── references/
+    └── assets/
+```
+
 Maintains compatibility with existing Skillet format:
 
 **Media Types:**
@@ -352,9 +402,12 @@ Maintains compatibility with existing Skillet format:
 - `org.stacklok.skillet.skill.version`
 
 **Reproducible Packaging:**
-- Deterministic tar (sorted entries, normalized timestamps via SOURCE_DATE_EPOCH)
-- Deterministic gzip (no ModTime, OS=255)
-- Same content always produces identical digest
+
+OCI uses content-addressable storage where every blob is identified by its SHA256 digest. For verification and supply chain security to work, the same skill content must always produce an identical digest. This requires deterministic packaging:
+
+- Deterministic tar: sorted file entries, normalized timestamps (via `SOURCE_DATE_EPOCH`), UID/GID set to 0
+- Deterministic gzip: fixed compression level, no variable header fields
+- Same content always produces identical digest, enabling anyone to rebuild and verify
 
 ## Security Considerations
 
@@ -453,10 +506,10 @@ Skills are client-only constructs (files in `~/.claude/skills/`) that don't flow
 
 ### Alternative 5: Default to All Clients
 
-- **Description**: Install to all detected clients when `--client` not specified
+- **Description**: Install to all detected clients when `--client` not specified, or auto-detect when only one client is present
 - **Pros**: Simpler UX for single-client users
-- **Cons**: Unexpected behavior for multi-client setups, potential for mistakes
-- **Why not chosen**: Explicit selection is safer and clearer
+- **Cons**: Unexpected behavior for multi-client setups, potential for mistakes, different clients may have different skill conventions
+- **Why not chosen**: Explicit selection is safer and clearer. Users working with multiple AI clients (increasingly common) benefit from explicit targeting. This follows the principle of least surprise - the command does exactly what was requested, nothing more. Skillet uses this same approach. We may reconsider this in the future based on user feedback (e.g., auto-detect when only one skill-supporting client is installed).
 
 ## Compatibility
 
