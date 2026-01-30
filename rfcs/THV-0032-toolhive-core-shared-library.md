@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
 - **Created**: 2026-01-29
-- **Last Updated**: 2026-01-29
+- **Last Updated**: 2026-01-30
 - **Target Repository**: multiple (new repository: `toolhive-core`)
 - **Related Issues**: N/A
 
@@ -19,6 +19,8 @@ The ToolHive ecosystem spans multiple Go repositories:
 - **toolhive-registry-server** - Registry API server
 - **dockyard** - Container packaging for MCP servers
 
+> **Note**: This RFC focuses on shared library extraction. While a stable core library could eventually enable components like the operator to be versioned independently, that would require additional considerations (e.g., RunConfig format stability, API versioning) beyond the scope of this proposal.
+
 Additionally, TypeScript projects exist (toolhive-studio, toolhive-cloud-ui) but are out of scope for a Go shared library.
 
 **Current state of code sharing:**
@@ -28,6 +30,8 @@ Additionally, TypeScript projects exist (toolhive-studio, toolhive-cloud-ui) but
 | **dockyard** | `pkg/logger`, `pkg/container/images`, `pkg/runner` | Aligned - uses toolhive utilities |
 | **toolhive-registry** | `pkg/logger`, `pkg/permissions`, `pkg/registry/*`, `pkg/container/verifier` | Aligned - heavily uses toolhive utilities |
 | **toolhive-registry-server** | Only `pkg/versions` + `pkg/registry` types | Uses stdlib `log/slog` instead of toolhive's zap logger; custom error handling |
+
+> **Future sharing opportunities**: Beyond the packages listed above, `pkg/auth` contains OAuth-related utilities (protected resource metadata, auth middleware) that could be refactored into a standalone `pkg/oauth` package. Similarly, `pkg/networking` has HTTP builder patterns and endpoint validation utilities that could benefit multiple projects.
 
 **Current limitations:**
 
@@ -92,6 +96,8 @@ flowchart TB
 ```
 
 ### Package Graduation Criteria
+
+**Guiding Principle**: Packages graduating to `toolhive-core` must provide genuinely reusable value and be designed as reusable from the start. This means they should not be tied to the inner workings of toolhive in either their API surface or internal logic. A package that requires knowledge of toolhive internals to use correctly is not a good candidate for graduation.
 
 Packages can graduate via two tracks depending on complexity:
 
@@ -178,6 +184,7 @@ These packages meet all graduation criteria (zero ToolHive-specific coupling, we
 | **permissions** | `pkg/permissions/` | Beta | Container permission profiles, stdlib-only, security validations |
 | **validation** | `pkg/validation/` | Beta | RFC 7230 HTTP header validation, security-focused |
 | **versions** | `pkg/versions/` | Beta | Build metadata, User-Agent generation |
+| **recovery** | `pkg/recovery/` | Beta | Panic recovery middleware, zero deps |
 
 > **Note**: All packages start as Beta in v0.x releases. Once the library reaches v1.0.0, packages meeting all graduation criteria will be promoted to Stable.
 
@@ -190,6 +197,7 @@ These packages have solid implementations but need minor changes to remove ToolH
 | **healthcheck** | `pkg/healthcheck/` | Beta | Remove unused logger import |
 | **logger** | `pkg/logger/` | Beta | Remove `viper.GetBool("debug")` coupling; accept config via parameters |
 | **auth/tokenexchange** | `pkg/auth/tokenexchange/` | Beta | Split core RFC 8693 logic from ToolHive middleware |
+| **auth/metadata** | `pkg/auth/` (to extract) | Beta | Refactor protected resource metadata into standalone package for reuse |
 | **networking** | `pkg/networking/` | Beta | Replace ToolHive logger with slog or interface |
 | **lockfile** | `pkg/lockfile/` | Beta | Accept logger interface instead of importing pkg/logger |
 
@@ -203,6 +211,16 @@ These packages have useful components but require significant refactoring or are
 | **secrets** | `pkg/secrets/` | Beta | Multiple providers, needs interface review |
 | **transport/types** | `pkg/transport/types/` | Beta | Middleware abstraction, widely used but coupled |
 | **mcp** | `pkg/mcp/` | Beta | MCP primitives, protocol-specific |
+| **registry/types** | `pkg/registry/` | Beta | Registry types already imported by toolhive-registry and toolhive-registry-server |
+| **container/verifier** | `pkg/container/verifier/` | Beta | Sigstore verification, already used by toolhive-registry |
+| **cache** | multiple locations | Beta | Generic cache abstraction (see note below) |
+
+> **Cache Consolidation Opportunity**: The codebase has several bespoke cache implementations that could be consolidated into a generic, configurable cache package:
+> - `TokenCache` interface in `pkg/vmcp/cache/cache.go` (planned memory/Redis implementations)
+> - `CachedAPIRegistryProvider` in `pkg/registry/provider_cached.go` (in-memory registry cache)
+> - `DefaultManager` cache in `pkg/vmcp/discovery/manager.go` (capability discovery cache with TTL)
+>
+> Consolidating on a generic cache implementation would improve testability, simplify application code (e.g., the cache handles synchronization instead of requiring mutexes in each consumer), reduce cognitive load, and enable reuse of backend implementations (e.g., a Redis-backed cache could be shared across all use cases).
 
 #### Not Recommended for Extraction
 
