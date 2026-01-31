@@ -5,14 +5,15 @@
 - **Created**: 2026-01-14
 - **Last Updated**: 2026-01-14
 - **Target Repository**: toolhive
-- **Related Issues**: N/A
+- **Related Issues**: 
+  - [#3125](https://github.com/stacklok/toolhive/issues/3125) - Simplify VMCP Configuration (an earlier example of unifying CRD/config types)
 - **Related RFCs**:
   - [THV-0001](THV-0001-otel-integration-proposal.md) - OpenTelemetry integration (MCPTelemetryConfig builds on this)
   - [THV-0014](THV-0014-vmcp-k8s-aware-refactor.md) - vMCP K8s-aware refactor (VirtualMCPServer changes must align)
 
 ## Summary
 
-This RFC proposes architectural improvements to ToolHive's Kubernetes CRDs for the v1beta1 release. The key changes include extracting shared configuration (OIDC, telemetry, authorization) into dedicated reusable CRDs, replacing type discriminators with CEL-validated unions, and removing deprecated fields. These changes follow the successful pattern established by `MCPExternalAuthConfig` and align with Kubernetes API best practices.
+This RFC proposes architectural improvements to ToolHive's Kubernetes CRDs for the v1beta1 release. The key changes include extracting shared configuration (OIDC, telemetry, authorization) into dedicated reusable CRDs, replacing type discriminators with CEL-validated unions, unifying CRD config types with application config types, and removing deprecated fields. These changes follow the successful pattern established by `MCPExternalAuthConfig` and align with Kubernetes API best practices.
 
 ## Problem Statement
 
@@ -78,6 +79,7 @@ MCPRegistry has three separate phase fields (`Status.Phase`, `Status.SyncStatus.
 ## Goals
 
 - **Extract shared configuration into reusable CRDs**: Create MCPOIDCConfig, MCPTelemetryConfig, MCPAuthzConfig, and MCPAggregationToolConfig following the MCPExternalAuthConfig pattern
+- **Unify CRD config types with application config types**: Use the same types for CRD specs and application configs when possible to eliminate translation layers and enable single-source-of-truth validation and documentation
 - **Replace type discriminators with CEL-validated unions**: Cleaner YAML, immediate validation feedback
 - **Remove deprecated fields**: Clean API surface for v1beta1
 - **Consolidate MCPRegistry status**: Single authoritative phase with standard Kubernetes conditions
@@ -611,13 +613,132 @@ When a config CRD changes, all referencing workloads must reconcile:
 
 Config CRDs use finalizers to prevent deletion while referenced. When a config CRD has a non-empty `referencingWorkloads` status, the finalizer blocks deletion until all references are removed.
 
+### CRD Types and Application Config Relationship
+
+This section addresses how CRD spec types relate to the application config structures used by provisioned servers at runtime.
+
+#### Problem Statement
+
+Today, ToolHive maintains separate type definitions for CRD specs and application configs. This separation creates several challenges:
+
+**Configuration Pipeline Complexity**
+
+Configuration flows through multiple transformation layers, each requiring manual conversion logic:
+
+```
+CRD Spec Types → Converter → Application Config Types → Execution
+```
+
+When CRD spec types and application config types are distinct, configuration must be defined in multiple places (see [Issue #3125](https://github.com/stacklok/toolhive/issues/3125) for a concrete example). Adding or modifying any configurable feature requires touching multiple layers, with bugs at any step going undetected until production.
+
+**Silent Configuration Bugs**
+
+Missing or incorrect transformations at any layer result in silent configuration failures. Real examples from the codebase:
+- Telemetry configuration worked in integration tests but failed with CRD due to broken conversion
+- `on_error.action: continue` was silently ignored due to broken config-to-execution plumbing ([PR #3118](https://github.com/stacklok/toolhive/pull/3118)). Technically, this is a problem at the application -> execution types, but it illustrates the issue with redefining types.
+
+Integration tests pass because they configure execution-layer data structures directly, bypassing transformation layers entirely.
+
+**Documentation Divergence**
+
+The current architecture produces two different configuration formats:
+- YAML tags for direct config files use `snake_case`
+- CRD spec fields use `camelCase`
+
+Documenting the same configuration twice with subtle differences creates user confusion and maintenance burden. [PR #3070](https://github.com/stacklok/toolhive/pull/3070) fixed documentation that incorrectly mixed these conventions.
+
+**Developer Velocity Impact**
+
+Every new configurable feature must traverse the entire configuration pipeline: CRD type → Converter → Server Config → Execution. This multiplies the effort required for even simple additions and creates friction for contributors.
+
+**Testing Limitations**
+
+When CRD spec types differ from application config types, integration tests that configure data structures directly miss config plumbing bugs. Moving e2e tests to integration tests for faster feedback becomes risky because integration tests bypass transformation layers entirely.
+
+#### Options Comparison
+
+| Aspect | Option A: Separate Types (Current) | Option B: Unified Types (Proposed) |
+|--------|------------------------------------|------------------------------------|
+| **Type Definitions** | CRD spec types and application config types are distinct | Application config types are embedded/reused in CRD spec |
+| **Conversion Code** | Requires extensive manual converters | Minimal or no conversion required; most config is passed through |
+| **Documentation** | Two formats to document (`snake_case` YAML vs `camelCase` CRD) | Single configuration schema |
+| **Bug Surface Area** | Each transformation layer can introduce silent bugs | Most config passes through unchanged; only resolver-managed fields require transformation |
+| **Test Coverage** | Integration tests bypass transformation layers | Integration tests exercise the same types as production |
+| **Field Naming** | CRD uses `camelCase`, config uses `snake_case` | Unified naming convention (recommend `camelCase` for K8s compatibility) |
+| **K8s-Specific Fields** | Naturally separated | Must be clearly delineated from shared config |
+| **Validation** | Separate CRD webhook validation and server startup validation | Single validation implementation, used at both admission and runtime |
+| **Developer Experience** | Adding features requires changes in multiple places | Adding features touches fewer files |
+
+
+
+#### Proposal
+
+**New CRDs use the same types as the application config.**
+
+For net-new CRDs introduced in this RFC, define a single canonical type that serves both the CRD spec and the application configs.
+
+For example, with `VirtualMCPServer` & `MCPTelemetryConfig` this pattern would look like:
+
+1. **The canonical type is defined** in `pkg/telemetry/config.go`:
+
+   ```go
+   // Config holds the configuration for OpenTelemetry instrumentation.
+   // +kubebuilder:object:generate=true
+   type Config struct {
+       Endpoint       string            `json:"endpoint,omitempty"`
+       ServiceName    string            `json:"serviceName,omitempty"`
+       TracingEnabled bool              `json:"tracingEnabled,omitempty"`
+       MetricsEnabled bool              `json:"metricsEnabled,omitempty"`
+       SamplingRate   string            `json:"samplingRate,omitempty"`
+       Headers        map[string]string `json:"headers,omitempty"`
+       // ... additional fields
+   }
+   ```
+
+2. **The CRD spec embeds the canonical type**:
+
+   ```go
+   // MCPTelemetryConfigSpec defines the desired state of MCPTelemetryConfig
+   type MCPTelemetryConfigSpec struct {
+       // Inline the canonical telemetry config type
+       telemetry.Config `json:",inline"`
+   }
+   ```
+
+3. **The VirtualMCPServerSpec supports a reference, the config supports a literal**:
+
+   ```go
+   // In pkg/vmcp/config/config.go
+   type Config struct {
+       // TelemetryRef references an MCPTelemetryConfig CRD (Kubernetes only)
+       TelemetryRef *TelemetryRef `json:"telemetryRef,omitempty"`
+       
+       // Telemetry is the literal telemetry config (same type as MCPTelemetryConfig spec)
+       Telemetry *telemetry.Config `json:"telemetry,omitempty"`
+       
+       // ... other fields
+   }
+   ```
+   Recall, the `VirtualMCPServerSpec` fully embeds the application config in its CRD. The above snippet simultaneously demonstrates adding support for a reference in the CRD and the equivalent type to
+   the application config. For the example above, the controller resolves `TelemetryRef` and populates `Telemetry` before passing to the server.
+   
+
+New CRDs introduced in this RFC (MCPTelemetryConfig, MCPOIDCConfig, etc.) would ideally follow the same pattern. The new CRDs use the same underlying type as the servers' application config.
+
+
+**Expected Outcomes:**
+- Single source of truth for configuration schema
+- Integration tests exercise the same types as CRD-based deployments
+- Documentation references one configuration format
+- Reduced code surface area and maintenance burden
+
+
 ### CLI Mode Considerations
 
 These CRD changes are **Kubernetes-only**. CLI mode (`thv run`) continues to use:
 
 - Inline configuration in RunConfig JSON
 - No CRD references (RunConfig is self-contained)
-- Same underlying config structs (platform-agnostic types in `pkg/`)
 
 The portability principle is maintained: a workload can be exported from K8s (with dereferenced config) and run via CLI, or vice versa.
 
@@ -808,7 +929,6 @@ Single `MCPWorkload` CRD with type discriminator.
 
 **What breaks:**
 - Inline OIDC/telemetry/authz configs must be extracted to new CRDs
-- VirtualMCPServer `config` field removed
 - Deprecated fields (`port`, `targetPort`, `toolsFilter`) removed
 - Type discriminator fields (`oidcConfig.type`) removed
 
@@ -864,7 +984,7 @@ Define the complete v1beta1 API surface:
 **Updated Workload CRDs**:
 - MCPServer: Replace inline configs with `*ConfigRef` fields, remove deprecated `port`/`targetPort`/`toolsFilter`
 - MCPRemoteProxy: Replace inline configs with `*ConfigRef` fields
-- VirtualMCPServer: Remove embedded `Config` field, define all fields at CRD level, use `*ConfigRef` for auth
+- VirtualMCPServer: Retain embedded `Config` field with unified types (application config embedded directly), support `*ConfigRef` for auth
 - MCPRegistry: Consolidate status to single phase + conditions pattern
 
 **Cleanup**:
@@ -884,7 +1004,7 @@ Parallelizable work across contributors:
 **Workload Controller Updates**:
 - MCPServer controller: resolve config references, watch config CRDs
 - MCPRemoteProxy controller: resolve config references, watch config CRDs
-- VirtualMCPServer controller: reference resolution, runtime conversion to platform-agnostic types
+- VirtualMCPServer controller: resolve config references, watch config CRDs
 - MCPRegistry controller: updated status reconciliation
 
 Unit tests for all controller logic.
