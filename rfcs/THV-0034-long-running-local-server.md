@@ -1,4 +1,4 @@
-# RFC-XXXX: Local Long-Running Server Architecture
+# RFC-0034: Local Long-Running Server Architecture
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX), Michelangelo Mori (@blkt)
@@ -95,8 +95,6 @@ Clients discover the server by:
 3. If health check fails, reading `$XDG_CONFIG_HOME/toolhive/server.pid` and checking if process is alive
 4. If process is alive but not responding → return error (server may be starting or hung)
 5. If process is dead → clean up stale files and start new server
-
-The starting procedure MUST NOT retry.
 
 ```mermaid
 sequenceDiagram
