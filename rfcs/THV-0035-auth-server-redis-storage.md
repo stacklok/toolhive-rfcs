@@ -9,7 +9,7 @@
 
 ## Summary
 
-Add a Redis-backed implementation of the `Storage` interface in `pkg/authserver/storage/` to enable horizontal scaling of the embedded authorization server. This allows multiple ToolHive instances to share authentication state, supporting high-availability deployments.
+Add a Redis Sentinel-backed implementation of the `Storage` interface in `pkg/authserver/storage/` to enable horizontal scaling of the embedded authorization server. This allows multiple ToolHive instances to share authentication state, supporting high-availability deployments with automatic failover. The implementation uses Redis Sentinel with one primary and two replicas, authenticated via ACL users for secure production deployments.
 
 ## Problem Statement
 
@@ -28,8 +28,9 @@ Users deploying ToolHive in production environments with high availability requi
 - Support all existing storage operations with Redis as the backend
 - Maintain compatibility with the fosite OAuth2 library interfaces
 - Enable atomic operations for token creation/revocation
-- Support configurable Redis connection options (standalone, Sentinel, Cluster)
+- Support Redis Sentinel deployment with one primary and two replicas for high availability
 - Provide automatic key expiration using Redis TTL features
+- Use Redis ACL authentication for secure production deployments
 
 ## Non-Goals
 
@@ -39,10 +40,14 @@ Users deploying ToolHive in production environments with high availability requi
 - Adding Redis as a dependency for local/development use (MemoryStorage remains default)
 - Redis persistence (RDB/AOF) - this implementation is memory-only
 - Encryption at rest - not needed since data is memory-only with short TTLs
+- Supporting standalone or cluster deployment modes - only Sentinel is supported
+- Supporting other authentication methods (password-only, mTLS, IAM) - only ACL user is supported
 
 ## Proposed Solution
 
 ### High-Level Design
+
+Multiple ToolHive instances share authentication state via Redis Sentinel (1 primary + 2 replicas):
 
 ```mermaid
 flowchart TB
@@ -56,12 +61,17 @@ flowchart TB
         ASN[Auth Server] --> RSN[RedisStorage]
     end
 
-    RS1 --> Redis[(Redis)]
-    RS2 --> Redis
-    RSN --> Redis
+    RS1 --> Sentinel[Redis Sentinel<br/>1 Primary + 2 Replicas]
+    RS2 --> Sentinel
+    RSN --> Sentinel
 ```
 
 ### Detailed Design
+
+**Deployment Architecture:**
+- **Deployment Mode**: Redis Sentinel only (one primary + two replicas for HA)
+- **Authentication**: ACL user only (Redis 6+ required)
+- **Rationale**: This opinionated approach simplifies configuration, testing, and operations while providing production-grade high availability and security
 
 #### Component Changes
 
@@ -143,31 +153,38 @@ type RedisStorage struct {
 // NewRedisStorage creates a new Redis-backed storage
 func NewRedisStorage(ctx context.Context, cfg RedisConfig) (*RedisStorage, error)
 
+// Redis deployment modes
+const (
+    DeploymentModeSentinel = "sentinel" // Only supported mode: Sentinel with 1 primary + 2 replicas
+)
+
+// Redis authentication types
+const (
+    AuthTypeACLUser = "aclUser" // Only supported auth: ACL user (Redis 6+)
+)
+
 // RedisConfig holds Redis connection configuration
+// Validation ensures:
+// - DeploymentMode is DeploymentModeSentinel
+// - AuthType is AuthTypeACLUser
+// - SentinelConfig is non-nil when DeploymentMode is sentinel
+// - ACLUserConfig is non-nil when AuthType is aclUser
 type RedisConfig struct {
-    // Standalone mode
-    Addr string
-    DB   int
+    // DeploymentMode specifies the Redis deployment mode
+    // Only DeploymentModeSentinel is supported for high availability
+    DeploymentMode string // Must be DeploymentModeSentinel
 
-    // Sentinel mode
-    MasterName    string
-    SentinelAddrs []string
+    // SentinelConfig holds Sentinel-specific configuration
+    // Required when DeploymentMode is DeploymentModeSentinel
+    SentinelConfig *SentinelConfig
 
-    // Cluster mode
-    ClusterAddrs []string
+    // AuthType specifies the authentication method
+    // Only AuthTypeACLUser is supported for secure production deployments
+    AuthType string // Must be AuthTypeACLUser
 
-    // Authentication (multiple options for production flexibility)
-    // Option 1: ACL User (Redis 6+ recommended for production)
-    Username string // ACL username (leave empty for 'default' user)
-    Password string // ACL password or legacy AUTH password
-
-    // Option 2: TLS Client Certificates (mTLS)
-    TLSConfig *tls.Config // Includes client cert for mTLS auth
-
-    // Option 3: Cloud IAM (for managed Redis services)
-    // AWS ElastiCache IAM auth, Azure AD, GCP IAM
-    IAMAuthEnabled bool
-    IAMAuthFunc    func(ctx context.Context) (string, error) // Returns short-lived token
+    // ACLUserConfig holds ACL user authentication configuration
+    // Required when AuthType is AuthTypeACLUser
+    ACLUserConfig *ACLUserConfig
 
     // Key partitioning - KeyPrefix is derived from server name
     // Format: thv:auth:{<server-name>}:
@@ -179,6 +196,19 @@ type RedisConfig struct {
     ReadTimeout  time.Duration
     WriteTimeout time.Duration
     PoolSize     int
+}
+
+// SentinelConfig holds Redis Sentinel configuration
+type SentinelConfig struct {
+    MasterName    string   // Name of the Redis master monitored by Sentinel
+    SentinelAddrs []string // List of Sentinel host:port addresses
+    DB            int      // Redis database number (default: 0)
+}
+
+// ACLUserConfig holds ACL user authentication configuration
+type ACLUserConfig struct {
+    Username string // ACL username
+    Password string // ACL password
 }
 ```
 
@@ -203,28 +233,23 @@ type RunConfig struct {
 }
 
 type RedisRunConfig struct {
-    // Connection
-    Addr          string   `json:"addr" yaml:"addr"`
-    DB            int      `json:"db,omitempty" yaml:"db,omitempty"`
-    MasterName    string   `json:"masterName,omitempty" yaml:"masterName,omitempty"`
-    SentinelAddrs []string `json:"sentinelAddrs,omitempty" yaml:"sentinelAddrs,omitempty"`
-    ClusterAddrs  []string `json:"clusterAddrs,omitempty" yaml:"clusterAddrs,omitempty"`
+    // DeploymentMode specifies the Redis deployment mode
+    // Only "sentinel" is supported
+    // +kubebuilder:validation:Enum=sentinel
+    DeploymentMode string `json:"deploymentMode" yaml:"deploymentMode"`
 
-    // Authentication - supports multiple methods
-    // Method 1: ACL User credentials (Redis 6+ recommended)
-    Username string `json:"username,omitempty" yaml:"username,omitempty"` // ACL username
-    Password string `json:"password,omitempty" yaml:"password,omitempty"` // ACL password
+    // SentinelConfig holds Sentinel-specific configuration
+    // Required when deploymentMode is "sentinel"
+    SentinelConfig *SentinelRunConfig `json:"sentinelConfig,omitempty" yaml:"sentinelConfig,omitempty"`
 
-    // Method 2: TLS with optional mTLS
-    TLSEnabled     bool   `json:"tlsEnabled,omitempty" yaml:"tlsEnabled,omitempty"`
-    TLSCertFile    string `json:"tlsCertFile,omitempty" yaml:"tlsCertFile,omitempty"`     // Client cert for mTLS
-    TLSKeyFile     string `json:"tlsKeyFile,omitempty" yaml:"tlsKeyFile,omitempty"`       // Client key for mTLS
-    TLSCACertFile  string `json:"tlsCACertFile,omitempty" yaml:"tlsCACertFile,omitempty"` // CA cert for server verification
-    TLSSkipVerify  bool   `json:"tlsSkipVerify,omitempty" yaml:"tlsSkipVerify,omitempty"` // Skip server cert verification (not for prod)
+    // AuthType specifies the authentication method
+    // Only "aclUser" is supported
+    // +kubebuilder:validation:Enum=aclUser
+    AuthType string `json:"authType" yaml:"authType"`
 
-    // Method 3: Cloud IAM authentication
-    IAMAuthEnabled bool   `json:"iamAuthEnabled,omitempty" yaml:"iamAuthEnabled,omitempty"`
-    IAMProvider    string `json:"iamProvider,omitempty" yaml:"iamProvider,omitempty"` // "aws", "azure", "gcp"
+    // ACLUserConfig holds ACL user authentication configuration
+    // Required when authType is "aclUser"
+    ACLUserConfig *ACLUserRunConfig `json:"aclUserConfig,omitempty" yaml:"aclUserConfig,omitempty"`
 
     // KeyPrefix is automatically derived from the MCP server name
     // Format: thv:auth:{<server-name>}:
@@ -232,6 +257,19 @@ type RedisRunConfig struct {
     // Users should NOT set this manually in most cases - it's populated by the operator
     // +optional
     KeyPrefix string `json:"keyPrefix,omitempty" yaml:"keyPrefix,omitempty"`
+}
+
+// SentinelRunConfig holds Sentinel-specific configuration
+type SentinelRunConfig struct {
+    MasterName    string   `json:"masterName" yaml:"masterName"`
+    SentinelAddrs []string `json:"sentinelAddrs" yaml:"sentinelAddrs"`
+    DB            int      `json:"db,omitempty" yaml:"db,omitempty"`
+}
+
+// ACLUserRunConfig holds ACL user authentication configuration
+type ACLUserRunConfig struct {
+    Username string `json:"username" yaml:"username"`
+    Password string `json:"password" yaml:"password"`
 }
 ```
 
@@ -280,27 +318,25 @@ type AuthServerStorageConfig struct {
 
 // RedisStorageConfig configures Redis connection for auth server storage
 type RedisStorageConfig struct {
-    // Mode specifies Redis deployment mode
-    // Valid values: "standalone", "sentinel", "cluster"
-    // +kubebuilder:validation:Enum=standalone;sentinel;cluster
-    // +kubebuilder:default=standalone
-    Mode string `json:"mode,omitempty"`
+    // DeploymentMode specifies the Redis deployment mode
+    // Only "sentinel" is supported for high availability with one primary and two replicas
+    // +kubebuilder:validation:Enum=sentinel
+    // +kubebuilder:default=sentinel
+    DeploymentMode string `json:"deploymentMode,omitempty"`
 
-    // Standalone configuration (when mode is "standalone")
-    // +optional
-    Standalone *RedisStandaloneConfig `json:"standalone,omitempty"`
+    // SentinelConfig holds Sentinel configuration
+    // Required when deploymentMode is "sentinel"
+    SentinelConfig *RedisSentinelConfig `json:"sentinelConfig,omitempty"`
 
-    // Sentinel configuration (when mode is "sentinel")
-    // +optional
-    Sentinel *RedisSentinelConfig `json:"sentinel,omitempty"`
+    // AuthType specifies the authentication method
+    // Only "aclUser" is supported for secure production deployments
+    // +kubebuilder:validation:Enum=aclUser
+    // +kubebuilder:default=aclUser
+    AuthType string `json:"authType,omitempty"`
 
-    // Cluster configuration (when mode is "cluster")
-    // +optional
-    Cluster *RedisClusterConfig `json:"cluster,omitempty"`
-
-    // Auth configures authentication to Redis
-    // +optional
-    Auth *RedisAuthConfig `json:"auth,omitempty"`
+    // ACLUserConfig configures ACL user authentication
+    // Required when authType is "aclUser"
+    ACLUserConfig *RedisACLUserConfig `json:"aclUserConfig,omitempty"`
 
     // TLS configures TLS settings for Redis connection
     // +optional
@@ -318,26 +354,14 @@ type RedisStorageConfig struct {
 // - For VirtualMCPServer "my-vmcp": KeyPrefix = "thv:auth:{my-vmcp}:"
 // This ensures proper key partitioning in Redis Cluster and multi-tenant isolation.
 
-// RedisStandaloneConfig configures a standalone Redis connection
-type RedisStandaloneConfig struct {
-    // Host is the Redis server hostname or IP
-    Host string `json:"host"`
-
-    // Port is the Redis server port (default: 6379)
-    // +kubebuilder:default=6379
-    Port int32 `json:"port,omitempty"`
-
-    // DB is the Redis database number (default: 0)
-    // +kubebuilder:default=0
-    DB int32 `json:"db,omitempty"`
-}
-
 // RedisSentinelConfig configures Redis Sentinel connection
+// Deploys with one primary and two replicas for high availability
 type RedisSentinelConfig struct {
     // MasterName is the name of the Redis master monitored by Sentinel
     MasterName string `json:"masterName"`
 
     // SentinelAddrs is a list of Sentinel host:port addresses
+    // Typically three Sentinel instances for quorum
     SentinelAddrs []string `json:"sentinelAddrs"`
 
     // DB is the Redis database number (default: 0)
@@ -345,31 +369,15 @@ type RedisSentinelConfig struct {
     DB int32 `json:"db,omitempty"`
 }
 
-// RedisClusterConfig configures Redis Cluster connection
-type RedisClusterConfig struct {
-    // Addrs is a list of cluster node host:port addresses
-    Addrs []string `json:"addrs"`
-}
-
-// RedisAuthConfig configures Redis authentication
-type RedisAuthConfig struct {
-    // Type specifies the authentication method
-    // Valid values: "password", "acl" (username+password), "mtls"
-    // +kubebuilder:validation:Enum=password;acl;mtls
-    // +kubebuilder:default=password
-    Type string `json:"type,omitempty"`
-
-    // PasswordSecretRef references a Secret containing the Redis password
-    // The secret must have a key named "password"
-    // Used when type is "password" or "acl"
-    // +optional
-    PasswordSecretRef *SecretKeyRef `json:"passwordSecretRef,omitempty"`
-
+// RedisACLUserConfig configures Redis ACL user authentication
+type RedisACLUserConfig struct {
     // UsernameSecretRef references a Secret containing the Redis ACL username
     // The secret must have a key named "username"
-    // Used when type is "acl"
-    // +optional
-    UsernameSecretRef *SecretKeyRef `json:"usernameSecretRef,omitempty"`
+    UsernameSecretRef *SecretKeyRef `json:"usernameSecretRef"`
+
+    // PasswordSecretRef references a Secret containing the Redis ACL password
+    // The secret must have a key named "password"
+    PasswordSecretRef *SecretKeyRef `json:"passwordSecretRef"`
 }
 
 // RedisTLSConfig configures TLS for Redis connection
@@ -412,16 +420,20 @@ spec:
         clientSecretRef:
           name: github-oauth-secret
           key: client-secret
-    # NEW: Storage configuration for multi-replica deployments
+    # Storage configuration for multi-replica deployments
+    # Uses Redis Sentinel with one primary and two replicas for high availability
     storage:
       type: redis
       redis:
-        mode: standalone
-        standalone:
-          host: redis.default.svc.cluster.local
-          port: 6379
-        auth:
-          type: acl
+        deploymentMode: sentinel  # Only sentinel is supported
+        sentinelConfig:
+          masterName: mymaster
+          sentinelAddrs:
+            - sentinel-0.redis.svc:26379
+            - sentinel-1.redis.svc:26379
+            - sentinel-2.redis.svc:26379
+        authType: aclUser  # Only aclUser is supported
+        aclUserConfig:
           usernameSecretRef:
             name: redis-credentials
             key: username
@@ -432,52 +444,6 @@ spec:
           enabled: true
           secretRef:
             name: redis-tls-certs
-```
-
-**Redis Sentinel Example:**
-
-```yaml
-storage:
-  type: redis
-  redis:
-    mode: sentinel
-    sentinel:
-      masterName: mymaster
-      sentinelAddrs:
-        - sentinel-0.redis.svc:26379
-        - sentinel-1.redis.svc:26379
-        - sentinel-2.redis.svc:26379
-    auth:
-      type: password
-      passwordSecretRef:
-        name: redis-auth
-        key: password
-    tls:
-      enabled: true
-      secretRef:
-        name: redis-ca
-```
-
-**Redis Cluster Example:**
-
-```yaml
-storage:
-  type: redis
-  redis:
-    mode: cluster
-    cluster:
-      addrs:
-        - redis-0.redis.svc:6379
-        - redis-1.redis.svc:6379
-        - redis-2.redis.svc:6379
-    auth:
-      type: acl
-      usernameSecretRef:
-        name: redis-acl
-        key: username
-      passwordSecretRef:
-        name: redis-acl
-        key: password
 ```
 
 #### Redis Kubernetes Operator (OpsTree)
@@ -502,7 +468,7 @@ helm install redis-operator ot-helm/redis-operator --namespace redis-operator --
 ```yaml
 ---
 # redis-secret.yaml
-# Secret containing Redis password for ACL authentication
+# Secret containing Redis ACL credentials
 apiVersion: v1
 kind: Secret
 metadata:
@@ -510,127 +476,29 @@ metadata:
   namespace: toolhive
 type: Opaque
 stringData:
-  password: "your-secure-password-here"  # Change this!
+  username: "toolhive-user"  # ACL username
+  password: "your-secure-password-here"  # Change this! ACL password
 ```
 
 Apply: `kubectl apply -f redis-secret.yaml`
 
 ---
 
-**Step 2a: Redis Standalone (Memory-Only)**
+**Step 2: Redis Replication with Sentinel (Memory-Only, HA)**
 
-For single-instance deployments without persistence:
-
-```yaml
----
-# redis-standalone.yaml
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: Redis
-metadata:
-  name: toolhive-redis
-  namespace: toolhive
-spec:
-  kubernetesConfig:
-    image: quay.io/opstree/redis:v7.2
-    imagePullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: "100m"
-        memory: "128Mi"
-      limits:
-        cpu: "500m"
-        memory: "512Mi"
-    # Reference the authentication secret
-    redisSecret:
-      name: toolhive-redis-secret
-      key: password
-  # Memory-only: no storage section
-  # Disable persistence via Redis config
-  redisConfig:
-    additionalRedisConfig: |
-      save ""
-      appendonly no
-  # Optional: Prometheus metrics
-  redisExporter:
-    enabled: true
-    image: quay.io/opstree/redis-exporter:v1.44.0
-    resources:
-      requests:
-        cpu: "50m"
-        memory: "64Mi"
-      limits:
-        cpu: "100m"
-        memory: "128Mi"
-```
-
-Service will be available at: `toolhive-redis.toolhive.svc.cluster.local:6379`
-
----
-
-**Step 2b: Redis Cluster (Memory-Only, HA)**
-
-For high-availability deployments with sharding:
-
-```yaml
----
-# redis-cluster.yaml
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: RedisCluster
-metadata:
-  name: toolhive-redis-cluster
-  namespace: toolhive
-spec:
-  clusterSize: 3  # Number of leader nodes (total pods = clusterSize * 2 for leader+follower)
-  clusterVersion: v7
-  kubernetesConfig:
-    image: quay.io/opstree/redis:v7.2
-    imagePullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: "100m"
-        memory: "128Mi"
-      limits:
-        cpu: "500m"
-        memory: "512Mi"
-    # Reference the authentication secret
-    redisSecret:
-      name: toolhive-redis-secret
-      key: password
-  # Memory-only: no storage section, disable persistence
-  redisLeader:
-    redisConfig:
-      additionalRedisConfig: |
-        save ""
-        appendonly no
-  redisFollower:
-    redisConfig:
-      additionalRedisConfig: |
-        save ""
-        appendonly no
-  # Optional: Prometheus metrics
-  redisExporter:
-    enabled: true
-    image: quay.io/opstree/redis-exporter:v1.44.0
-```
-
-Cluster service: `toolhive-redis-cluster.toolhive.svc.cluster.local:6379`
-
----
-
-**Step 2c: Redis Replication with Sentinel (Memory-Only, HA)**
-
-For high-availability with automatic failover via Sentinel:
+Deploy Redis with Sentinel for high-availability with one primary and two replicas:
 
 ```yaml
 ---
 # redis-replication.yaml
+# Deploys 1 primary + 2 replicas
 apiVersion: redis.redis.opstreelabs.in/v1beta2
 kind: RedisReplication
 metadata:
   name: toolhive-redis-replication
   namespace: toolhive
 spec:
-  clusterSize: 3  # 1 leader + 2 followers
+  clusterSize: 3  # Total: 1 primary + 2 replicas
   kubernetesConfig:
     image: quay.io/opstree/redis:v7.2
     imagePullPolicy: IfNotPresent
@@ -649,15 +517,18 @@ spec:
     additionalRedisConfig: |
       save ""
       appendonly no
+      # ACL configuration
+      aclfile /data/users.acl
 ---
 # redis-sentinel.yaml
+# Deploys 3 Sentinel instances for quorum
 apiVersion: redis.redis.opstreelabs.in/v1beta2
 kind: RedisSentinel
 metadata:
   name: toolhive-redis-sentinel
   namespace: toolhive
 spec:
-  clusterSize: 3  # Number of Sentinel instances
+  clusterSize: 3  # Number of Sentinel instances (for quorum of 2)
   kubernetesConfig:
     image: quay.io/opstree/redis-sentinel:v7.2
     imagePullPolicy: IfNotPresent
@@ -674,7 +545,7 @@ spec:
   redisSentinelConfig:
     redisReplicationName: toolhive-redis-replication
     masterGroupName: mymaster
-    quorum: "2"
+    quorum: "2"  # Requires 2 Sentinels to agree on failover
 ```
 
 Sentinel service: `toolhive-redis-sentinel.toolhive.svc.cluster.local:26379`
@@ -771,12 +642,18 @@ spec:
     storage:
       type: redis
       redis:
-        mode: standalone  # or "sentinel" or "cluster"
-        standalone:
-          host: toolhive-redis.toolhive.svc.cluster.local
-          port: 6379
-        auth:
-          type: password
+        deploymentMode: sentinel  # Only sentinel is supported
+        sentinelConfig:
+          masterName: mymaster
+          sentinelAddrs:
+            - toolhive-redis-sentinel-0.toolhive-redis-sentinel-headless.toolhive.svc:26379
+            - toolhive-redis-sentinel-1.toolhive-redis-sentinel-headless.toolhive.svc:26379
+            - toolhive-redis-sentinel-2.toolhive-redis-sentinel-headless.toolhive.svc:26379
+        authType: aclUser  # Only aclUser is supported
+        aclUserConfig:
+          usernameSecretRef:
+            name: toolhive-redis-secret
+            key: username
           passwordSecretRef:
             name: toolhive-redis-secret
             key: password
@@ -787,35 +664,15 @@ spec:
         #     name: toolhive-redis-tls
 ```
 
-For Sentinel mode:
-
-```yaml
-    storage:
-      type: redis
-      redis:
-        mode: sentinel
-        sentinel:
-          masterName: mymaster
-          sentinelAddrs:
-            - toolhive-redis-sentinel-0.toolhive-redis-sentinel-headless.toolhive.svc:26379
-            - toolhive-redis-sentinel-1.toolhive-redis-sentinel-headless.toolhive.svc:26379
-            - toolhive-redis-sentinel-2.toolhive-redis-sentinel-headless.toolhive.svc:26379
-        auth:
-          type: password
-          passwordSecretRef:
-            name: toolhive-redis-secret
-            key: password
-```
-
 ---
 
 ##### Alternative Redis Operators
 
-Other options for provisioning Redis in Kubernetes (not covered in detail):
+Other options for provisioning Redis Sentinel in Kubernetes:
 
-- **Spotahome Redis Operator** ([GitHub](https://github.com/spotahome/redis-operator)) - Focused on Sentinel HA with automatic failover. Good choice if you only need Sentinel mode.
+- **Spotahome Redis Operator** ([GitHub](https://github.com/spotahome/redis-operator)) - Focused exclusively on Sentinel HA with automatic failover. Simpler than OpsTree if you only need Sentinel mode.
 
-- **Bitnami Redis Helm Chart** ([GitHub](https://github.com/bitnami/charts/tree/main/bitnami/redis)) - Not an operator, but widely used for simpler deployments. Quick setup via Helm.
+- **Bitnami Redis Helm Chart** ([GitHub](https://github.com/bitnami/charts/tree/main/bitnami/redis)) - Not an operator, but widely used. Quick setup via Helm with Sentinel support.
 
 - **Redis Enterprise Operator** ([Redis.io](https://redis.io/docs/latest/operate/kubernetes/)) - Commercial option with advanced features. Requires Redis Enterprise license.
 
@@ -928,32 +785,22 @@ func (s *RedisStorage) GetAccessTokenSession(ctx context.Context, signature stri
 
 ### Authentication and Authorization
 
-**Production Authentication Methods (in order of preference):**
+**Redis ACL User Authentication (Redis 6+):**
 
-1. **Redis ACL Users (Redis 6+)** - Recommended for production
-   - Create dedicated user with limited permissions (no FLUSHALL, CONFIG, SHUTDOWN)
-   - Per-application users enable credential rotation without downtime
-   - Example: `ACL SETUSER toolhive on >password ~thv:auth:* +get +set +del +expire +scan`
+This implementation exclusively uses Redis ACL users for secure production deployments:
 
-2. **mTLS (Mutual TLS)** - For high-security environments
-   - Client certificate authentication in addition to or instead of password
-   - Both server and client authenticate each other during TLS handshake
-   - Recommended for fintech, healthcare, and compliance-driven deployments
-
-3. **Cloud IAM Authentication** - For managed Redis services
-   - AWS ElastiCache supports IAM authentication (short-lived tokens)
-   - Azure Cache for Redis supports Azure AD authentication
-   - Eliminates static credentials entirely
-
-4. **Legacy Password (AUTH command)** - Acceptable for development only
-   - Single shared password, no fine-grained permissions
-   - Cannot rotate without downtime
-   - Not recommended for production
+- **Dedicated user with limited permissions**: No FLUSHALL, CONFIG, SHUTDOWN access
+- **Per-application credentials**: Enables credential rotation without downtime
+- **Example ACL setup**:
+  ```
+  ACL SETUSER toolhive on >password ~thv:auth:* +get +set +del +expire +psetex +scan +eval +evalsha -@all
+  ```
 
 **Authorization via Redis ACLs:**
-- Restrict to only required commands: GET, SET, DEL, EXPIRE, PSETEX, SCAN, EVAL
-- Restrict to key patterns: `~thv:auth:*`
-- Block dangerous commands: FLUSHALL, FLUSHDB, CONFIG, SHUTDOWN, DEBUG
+- **Allowed commands**: GET, SET, DEL, EXPIRE, PSETEX, SCAN, EVAL, EVALSHA (required for storage operations)
+- **Key pattern restriction**: `~thv:auth:*` (only allow access to auth-related keys)
+- **Blocked commands**: FLUSHALL, FLUSHDB, CONFIG, SHUTDOWN, DEBUG (deny all admin commands via `-@all`)
+- **Credential rotation**: ACL users support rotation without downtime by creating new user, updating config, then removing old user
 
 ### Data Security
 
@@ -984,11 +831,14 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 
 ### Secrets Management
 
-- **ACL credentials**: Should come from environment variables or secret managers (Vault, AWS Secrets Manager, K8s Secrets)
-- **TLS certificates**: Mount from K8s Secrets or cert-manager; never embed in config files
-- **IAM credentials**: Use instance profiles, workload identity, or service accounts - no static credentials
-- **Connection strings**: Never log with embedded passwords; use separate credential injection
-- **Credential rotation**: ACL users support rotation without downtime; plan for periodic rotation
+- **ACL credentials**: Must come from Kubernetes Secrets referenced via `usernameSecretRef` and `passwordSecretRef` in CRD
+- **TLS certificates**: Mount from K8s Secrets (via `tls.secretRef`) or cert-manager; never embed in config files
+- **Connection strings**: Never log with embedded passwords; credentials are injected at runtime
+- **Credential rotation**: ACL users support rotation without downtime:
+  1. Create new ACL user in Redis with new credentials
+  2. Update K8s Secret with new username/password
+  3. ToolHive pods will pick up new credentials on restart
+  4. Remove old ACL user from Redis after all pods are updated
 
 ### Audit and Logging
 
@@ -1000,12 +850,13 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 
 | Threat | Mitigation |
 |--------|------------|
-| Compromised Redis | Network isolation, ACL users with limited permissions, mTLS, key pattern restrictions |
-| Credential theft | ACL users enable rotation; mTLS uses certificates; IAM eliminates static credentials |
-| Network interception | TLS required for production; mTLS for high-security |
-| Key enumeration | Non-guessable signatures (cryptographically random); ACL key pattern restrictions |
-| Data breach | Short TTLs minimize exposure window; memory-only means no persistent data to steal |
-| Privilege escalation | ACL restricts to minimal command set; no admin commands allowed |
+| Compromised Redis | Network isolation (K8s network policies), ACL users with limited permissions, key pattern restrictions |
+| Credential theft | ACL users enable rotation without downtime; credentials stored in K8s Secrets |
+| Network interception | TLS required for production (optional in CRD via `tls.enabled`) |
+| Key enumeration | Non-guessable signatures (cryptographically random); ACL key pattern restrictions (`~thv:auth:*`) |
+| Data breach | Short TTLs minimize exposure window (1h access, 30d refresh); memory-only means no persistent data to steal |
+| Privilege escalation | ACL restricts to minimal command set (GET, SET, DEL, EXPIRE, SCAN, EVAL); no admin commands allowed |
+| Redis failover | Sentinel automatic failover with quorum of 2; ToolHive reconnects automatically on primary change |
 
 ## Alternatives Considered
 
@@ -1061,8 +912,8 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 
 ### Phase 3: Documentation & Configuration
 
-- Document Redis configuration options
-- Add example configurations for standalone, Sentinel, and Cluster modes
+- Document Redis Sentinel configuration with ACL user authentication
+- Add example configurations for Sentinel deployment (1 primary + 2 replicas)
 - Update architecture documentation
 
 ### Phase 4: Operator CRD Updates
@@ -1075,10 +926,11 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 
 ### Phase 5: Operator Integration Testing
 
-- Test with Spotahome Redis Operator (Sentinel mode)
-- Test with OpsTree Redis Operator (Cluster mode)
-- Test with Bitnami Helm chart (standalone mode)
-- Verify Secret mounting for credentials and TLS certs
+- Test with OpsTree Redis Operator (Sentinel mode with 1 primary + 2 replicas)
+- Test with Spotahome Redis Operator (alternative Sentinel implementation)
+- Test with Bitnami Helm chart (Sentinel mode)
+- Verify Secret mounting for ACL user credentials and TLS certs
+- Verify automatic failover behavior when primary fails
 
 ### Dependencies
 
@@ -1095,20 +947,22 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 
 ## Documentation
 
-- **User documentation**: Redis configuration guide in docs/
+- **User documentation**: Redis Sentinel configuration guide with ACL user authentication in docs/
 - **API documentation**: GoDoc for RedisStorage and RedisConfig
-- **Architecture documentation**: Update `docs/arch/` with storage backend options
+- **Architecture documentation**: Update `docs/arch/` with Redis Sentinel storage backend
 - **Operator documentation**:
   - CRD reference for `AuthServerStorageConfig` and `RedisStorageConfig`
-  - Redis operator deployment guide (Spotahome, OpsTree, Bitnami)
-  - Example manifests for standalone, Sentinel, and Cluster modes
-- **Runbooks**: Redis operational guide (monitoring, troubleshooting, failover scenarios)
+  - Redis Sentinel deployment guide (OpsTree, Spotahome, Bitnami)
+  - Example manifests for Sentinel mode (1 primary + 2 replicas)
+  - ACL user setup and credential rotation procedures
+- **Runbooks**: Redis Sentinel operational guide (monitoring, troubleshooting, failover scenarios, ACL management)
 
 ## Open Questions
 
 1. Should we implement connection pooling configuration, or use library defaults?
-2. How should we handle Redis failover scenarios (Sentinel) - retry logic in storage layer?
-3. What is the GitHub issue number to link to this RFC?
+2. What retry logic should we implement for Sentinel failover scenarios?
+3. Should we set specific ACL commands for production deployments in documentation examples, or rely on users to configure?
+4. What is the GitHub issue number to link to this RFC?
 
 ## References
 
