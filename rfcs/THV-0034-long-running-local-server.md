@@ -70,9 +70,11 @@ flowchart TB
 
 ### Component Separation
 
-**CLI (`thv`)**: Thin client for user interaction, command parsing, and communicating with the local server via HTTP API.
+**CLI**: Thin client for user interaction, command parsing, and communicating with the local server via HTTP API.
 
-**Local Server (`thv-server`)**: Long-running process responsible for MCP server lifecycle, configuration management, file watching, and serving as single source of truth for local state.
+**Local Server**: Long-running process responsible for MCP server lifecycle, configuration management, file watching, and serving as single source of truth for local state.
+
+To ease distribution, CLI and Local Server should use the same binary.
 
 ### Server Lifecycle
 
