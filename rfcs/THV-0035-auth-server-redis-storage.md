@@ -47,23 +47,27 @@ Users deploying ToolHive in production environments with high availability requi
 
 ### High-Level Design
 
-Multiple ToolHive instances share authentication state via Redis Sentinel (1 primary + 2 replicas):
+Multiple ToolHive instances share authentication state via Redis Sentinel (1 primary + 2 replicas).
+
+**Deployment Scenarios:**
+- **Shared Redis (Scenario 1)**: Multiple MCP servers reference the same MCPExternalAuthConfig, sharing one Redis instance. Keys are partitioned by server name using hash tags (`thv:auth:{server-name}:*`) to ensure isolation.
+- **Dedicated Redis (Scenario 2)**: Each MCP server has its own MCPExternalAuthConfig pointing to a dedicated Redis instance. Simpler but requires more infrastructure.
 
 ```mermaid
 flowchart TB
-    subgraph ToolHive Instance 1
-        AS1[Auth Server] --> RS1[RedisStorage]
-    end
-    subgraph ToolHive Instance 2
-        AS2[Auth Server] --> RS2[RedisStorage]
-    end
-    subgraph ToolHive Instance N
-        ASN[Auth Server] --> RSN[RedisStorage]
+    subgraph Scenario1["Scenario 1: Shared Redis"]
+        direction TB
+        AS1A["MCP Server A<br/>Auth Server"] --> RS1A[RedisStorage]
+        AS1B["MCP Server B<br/>Auth Server"] --> RS1B[RedisStorage]
+        RS1A --> Shared["Shared Redis Sentinel<br/>1 Primary + 2 Replicas<br/>Keys partitioned by server name:<br/>thv:auth:#123;server-a#125;:<br/>thv:auth:#123;server-b#125;:"]
+        RS1B --> Shared
     end
 
-    RS1 --> Sentinel[Redis Sentinel<br/>1 Primary + 2 Replicas]
-    RS2 --> Sentinel
-    RSN --> Sentinel
+    subgraph Scenario2["Scenario 2: Dedicated Redis"]
+        direction TB
+        AS1C["MCP Server C<br/>Auth Server"] --> RS1C[RedisStorage]
+        RS1C --> Dedicated["Dedicated Redis Sentinel<br/>1 Primary + 2 Replicas<br/>Keys: thv:auth:#123;server-c#125;:"]
+    end
 ```
 
 ### Detailed Design
