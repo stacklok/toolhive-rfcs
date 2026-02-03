@@ -549,10 +549,18 @@ spec:
         memory: "512Mi"
     storage:
       emptyDir: {}  # Memory-only: no persistence
+    # Mount Redis ACL credentials from Secret
+    env:
+      - name: REDIS_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: toolhive-redis-secret
+            key: password
     customConfig:
       - "save ''"  # Disable RDB snapshots
       - "appendonly no"  # Disable AOF
-      # ACL configuration will be added via Secret mount
+      - "requirepass $(REDIS_PASSWORD)"  # Require password authentication
+      - "masterauth $(REDIS_PASSWORD)"  # Auth for replication between Redis nodes
 ```
 
 Apply: `kubectl apply -f redis-failover.yaml`
@@ -626,6 +634,7 @@ All stored types will be serialized to JSON. The `fosite.Requester` interface re
 
 ```go
 // Serializable wrapper for fosite.Requester
+// This type is added to pkg/authserver/storage/redis.go
 type storedRequest struct {
     ClientID      string            `json:"client_id"`
     RequestedAt   time.Time         `json:"requested_at"`
