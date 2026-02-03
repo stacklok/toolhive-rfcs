@@ -1,9 +1,9 @@
 # RFC-XXXX: Redis-Backed Storage for Auth Server
 
 - **Status**: Draft
-- **Author(s)**: TBD (@github-handle)
+- **Author(s)**: @tgrunnagle
 - **Created**: 2026-02-02
-- **Last Updated**: 2026-02-02
+- **Last Updated**: 2026-02-03
 - **Target Repository**: toolhive
 - **Related Issues**: TBD
 
@@ -90,6 +90,7 @@ flowchart TB
 
 1. `pkg/authserver/storage/config.go` - Add Redis configuration type and options
 2. `pkg/authserver/storage/types.go` - Add `TypeRedis` constant to `Type` enum
+3. `cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go` - Add `AuthServerStorageConfig`, `RedisStorageConfig`, and related CRD types
 
 #### Redis Key Schema
 
@@ -196,10 +197,14 @@ type RedisConfig struct {
     // This is automatically set by the operator/runner from MCPServer name
     KeyPrefix string
 
-    // Common options
-    DialTimeout  time.Duration
-    ReadTimeout  time.Duration
+    // Timeout configuration (optional, with defaults if not specified)
+    // DialTimeout is the timeout for establishing new connections (default: 5s)
+    DialTimeout time.Duration
+    // ReadTimeout is the timeout for socket reads (default: 3s)
+    ReadTimeout time.Duration
+    // WriteTimeout is the timeout for socket writes (default: 3s)
     WriteTimeout time.Duration
+
     // Note: Connection pooling uses go-redis library defaults (10 connections per CPU)
     // Pool configuration may be exposed as a future enhancement if needed
 }
@@ -221,6 +226,8 @@ type ACLUserConfig struct {
 #### Configuration Changes
 
 Update `storage.Config` and `storage.RunConfig`:
+
+**Security Note:** The `RunConfig` types reference environment variables for credentials rather than storing secrets directly in configuration files. At runtime, the runner reads the specified environment variables to populate the actual credential values in the `Config` types.
 
 ```go
 // config.go additions
@@ -263,6 +270,14 @@ type RedisRunConfig struct {
     // Users should NOT set this manually in most cases - it's populated by the operator
     // +optional
     KeyPrefix string `json:"keyPrefix,omitempty" yaml:"keyPrefix,omitempty"`
+
+    // Timeout configuration (optional, defaults: DialTimeout=5s, ReadTimeout=3s, WriteTimeout=3s)
+    // +optional
+    DialTimeout string `json:"dialTimeout,omitempty" yaml:"dialTimeout,omitempty"`
+    // +optional
+    ReadTimeout string `json:"readTimeout,omitempty" yaml:"readTimeout,omitempty"`
+    // +optional
+    WriteTimeout string `json:"writeTimeout,omitempty" yaml:"writeTimeout,omitempty"`
 }
 
 // SentinelRunConfig holds Sentinel-specific configuration
@@ -273,10 +288,16 @@ type SentinelRunConfig struct {
 }
 
 // ACLUserRunConfig holds ACL user authentication configuration
+// References environment variables to avoid storing secrets in config files
 type ACLUserRunConfig struct {
-    Username string `json:"username" yaml:"username"`
-    Password string `json:"password" yaml:"password"`
+    // UsernameEnvVar is the name of the environment variable containing the ACL username
+    UsernameEnvVar string `json:"usernameEnvVar" yaml:"usernameEnvVar"`
+    // PasswordEnvVar is the name of the environment variable containing the ACL password
+    PasswordEnvVar string `json:"passwordEnvVar" yaml:"passwordEnvVar"`
 }
+
+// At runtime, the operator/runner reads the environment variables specified in ACLUserRunConfig
+// to populate the ACLUserConfig with actual credential values
 ```
 
 #### Kubernetes CRD Changes
@@ -287,20 +308,7 @@ Update `EmbeddedAuthServerConfig` to support Redis storage:
 
 ```go
 type EmbeddedAuthServerConfig struct {
-    // Issuer is the issuer identifier for this authorization server
-    Issuer string `json:"issuer"`
-
-    // SigningKeySecretRefs references Kubernetes Secrets containing signing keys
-    SigningKeySecretRefs []SecretKeyRef `json:"signingKeySecretRefs,omitempty"`
-
-    // HMACSecretRefs references Kubernetes Secrets for signing auth codes/refresh tokens
-    HMACSecretRefs []SecretKeyRef `json:"hmacSecretRefs,omitempty"`
-
-    // TokenLifespans configures token validity durations
-    TokenLifespans *TokenLifespanConfig `json:"tokenLifespans,omitempty"`
-
-    // UpstreamProviders configures upstream Identity Provider connections
-    UpstreamProviders []UpstreamProviderConfig `json:"upstreamProviders"`
+    // ... Existing fields
 
     // Storage configures the storage backend for tokens and authorization state
     // If not specified, defaults to in-memory storage (single replica only)
@@ -353,6 +361,20 @@ type RedisStorageConfig struct {
     // Only set this if you need a custom prefix (not recommended)
     // +optional
     KeyPrefix string `json:"keyPrefix,omitempty"`
+
+    // Timeout configuration (optional, with reasonable defaults)
+    // DialTimeout is the timeout for establishing new connections
+    // +optional
+    // +kubebuilder:default="5s"
+    DialTimeout string `json:"dialTimeout,omitempty"`
+    // ReadTimeout is the timeout for socket reads
+    // +optional
+    // +kubebuilder:default="3s"
+    ReadTimeout string `json:"readTimeout,omitempty"`
+    // WriteTimeout is the timeout for socket writes
+    // +optional
+    // +kubebuilder:default="3s"
+    WriteTimeout string `json:"writeTimeout,omitempty"`
 }
 
 // Note: The operator automatically sets KeyPrefix based on the parent resource name:
@@ -366,13 +388,37 @@ type RedisSentinelConfig struct {
     // MasterName is the name of the Redis master monitored by Sentinel
     MasterName string `json:"masterName"`
 
-    // SentinelAddrs is a list of Sentinel host:port addresses
-    // Typically three Sentinel instances for quorum
-    SentinelAddrs []string `json:"sentinelAddrs"`
+    // SentinelAddrs is a list of Sentinel host:port addresses for direct specification
+    // Use this for external Redis or when you need explicit control over addresses
+    // Mutually exclusive with SentinelService
+    // +optional
+    SentinelAddrs []string `json:"sentinelAddrs,omitempty"`
+
+    // SentinelService enables automatic discovery of Sentinel addresses from a Kubernetes Service
+    // The operator will discover sentinel pod addresses from the service endpoints
+    // Use this for operator-managed Redis (simpler configuration)
+    // Mutually exclusive with SentinelAddrs
+    // +optional
+    SentinelService *SentinelServiceRef `json:"sentinelService,omitempty"`
 
     // DB is the Redis database number (default: 0)
     // +kubebuilder:default=0
     DB int32 `json:"db,omitempty"`
+}
+
+// SentinelServiceRef references a Kubernetes Service for Sentinel discovery
+type SentinelServiceRef struct {
+    // Name of the Sentinel Service
+    Name string `json:"name"`
+
+    // Namespace of the Sentinel Service (defaults to same namespace as MCPExternalAuthConfig)
+    // +optional
+    Namespace string `json:"namespace,omitempty"`
+
+    // Port of the Sentinel service (default: 26379)
+    // +optional
+    // +kubebuilder:default=26379
+    Port int32 `json:"port,omitempty"`
 }
 
 // RedisACLUserConfig configures Redis ACL user authentication
@@ -434,10 +480,16 @@ spec:
         deploymentMode: sentinel  # Only sentinel is supported
         sentinelConfig:
           masterName: mymaster
-          sentinelAddrs:
-            - sentinel-0.redis.svc:26379
-            - sentinel-1.redis.svc:26379
-            - sentinel-2.redis.svc:26379
+          # Option 1: Service-based discovery (recommended for operator-managed Redis)
+          sentinelService:
+            name: redis-sentinel
+            namespace: redis  # Optional, defaults to same namespace
+            port: 26379       # Optional, defaults to 26379
+          # Option 2: Direct address specification (for external Redis)
+          # sentinelAddrs:
+          #   - sentinel-0.redis.svc:26379
+          #   - sentinel-1.redis.svc:26379
+          #   - sentinel-2.redis.svc:26379
         authType: aclUser  # Only aclUser is supported
         aclUserConfig:
           usernameSecretRef:
@@ -460,20 +512,19 @@ For provisioning Redis in Kubernetes, we recommend the **Spotahome Redis Operato
 Kubernetes operators provide continuous management and automatic failover handling, unlike Helm charts which perform one-time deployments. When a Redis primary fails, the operator actively monitors Sentinel and can trigger Kubernetes-level actions (pod restarts, service updates) to ensure seamless failover. Helm charts like Bitnami Redis are excellent for initial provisioning, but operators provide the ongoing operational intelligence needed for production high-availability deployments.
 
 **Alternative: OpsTree Redis Operator**
-For users requiring more flexibility beyond Sentinel (standalone, cluster modes), the **OpsTree Redis Operator** is a robust alternative with support for all deployment modes. The detailed manifests below demonstrate OpsTree configuration, which can be adapted to Spotahome's CRD format.
+For users requiring more flexibility beyond Sentinel (standalone, cluster modes), the **OpsTree Redis Operator** is a robust alternative with support for all deployment modes. See the [Alternative Redis Options](#alternative-redis-options) section below for more information.
+
+---
+
+##### Complete Manifests for Spotahome Redis Operator (Recommended)
 
 **Installation:**
 
 ```bash
-# Install the operator
-helm repo add ot-helm https://ot-container-kit.github.io/helm-charts/
-helm repo update
-helm install redis-operator ot-helm/redis-operator --namespace redis-operator --create-namespace
+# Install the Spotahome operator
+kubectl apply -f https://raw.githubusercontent.com/spotahome/redis-operator/master/manifests/databases.spotahome.com_redisfailovers.yaml
+kubectl apply -f https://raw.githubusercontent.com/spotahome/redis-operator/master/example/operator.yaml
 ```
-
----
-
-##### Complete Manifests for OpsTree Redis Operator
 
 **Step 1: Create Redis Authentication Secret**
 
@@ -496,54 +547,22 @@ Apply: `kubectl apply -f redis-secret.yaml`
 
 ---
 
-**Step 2: Redis Replication with Sentinel (Memory-Only, HA)**
+**Step 2: Deploy Redis Sentinel with Spotahome Operator**
 
-Deploy Redis with Sentinel for high-availability with one primary and two replicas:
+Spotahome uses a single `RedisFailover` CRD that configures both Redis and Sentinel:
 
 ```yaml
 ---
-# redis-replication.yaml
-# Deploys 1 primary + 2 replicas
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: RedisReplication
+# redis-failover.yaml
+# Deploys 1 primary + 2 replicas with 3 Sentinel instances
+apiVersion: databases.spotahome.com/v1
+kind: RedisFailover
 metadata:
-  name: toolhive-redis-replication
+  name: toolhive-redis
   namespace: toolhive
 spec:
-  clusterSize: 3  # Total: 1 primary + 2 replicas
-  kubernetesConfig:
-    image: quay.io/opstree/redis:v7.2
-    imagePullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: "100m"
-        memory: "128Mi"
-      limits:
-        cpu: "500m"
-        memory: "512Mi"
-    redisSecret:
-      name: toolhive-redis-secret
-      key: password
-  # Memory-only: disable persistence
-  redisConfig:
-    additionalRedisConfig: |
-      save ""
-      appendonly no
-      # ACL configuration
-      aclfile /data/users.acl
----
-# redis-sentinel.yaml
-# Deploys 3 Sentinel instances for quorum
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: RedisSentinel
-metadata:
-  name: toolhive-redis-sentinel
-  namespace: toolhive
-spec:
-  clusterSize: 3  # Number of Sentinel instances (for quorum of 2)
-  kubernetesConfig:
-    image: quay.io/opstree/redis-sentinel:v7.2
-    imagePullPolicy: IfNotPresent
+  sentinel:
+    replicas: 3  # Number of Sentinel instances for quorum
     resources:
       requests:
         cpu: "50m"
@@ -551,52 +570,8 @@ spec:
       limits:
         cpu: "100m"
         memory: "128Mi"
-    redisSecret:
-      name: toolhive-redis-secret
-      key: password
-  redisSentinelConfig:
-    redisReplicationName: toolhive-redis-replication
-    masterGroupName: mymaster
-    quorum: "2"  # Requires 2 Sentinels to agree on failover
-```
-
-Sentinel service: `toolhive-redis-sentinel.toolhive.svc.cluster.local:26379`
-
----
-
-**Step 3: TLS Configuration (Optional)**
-
-For encrypted connections, create TLS secrets and enable TLS:
-
-```yaml
----
-# redis-tls-secret.yaml
-# Create using: kubectl create secret generic toolhive-redis-tls \
-#   --from-file=ca.crt=ca.crt \
-#   --from-file=tls.crt=redis.crt \
-#   --from-file=tls.key=redis.key \
-#   -n toolhive
-apiVersion: v1
-kind: Secret
-metadata:
-  name: toolhive-redis-tls
-  namespace: toolhive
-type: kubernetes.io/tls
-data:
-  ca.crt: <base64-encoded-ca-cert>
-  tls.crt: <base64-encoded-server-cert>
-  tls.key: <base64-encoded-server-key>
----
-# redis-standalone-tls.yaml
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: Redis
-metadata:
-  name: toolhive-redis
-  namespace: toolhive
-spec:
-  kubernetesConfig:
-    image: quay.io/opstree/redis:v7.2
-    imagePullPolicy: IfNotPresent
+  redis:
+    replicas: 3  # Total: 1 primary + 2 replicas
     resources:
       requests:
         cpu: "100m"
@@ -604,29 +579,23 @@ spec:
       limits:
         cpu: "500m"
         memory: "512Mi"
-    redisSecret:
-      name: toolhive-redis-secret
-      key: password
-  TLS:
-    ca: ca.crt
-    cert: tls.crt
-    key: tls.key
-    secret:
-      secretName: toolhive-redis-tls
-  redisConfig:
-    additionalRedisConfig: |
-      save ""
-      appendonly no
-      tls-port 6379
-      port 0
-      tls-auth-clients yes
+    storage:
+      emptyDir: {}  # Memory-only: no persistence
+    customConfig:
+      - "save ''"  # Disable RDB snapshots
+      - "appendonly no"  # Disable AOF
+      # ACL configuration will be added via Secret mount
 ```
+
+Apply: `kubectl apply -f redis-failover.yaml`
+
+**Services Created:**
+- Redis: `rfr-toolhive-redis.toolhive.svc.cluster.local:26379` (Sentinel service)
+- Master name: `mymaster` (default, can be customized)
 
 ---
 
-**Step 4: Configure ToolHive to Connect**
-
-Example MCPExternalAuthConfig referencing the OpsTree-provisioned Redis:
+**Step 3: Configure ToolHive to Connect**
 
 ```yaml
 ---
@@ -654,14 +623,14 @@ spec:
     storage:
       type: redis
       redis:
-        deploymentMode: sentinel  # Only sentinel is supported
+        deploymentMode: sentinel
         sentinelConfig:
           masterName: mymaster
-          sentinelAddrs:
-            - toolhive-redis-sentinel-0.toolhive-redis-sentinel-headless.toolhive.svc:26379
-            - toolhive-redis-sentinel-1.toolhive-redis-sentinel-headless.toolhive.svc:26379
-            - toolhive-redis-sentinel-2.toolhive-redis-sentinel-headless.toolhive.svc:26379
-        authType: aclUser  # Only aclUser is supported
+          # Service-based discovery (Spotahome creates this service)
+          sentinelService:
+            name: rfr-toolhive-redis
+            namespace: toolhive
+        authType: aclUser
         aclUserConfig:
           usernameSecretRef:
             name: toolhive-redis-secret
@@ -669,11 +638,6 @@ spec:
           passwordSecretRef:
             name: toolhive-redis-secret
             key: password
-        # For TLS-enabled Redis:
-        # tls:
-        #   enabled: true
-        #   secretRef:
-        #     name: toolhive-redis-tls
 ```
 
 ---
@@ -682,7 +646,7 @@ spec:
 
 Other options for provisioning Redis Sentinel in Kubernetes:
 
-- **OpsTree Redis Operator** ([GitHub](https://github.com/OT-CONTAINER-KIT/redis-operator)) - Full-featured operator supporting all deployment modes (standalone, cluster, sentinel, replication). Recommended if you need flexibility beyond Sentinel-only deployments. The manifests shown above demonstrate OpsTree configuration.
+- **OpsTree Redis Operator** ([GitHub](https://github.com/OT-CONTAINER-KIT/redis-operator)) - Full-featured operator supporting all deployment modes (standalone, cluster, sentinel, replication). Choose this if you need flexibility beyond Sentinel-only deployments.
 
 - **Bitnami Redis Helm Chart** ([GitHub](https://github.com/bitnami/charts/tree/main/bitnami/redis)) - Not an operator, but widely used for quick provisioning via Helm. Supports Sentinel mode but lacks the continuous management and automatic failover handling that operators provide.
 
@@ -707,6 +671,33 @@ type storedRequest struct {
 ```
 
 #### Implementation Details
+
+**Sentinel Address Discovery:**
+
+When `sentinelService` is specified, the operator discovers Sentinel addresses at deployment time:
+
+```go
+// In operator controller
+func resolveSentinelAddrs(ctx context.Context, sentinelService *SentinelServiceRef, namespace string) ([]string, error) {
+    // Get the Service
+    svc, err := k8sClient.CoreV1().Services(sentinelService.Namespace or namespace).Get(ctx, sentinelService.Name, metav1.GetOptions{})
+
+    // Get Endpoints for the Service
+    endpoints, err := k8sClient.CoreV1().Endpoints(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+
+    // Extract addresses from endpoints
+    var addrs []string
+    port := sentinelService.Port or 26379
+    for _, subset := range endpoints.Subsets {
+        for _, addr := range subset.Addresses {
+            addrs = append(addrs, fmt.Sprintf("%s:%d", addr.IP, port))
+        }
+    }
+    return addrs, nil
+}
+```
+
+The resolved addresses are passed to the runner's `RedisRunConfig.SentinelConfig.SentinelAddrs` field. This happens at pod creation/update time, so sentinel address changes require a pod restart.
 
 **Atomic Operations:**
 
@@ -948,8 +939,11 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 - Add `AuthServerStorageConfig`, `RedisStorageConfig`, and related types to CRD
 - Update EmbeddedAuthServerConfig to include `storage` field
 - Run `task operator-generate` and `task operator-manifests`
-- Update controller in `pkg/controllerutil/authserver.go` to pass Redis config to runner
-- Add validation webhooks for Redis configuration
+- Update controller in `pkg/controllerutil/authserver.go` to pass Redis config to runner and implement Sentinel service discovery
+- Add validation webhooks for Redis configuration:
+  - Exactly one of `sentinelAddrs` or `sentinelService` must be specified in `RedisSentinelConfig`
+  - Validate that timeout values are valid durations (e.g., "5s", "100ms")
+  - Validate that `deploymentMode` is "sentinel" and `authType` is "aclUser"
 
 ### Phase 5: Operator Integration Testing
 
