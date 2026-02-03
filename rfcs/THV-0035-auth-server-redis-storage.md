@@ -43,6 +43,7 @@ Users deploying ToolHive in production environments with high availability requi
 - Supporting standalone or cluster deployment modes - only Sentinel is supported
 - Supporting other authentication methods (password-only, mTLS, IAM) - only ACL user is supported
 - Custom connection pool configuration - use go-redis library defaults (may be added in future if needed)
+- TLS/mTLS configuration for Redis connections - future enhancement if needed for encrypted connections
 
 ## Proposed Solution
 
@@ -352,10 +353,6 @@ type RedisStorageConfig struct {
     // Required when authType is "aclUser"
     ACLUserConfig *RedisACLUserConfig `json:"aclUserConfig,omitempty"`
 
-    // TLS configures TLS settings for Redis connection
-    // +optional
-    TLS *RedisTLSConfig `json:"tls,omitempty"`
-
     // KeyPrefix override - normally auto-derived from MCPServer/VirtualMCPServer name
     // Format when auto-derived: thv:auth:{<server-name>}:
     // Only set this if you need a custom prefix (not recommended)
@@ -431,23 +428,6 @@ type RedisACLUserConfig struct {
     // The secret must have a key named "password"
     PasswordSecretRef *SecretKeyRef `json:"passwordSecretRef"`
 }
-
-// RedisTLSConfig configures TLS for Redis connection
-type RedisTLSConfig struct {
-    // Enabled controls whether TLS is used for Redis connections
-    Enabled bool `json:"enabled"`
-
-    // SecretRef references a Secret containing TLS certificates
-    // For mTLS: must contain "tls.crt", "tls.key", and optionally "ca.crt"
-    // For server verification only: must contain "ca.crt"
-    // +optional
-    SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
-
-    // InsecureSkipVerify disables server certificate verification
-    // WARNING: Only use for testing. Not recommended for production.
-    // +optional
-    InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
-}
 ```
 
 **Example CRD Usage:**
@@ -498,10 +478,6 @@ spec:
           passwordSecretRef:
             name: redis-credentials
             key: password
-        tls:
-          enabled: true
-          secretRef:
-            name: redis-tls-certs
 ```
 
 #### Redis Kubernetes Operator (Spotahome)
@@ -829,8 +805,9 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 - Auth codes: 10 minute TTL (re-request authorization)
 
 **In Transit:**
-- Require TLS for all Redis connections in production
-- mTLS recommended for cross-datacenter communication
+- TLS/mTLS support for Redis connections is planned as a future enhancement
+- Until then, deploy Redis within the same secure network as the auth server pods
+- Use Kubernetes Network Policies to restrict Redis access to authorized pods only
 
 **Sensitive Data Stored:**
 - Access tokens, refresh tokens, upstream IDP tokens (sensitive)
@@ -850,7 +827,6 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 ### Secrets Management
 
 - **ACL credentials**: Must come from Kubernetes Secrets referenced via `usernameSecretRef` and `passwordSecretRef` in CRD
-- **TLS certificates**: Mount from K8s Secrets (via `tls.secretRef`) or cert-manager; never embed in config files
 - **Connection strings**: Never log with embedded passwords; credentials are injected at runtime
 - **Credential rotation**: ACL users support rotation without downtime:
   1. Create new ACL user in Redis with new credentials
@@ -870,7 +846,7 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 |--------|------------|
 | Compromised Redis | Network isolation (K8s network policies), ACL users with limited permissions, key pattern restrictions |
 | Credential theft | ACL users enable rotation without downtime; credentials stored in K8s Secrets |
-| Network interception | TLS required for production (optional in CRD via `tls.enabled`) |
+| Network interception | Deploy Redis in same secure network; use Kubernetes Network Policies for pod-level access control (TLS planned as future enhancement) |
 | Key enumeration | Non-guessable signatures (cryptographically random); ACL key pattern restrictions (`~thv:auth:*`) |
 | Data breach | Short TTLs minimize exposure window (1h access, 30d refresh); memory-only means no persistent data to steal |
 | Privilege escalation | ACL restricts to minimal command set (GET, SET, DEL, EXPIRE, SCAN, EVAL); no admin commands allowed |
@@ -948,7 +924,7 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 ### Phase 5: Operator Integration Testing
 
 - Test with Spotahome Redis Operator (Sentinel mode with 1 primary + 2 replicas)
-- Verify Secret mounting for ACL user credentials and TLS certs
+- Verify Secret mounting for ACL user credentials
 - Verify automatic failover behavior when primary fails
 
 ### Dependencies
@@ -962,7 +938,7 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 - **Integration tests**: Real Redis via testcontainers, full Storage interface compliance
 - **End-to-end tests**: OAuth flows with Redis storage backend
 - **Performance tests**: Token creation/retrieval latency, concurrent access patterns
-- **Security tests**: TLS verification, AUTH enforcement
+- **Security tests**: ACL authentication enforcement, network policy validation
 
 ## Documentation
 
