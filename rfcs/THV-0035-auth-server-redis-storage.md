@@ -42,6 +42,7 @@ Users deploying ToolHive in production environments with high availability requi
 - Encryption at rest - not needed since data is memory-only with short TTLs
 - Supporting standalone or cluster deployment modes - only Sentinel is supported
 - Supporting other authentication methods (password-only, mTLS, IAM) - only ACL user is supported
+- Custom connection pool configuration - use go-redis library defaults (may be added in future if needed)
 
 ## Proposed Solution
 
@@ -199,7 +200,8 @@ type RedisConfig struct {
     DialTimeout  time.Duration
     ReadTimeout  time.Duration
     WriteTimeout time.Duration
-    PoolSize     int
+    // Note: Connection pooling uses go-redis library defaults (10 connections per CPU)
+    // Pool configuration may be exposed as a future enhancement if needed
 }
 
 // SentinelConfig holds Redis Sentinel configuration
@@ -795,10 +797,25 @@ This implementation exclusively uses Redis ACL users for secure production deplo
 
 - **Dedicated user with limited permissions**: No FLUSHALL, CONFIG, SHUTDOWN access
 - **Per-application credentials**: Enables credential rotation without downtime
-- **Example ACL setup**:
-  ```
+- **Recommended ACL setup** (customize based on your security requirements):
+  ```bash
+  # Minimum required commands for storage operations
   ACL SETUSER toolhive on >password ~thv:auth:* +get +set +del +expire +psetex +scan +eval +evalsha -@all
+
+  # Explanation:
+  # - on: Enable the user
+  # - >password: Set the password (replace with actual password)
+  # - ~thv:auth:*: Restrict access to keys matching this pattern only
+  # - +get +set +del +expire +psetex: Allow required Redis commands for storage operations
+  # - +scan: Allow SCAN for key enumeration (used for cleanup/debugging)
+  # - +eval +evalsha: Allow Lua scripts for atomic operations
+  # - -@all: Deny all other command categories by default
   ```
+
+  **Note**: Adjust the ACL configuration based on your organization's security policies. Consider:
+  - Removing `+scan` if key enumeration is a concern (may impact debugging)
+  - Adding monitoring/auditing commands if your security team requires them
+  - Using separate ACL users for different environments (dev/staging/prod)
 
 **Authorization via Redis ACLs:**
 - **Allowed commands**: GET, SET, DEL, EXPIRE, PSETEX, SCAN, EVAL, EVALSHA (required for storage operations)
@@ -961,12 +978,36 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
   - ACL user setup and credential rotation procedures
 - **Runbooks**: Redis Sentinel operational guide (monitoring, troubleshooting, failover scenarios, ACL management)
 
-## Open Questions
+## Design Decisions
 
-1. Should we implement connection pooling configuration, or use library defaults?
-2. What retry logic should we implement for Sentinel failover scenarios?
-3. Should we set specific ACL commands for production deployments in documentation examples, or rely on users to configure?
-4. What is the GitHub issue number to link to this RFC?
+### Connection Pooling
+**Decision**: Use go-redis library defaults (10 connections per CPU) without exposing configuration options initially.
+
+**Rationale**:
+- Library defaults are suitable for most deployments
+- Reduces configuration complexity
+- Can be exposed as a future enhancement if high-traffic deployments require tuning
+
+### Retry Logic for Sentinel Failover
+**Decision**: Rely on go-redis built-in retry and Sentinel failover handling without additional application-level retry logic.
+
+**Rationale**:
+- go-redis automatically detects Sentinel failover and reconnects to the new primary
+- The library handles connection pooling and retry internally
+- Adding application-level retry would duplicate existing functionality
+- Failover typically completes in seconds (with Sentinel quorum of 2)
+- Short-lived OAuth tokens (1h access, 30d refresh) minimize impact of transient failures
+- Clients can retry failed OAuth requests at the application layer if needed
+
+### Redis ACL Configuration
+**Decision**: Provide documented ACL examples with guidance for customization rather than prescriptive commands.
+
+**Rationale**:
+- Security requirements vary by organization (compliance, auditing, monitoring needs)
+- Prescriptive ACL commands may be too restrictive or too permissive for some deployments
+- Documented examples with explanations help users understand the minimum required permissions
+- Users can customize based on their security policies (e.g., removing SCAN for stricter environments)
+- Allows flexibility for future command additions without breaking existing deployments
 
 ## References
 
