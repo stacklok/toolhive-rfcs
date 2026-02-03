@@ -452,9 +452,15 @@ spec:
             name: redis-tls-certs
 ```
 
-#### Redis Kubernetes Operator (OpsTree)
+#### Redis Kubernetes Operator (Spotahome)
 
-For provisioning Redis in Kubernetes, we recommend the **OpsTree Redis Operator** for its support of all deployment modes (standalone, cluster, sentinel, replication).
+For provisioning Redis in Kubernetes, we recommend the **Spotahome Redis Operator** as the primary choice for this Sentinel-only implementation. Spotahome is purpose-built for Redis Sentinel with automatic failover, making it a perfect fit for this RFC's opinionated approach.
+
+**Why an Operator over Helm Charts?**
+Kubernetes operators provide continuous management and automatic failover handling, unlike Helm charts which perform one-time deployments. When a Redis primary fails, the operator actively monitors Sentinel and can trigger Kubernetes-level actions (pod restarts, service updates) to ensure seamless failover. Helm charts like Bitnami Redis are excellent for initial provisioning, but operators provide the ongoing operational intelligence needed for production high-availability deployments.
+
+**Alternative: OpsTree Redis Operator**
+For users requiring more flexibility beyond Sentinel (standalone, cluster modes), the **OpsTree Redis Operator** is a robust alternative with support for all deployment modes. The detailed manifests below demonstrate OpsTree configuration, which can be adapted to Spotahome's CRD format.
 
 **Installation:**
 
@@ -672,13 +678,13 @@ spec:
 
 ---
 
-##### Alternative Redis Operators
+##### Alternative Redis Options
 
 Other options for provisioning Redis Sentinel in Kubernetes:
 
-- **Spotahome Redis Operator** ([GitHub](https://github.com/spotahome/redis-operator)) - Focused exclusively on Sentinel HA with automatic failover. Simpler than OpsTree if you only need Sentinel mode.
+- **OpsTree Redis Operator** ([GitHub](https://github.com/OT-CONTAINER-KIT/redis-operator)) - Full-featured operator supporting all deployment modes (standalone, cluster, sentinel, replication). Recommended if you need flexibility beyond Sentinel-only deployments. The manifests shown above demonstrate OpsTree configuration.
 
-- **Bitnami Redis Helm Chart** ([GitHub](https://github.com/bitnami/charts/tree/main/bitnami/redis)) - Not an operator, but widely used. Quick setup via Helm with Sentinel support.
+- **Bitnami Redis Helm Chart** ([GitHub](https://github.com/bitnami/charts/tree/main/bitnami/redis)) - Not an operator, but widely used for quick provisioning via Helm. Supports Sentinel mode but lacks the continuous management and automatic failover handling that operators provide.
 
 - **Redis Enterprise Operator** ([Redis.io](https://redis.io/docs/latest/operate/kubernetes/)) - Commercial option with advanced features. Requires Redis Enterprise license.
 
@@ -947,9 +953,7 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 
 ### Phase 5: Operator Integration Testing
 
-- Test with OpsTree Redis Operator (Sentinel mode with 1 primary + 2 replicas)
-- Test with Spotahome Redis Operator (alternative Sentinel implementation)
-- Test with Bitnami Helm chart (Sentinel mode)
+- Test with Spotahome Redis Operator (Sentinel mode with 1 primary + 2 replicas)
 - Verify Secret mounting for ACL user credentials and TLS certs
 - Verify automatic failover behavior when primary fails
 
@@ -1019,10 +1023,10 @@ This implementation uses Redis in memory-only mode (no RDB/AOF persistence). Dat
 - [Redis ACL Documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/) - ACL configuration
 - [Redis TLS Documentation](https://redis.io/docs/latest/operate/rs/security/encryption/tls/enable-tls/) - TLS setup guide
 - [AWS ElastiCache IAM Auth](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/auth-iam.html) - IAM authentication for ElastiCache
-- [OpsTree Redis Operator](https://github.com/OT-CONTAINER-KIT/redis-operator) - Kubernetes operator for Redis (all modes)
-- [OpsTree Redis Operator Docs](https://ot-container-kit.github.io/redis-operator/guide/setup.html) - Setup and configuration guide
-- [Spotahome Redis Operator](https://github.com/spotahome/redis-operator) - Alternative: Kubernetes operator for Redis Sentinel
-- [Bitnami Redis Helm Chart](https://github.com/bitnami/charts/tree/main/bitnami/redis) - Alternative: Helm chart for Redis deployments
+- [Spotahome Redis Operator](https://github.com/spotahome/redis-operator) - Recommended: Kubernetes operator for Redis Sentinel with automatic failover
+- [OpsTree Redis Operator](https://github.com/OT-CONTAINER-KIT/redis-operator) - Alternative: Kubernetes operator for Redis (all deployment modes)
+- [OpsTree Redis Operator Docs](https://ot-container-kit.github.io/redis-operator/guide/setup.html) - Setup and configuration guide for OpsTree
+- [Bitnami Redis Helm Chart](https://github.com/bitnami/charts/tree/main/bitnami/redis) - Alternative: Helm chart for Redis deployments (non-operator)
 - [RFC 6749](https://tools.ietf.org/html/rfc6749) - OAuth 2.0 Authorization Framework
 - [RFC 7009](https://tools.ietf.org/html/rfc7009) - OAuth 2.0 Token Revocation
 
