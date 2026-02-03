@@ -268,9 +268,7 @@ type RedisRunConfig struct {
     // KeyPrefix is automatically derived from the MCP server name
     // Format: thv:auth:{<server-name>}:
     // This ensures key partitioning for multi-tenancy in Redis Cluster
-    // Users should NOT set this manually in most cases - it's populated by the operator
-    // +optional
-    KeyPrefix string `json:"keyPrefix,omitempty" yaml:"keyPrefix,omitempty"`
+    KeyPrefix string `json:"keyPrefix" yaml:"keyPrefix"`
 
     // Timeout configuration (optional, defaults: DialTimeout=5s, ReadTimeout=3s, WriteTimeout=3s)
     // +optional
@@ -352,12 +350,6 @@ type RedisStorageConfig struct {
     // ACLUserConfig configures ACL user authentication
     // Required when authType is "aclUser"
     ACLUserConfig *RedisACLUserConfig `json:"aclUserConfig,omitempty"`
-
-    // KeyPrefix override - normally auto-derived from MCPServer/VirtualMCPServer name
-    // Format when auto-derived: thv:auth:{<server-name>}:
-    // Only set this if you need a custom prefix (not recommended)
-    // +optional
-    KeyPrefix string `json:"keyPrefix,omitempty"`
 
     // Timeout configuration (optional, with reasonable defaults)
     // DialTimeout is the timeout for establishing new connections
