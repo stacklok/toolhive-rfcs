@@ -37,7 +37,7 @@ Users deploying ToolHive in production environments with high availability requi
 - Migrating existing in-memory data to Redis (cold start is acceptable)
 - Supporting other distributed storage backends (PostgreSQL, etcd) in this RFC
 - Implementing distributed locking beyond what Redis provides natively
-- Adding Redis as a dependency for local/development use (MemoryStorage remains default)
+- Adding Redis as a dependency for development use (MemoryStorage remains default)
 - Redis persistence (RDB/AOF) - this implementation is memory-only
 - Encryption at rest - not needed since data is memory-only with short TTLs
 - Supporting standalone or cluster deployment modes - only Sentinel is supported
