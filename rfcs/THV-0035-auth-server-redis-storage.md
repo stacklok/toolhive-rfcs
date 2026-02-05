@@ -52,7 +52,7 @@ Users deploying ToolHive in production environments with high availability requi
 Multiple ToolHive instances share authentication state via Redis Sentinel (1 primary + 2 replicas).
 
 **Deployment Scenarios:**
-- **Shared Redis (Scenario 1)**: Multiple MCP servers reference the same MCPExternalAuthConfig, sharing one Redis instance. Keys are partitioned by server name using hash tags (`thv:auth:{server-name}:*`) to ensure isolation.
+- **Shared Redis (Scenario 1)**: Multiple MCP servers reference the same MCPExternalAuthConfig, sharing one Redis instance. Keys are partitioned by server name using hash tags (`thv:auth:{server-ns}:{server-name}:*`) to ensure isolation.
 - **Dedicated Redis (Scenario 2)**: Each MCP server has its own MCPExternalAuthConfig pointing to a dedicated Redis instance. Simpler but requires more infrastructure.
 
 ```mermaid
@@ -194,7 +194,7 @@ type RedisConfig struct {
     ACLUserConfig *ACLUserConfig
 
     // Key partitioning - KeyPrefix is derived from server name
-    // Format: thv:auth:{<server-name>}:
+    // Format: thv:auth:{<server-ns}:{<server-name>}:
     // This is automatically set by the operator/runner from MCPServer name
     KeyPrefix string
 
@@ -266,7 +266,7 @@ type RedisRunConfig struct {
     ACLUserConfig *ACLUserRunConfig `json:"aclUserConfig,omitempty" yaml:"aclUserConfig,omitempty"`
 
     // KeyPrefix is automatically derived from the MCP server name
-    // Format: thv:auth:{<server-name>}:
+    // Format: thv:auth:{<server-ns}:{<server-name>}:
     // This ensures key partitioning for multi-tenancy in Redis Cluster
     KeyPrefix string `json:"keyPrefix" yaml:"keyPrefix"`
 
@@ -709,10 +709,10 @@ func (s *RedisStorage) key(dataType, identifier string) string {
 }
 
 // KeyPrefix derivation (done once at startup by operator/runner)
-func DeriveKeyPrefix(serverName string) string {
-    // Format: thv:auth:{<server-name>}:
+func DeriveKeyPrefix(serverNamespace, serverName string) string {
+    // Format: thv:auth:{<server-ns}:{<server-name>}:
     // Hash tag {serverName} ensures Redis Cluster slot routing
-    return fmt.Sprintf("thv:auth:{%s}:", serverName)
+    return fmt.Sprintf("thv:auth:{%s}:{%s}:", serverNamespace, serverName)
 }
 ```
 
