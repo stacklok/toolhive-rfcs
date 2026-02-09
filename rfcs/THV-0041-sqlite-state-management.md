@@ -1,4 +1,4 @@
-# RFC-XXXX: SQLite-Based State Management
+# RFC-0041: SQLite-Based State Management
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
