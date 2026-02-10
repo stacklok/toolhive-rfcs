@@ -1,4 +1,4 @@
-# THV-0038: Session-Scoped MCP Client Lifecycle Management
+# THV-0038: Session-Scoped Architecture for vMCP
 
 - **Status**: Draft
 - **Author(s)**: @yrobla, @jerm-dro
@@ -9,7 +9,13 @@
 
 ## Summary
 
-Refactor vMCP session architecture to encapsulate behavior in well-defined interfaces (`Session` and `SessionFactory`), decoupling session creation (domain logic) from SDK integration (protocol concerns). This restructuring naturally enables session-scoped MCP client lifecycle management, where clients are created once during initialization, reused throughout the session, and closed during cleanup. The new architecture simplifies testing, reduces connection overhead, enables stateful backend workflows, and makes future features (optimizer-in-vmcp, capability refresh) straightforward to implement through interface decoration.
+Refactor vMCP session architecture to encapsulate behavior in well-defined interfaces (`Session` and `SessionFactory`), decoupling session creation (domain logic) from SDK integration (protocol concerns).
+
+Restructuring the session management enables:
+
+- **Client reuse throughout the session**: Clients are created once during initialization, reused for all requests, and closed during cleanup, enabling stateful workflows (e.g., Playwright browser sessions, database transactions)
+- **Integration testing without full server**: Test session capabilities and routing logic in isolation without spinning up the complete vMCP server
+- **Simplified feature extensions**: Add capabilities like optimizer-in-vmcp and capability refresh through interface decoration, since protocol concerns are decoupled from how capabilities are calculated
 
 ## Problem Statement
 
@@ -40,9 +46,9 @@ The per-request client pattern is a symptom of a deeper architectural problem: *
 
 Session construction is spread across middleware, adapters, and hooks—tightly coupled to the MCP SDK's lifecycle callbacks:
 
-- **Discovery middleware** triggers capability discovery before the session exists, then stuffs results into request context ([discovery/middleware.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/discovery/middleware.go#L109-L110))
-- **Session ID adapter** creates an empty session when the SDK calls `Generate()`, with no access to discovered capabilities ([session_adapter.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/session_adapter.go#L50-L71))
-- **OnRegisterSession hook** fishes capabilities back out of context and populates the session ([server.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/server.go#L777-L850))
+- **Discovery middleware** triggers capability discovery before the session exists, then stuffs results into request context ([discovery/middleware.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/discovery/middleware.go))
+- **Session ID adapter** creates an empty session when the SDK calls `Generate()`, with no access to discovered capabilities ([session_adapter.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/session_adapter.go))
+- **OnRegisterSession hook** fishes capabilities back out of context and populates the session ([server.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/server.go))
 
 This creates cognitive load: to understand "how does a session get created?", you must trace through middleware, adapter callbacks, SDK hooks, and context threading across multiple files.
 
@@ -60,9 +66,9 @@ The existing `VMCPSession` is a passive data container with getters and setters 
 
 The current design routes requests via **context**, not session object lookup:
 
-- Middleware stuffs capabilities into context before SDK sees request ([discovery/middleware.go:109-110](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/discovery/middleware.go#L109-L110))
-- Router is stateless - extracts routing table from context on every request ([router/default_router.go:54](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/router/default_router.go#L54)) by reading capabilities from context
-- Handler factory uses router to find backend target, then calls shared backend client ([adapter/handler_factory.go:103-125](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/adapter/handler_factory.go#L103-L125))
+- Middleware stuffs capabilities into context before SDK sees request ([discovery/middleware.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/discovery/middleware.go))
+- Router is stateless - extracts routing table from context on every request ([router/default_router.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/router/default_router.go)) by reading capabilities from context
+- Handler factory uses router to find backend target, then calls shared backend client ([adapter/handler_factory.go](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/adapter/handler_factory.go))
 
 **Flow**: `request → middleware (stuff ctx) → handler → router (read ctx) → backend client`
 
@@ -102,7 +108,7 @@ These architectural problems have cascading effects:
 - **Rewrite All Session Types**: Initial focus is on `VMCPSession`; other session types (ProxySession, SSESession) remain unchanged except for interface compliance
 - **Connection Pooling Within Clients**: Individual MCP clients may internally pool connections, but that's outside this RFC's scope
 - **Multi-Session Client Sharing**: Clients remain session-scoped and are not shared across sessions
-- **Lazy Backend Discovery**: Backend discovery remains eager (current behavior)
+- **Lazy Capability Discovery**: Capability discovery remains eager and static (i.e., done once at session creation, current behavior)
 - **Client Versioning**: Handling MCP protocol version negotiation is out of scope
 
 ## Proposed Solution
@@ -158,15 +164,13 @@ This RFC proposes restructuring around two key interfaces:
 ```mermaid
 sequenceDiagram
     participant Client
-    participant DiscoveryMW as Discovery Middleware
     participant SessionMgr as SessionManager
     participant Factory as SessionFactory
     participant Aggregator
     participant Session
     participant SDK as MCP SDK
 
-    Client->>DiscoveryMW: POST /mcp/initialize
-    DiscoveryMW->>SessionMgr: CreateSession(ctx, identity, backends)
+    Client->>SessionMgr: POST /mcp/initialize
     SessionMgr->>Factory: MakeSession(ctx, identity, backends)
     Factory->>Aggregator: AggregateCapabilities(ctx, backends)
     Aggregator-->>Factory: {Capabilities, Clients}
@@ -174,9 +178,8 @@ sequenceDiagram
     Session-->>Factory: session
     Factory-->>SessionMgr: session
     SessionMgr->>SessionMgr: Store session by ID
-    SessionMgr-->>DiscoveryMW: sessionID
-    DiscoveryMW->>SDK: Continue to SDK handler
-    SDK->>SessionMgr: Generate() // Returns pre-created session ID
+    SessionMgr->>SDK: Wire session to SDK
+    SDK->>SessionMgr: Generate() // Returns session ID
     SessionMgr-->>SDK: sessionID
     SDK->>SessionMgr: OnRegisterSession(sessionID)
     SessionMgr->>Session: Tools(), Resources()
@@ -186,11 +189,12 @@ sequenceDiagram
 ```
 
 **Key Flow:**
-1. Discovery middleware intercepts initialize request, calls `SessionManager.CreateSession()`
-2. SessionManager uses SessionFactory to create fully-formed session (capabilities + clients)
-3. Session stored before SDK sees request
-4. SDK calls `Generate()` which returns pre-created session ID
-5. SDK registers session's tools/resources via `OnRegisterSession` hook
+1. Initialize request triggers `SessionManager` to create session via `SessionFactory`
+2. SessionFactory creates clients, passes them to aggregator for capability discovery
+3. SessionFactory returns fully-formed session (capabilities + pre-initialized clients)
+4. Session stored in SessionManager before SDK registration
+5. SDK calls `Generate()` which returns the session ID
+6. SDK registers session's tools/resources via `OnRegisterSession` hook
 
 ### Terminology Clarification
 
@@ -208,7 +212,33 @@ This RFC uses the following terms consistently:
 
 Today's `VMCPSession` is a passive data container with getters and setters (e.g., `SetRoutingTable()`, `RoutingTable()`), not an object with encapsulated behavior.
 
-Proposed `Session` interface is an active domain object that owns backend clients and encapsulates routing logic. Instead of exposing internal state through setters, it provides behavior methods like `CallTool()` that look up the target in the routing table and invoke the appropriate backend client.
+Proposed `Session` interface is an active domain object that owns backend clients and encapsulates routing logic:
+
+```go
+type Session interface {
+    // Identity and metadata
+    ID() string
+    Identity() *auth.Identity
+
+    // Capabilities - returns discovered tools/resources for this session
+    Tools() []Tool
+    Resources() []Resource
+    Prompts() []Prompt
+
+    // MCP operations - routing logic is encapsulated here
+    CallTool(ctx context.Context, name string, arguments map[string]any) (*ToolResult, error)
+    ReadResource(ctx context.Context, uri string) (*ResourceResult, error)
+    GetPrompt(ctx context.Context, name string, arguments map[string]any) (*PromptResult, error)
+
+    // Lifecycle
+    Close() error
+
+    // Initialization state - returns error if session initialization failed, nil if successful
+    InitError() error
+}
+```
+
+Instead of exposing internal state through setters, it provides behavior methods like `CallTool()` that look up the target in the routing table and invoke the appropriate backend client.
 
 **2. Decoupling Session Creation from SDK Wiring**
 
@@ -216,7 +246,12 @@ Today: Session construction is spread across middleware (discovery), adapter cal
 
 Proposed: Clean separation:
 - **SessionFactory**: Builds complete sessions (discovery + client initialization + routing setup)
-- **SessionManager**: Bridges between `SessionFactory` (domain) and MCP SDK (protocol)
+- **SessionManager**: Bridges between `SessionFactory` (domain) and MCP SDK (protocol) by:
+  - Implementing `SessionIdManager` interface (`Generate`, `Validate`, `Terminate`)
+  - Converting domain types to SDK types (Session's `Tools()` → `[]mcp.Tool`)
+  - Registering capabilities with SDK via `server.AddTool()`, `server.AddResource()`, `server.AddPrompt()`
+  - Creating handlers that delegate to `session.CallTool()`, `session.ReadResource()`, `session.GetPrompt()`
+  - See example in [`pkg/vmcp/server/server.go` (injectCapabilities)](https://github.com/stacklok/toolhive/blob/main/pkg/vmcp/server/server.go)
 
 **3. Pre-initialized Backend Clients**
 
@@ -248,14 +283,17 @@ type Session interface {
 
     // Lifecycle
     Close() error
+
+    // Initialization state - returns error if session initialization failed, nil if successful
+    InitError() error
 }
 ```
 
 **Key behaviors:**
 - **Owns backend clients**: Session stores pre-initialized MCP clients in an internal map
 - **Encapsulates routing**: `CallTool()` looks up tool in routing table, routes to correct backend client
-- **Manages lifecycle**: `Close()` iterates through all clients and closes them
-- **Thread-safe**: All methods protected by mutex for concurrent access
+- **Manageable lifetime**: `Close()` cleans up clients and any other resources. The SessionManager/caller is decoupled from what exactly happens on close()
+- **Thread-safe**: All methods protected by internal RWMutex for concurrent access. Read operations (Tools, Resources, Prompts, CallTool, ReadResource, GetPrompt) use read locks; write operations (Close) use write locks. Methods like `Tools()`, `Resources()`, `Prompts()` return defensive copies (not references to internal slices) to prevent caller mutations. Internal maps and slices are never exposed directly. Proper encapsulation may allow removal of mutexes elsewhere (e.g., SessionManager, current VMCPSession) since state is now owned by the Session
 
 **Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). TTL management and storage are handled by the existing session storage layer (`pkg/transport/session`) - sessions are stored in a storage backend that automatically extends TTL on access via `Get()` and expires sessions based on configured TTL.
 
@@ -275,9 +313,9 @@ type SessionFactory interface {
 ```
 
 **Responsibilities:**
-- Calls aggregator to discover capabilities from all backends
-- Receives both capabilities AND initialized clients from aggregator (reuse for efficiency)
-- Constructs session with routing table, tools, resources, clients
+- Creates MCP clients for all backends (owns client lifecycle)
+- Passes clients to aggregator to discover capabilities
+- Constructs session with routing table, tools, resources, and the same pre-initialized clients
 - Returns fully-formed session ready for use
 
 #### 2. SessionFactory Implementation
@@ -286,30 +324,34 @@ type SessionFactory interface {
 
 The default factory implementation follows this pattern:
 
-1. **Single-pass discovery**: Call `aggregator.AggregateCapabilities(ctx, backends)`
-   - Aggregator creates MCP clients for each backend
-   - Queries capabilities (tools, resources, prompts) from each backend
-   - Resolves conflicts using configured strategy (prefix, priority, manual)
-   - Returns both aggregated capabilities AND initialized clients
+1. **Create MCP clients**: Initialize clients for each backend
+   - Factory creates one client per backend using existing client factory
+   - Clients are connection-ready but not yet used
 
-2. **Client reuse**: Use clients from aggregator (don't create new ones)
-   - Avoids redundant TCP handshake + TLS negotiation + MCP initialization
-   - Clients used for discovery are already working and initialized
+2. **Capability discovery**: Pass clients to `aggregator.AggregateCapabilities(ctx, clients)`
+   - Aggregator uses provided clients to query capabilities (tools, resources, prompts) from each backend
+   - Resolves conflicts using configured strategy (prefix, priority, manual)
+   - Returns aggregated capabilities (routing table, tools, resources, prompts)
+   - Aggregator does NOT own client lifecycle - just uses them for queries
 
 3. **Return fully-formed session**: Construct session with all dependencies
    - Session ID (UUID)
    - User identity
    - Routing table (maps tool names to backend workload IDs)
-   - Tools, resources, prompts (aggregated from all backends)
-   - Pre-initialized clients map (keyed by workload ID)
+   - Tools, resources, prompts (aggregated from backends)
+   - Pre-initialized clients map (keyed by workload ID) - same clients used for discovery
 
-**Key Design Decision**: The aggregator returns both capabilities and clients together. This enables the factory to pass initialized clients directly to the session without additional connection overhead.
+**Key Design Decision**: Clients are created once by the factory and threaded through: factory → aggregator (for discovery) → session (for reuse). This avoids redundant connection setup while maintaining clean separation of concerns (factory owns client creation, aggregator only queries capabilities).
 
 **Updated Aggregator Interface**:
 
-The aggregator must be updated to return clients alongside capabilities. Currently, `AggregateCapabilities()` returns only discovered capabilities (routing table, tools, resources, prompts). The updated version returns an `AggregationResult` struct that includes both capabilities **and** the initialized clients map (keyed by workload ID).
+The aggregator interface takes clients as input instead of creating them internally:
 
-**Rationale**: The aggregator already creates clients internally to query backend capabilities. This change just makes it return those clients instead of discarding them. No additional connection overhead.
+```go
+AggregateCapabilities(ctx context.Context, clients map[string]*Client) (*AggregationResult, error)
+```
+
+**Rationale**: Separates client lifecycle (factory's concern) from capability discovery (aggregator's concern). The factory creates clients once, passes them to aggregator for discovery, then passes same clients to session for reuse.
 
 **Performance impact**: Reusing discovery clients eliminates redundant connection setup (TCP handshake + TLS negotiation + MCP initialization), saving ~100-500ms per backend depending on network conditions.
 
@@ -322,7 +364,7 @@ The default session implementation stores:
 - Routing table mapping tool/resource names to backend workload IDs
 - Discovered capabilities (tools, resources, prompts)
 - Pre-initialized backend clients map (keyed by workload ID)
-- Mutex for thread-safe access
+- RWMutex for thread-safe access (read lock for queries/calls, write lock for Close)
 
 **Method behaviors:**
 
@@ -358,30 +400,19 @@ type SessionIdManager interface {
 
 **The Challenge**: Ideally, discovery middleware (which has request context) would create the fully-formed session, and `Generate()` would just return the ID. However, Go lacks goroutine-local storage, so `Generate()` can't retrieve a pre-created session ID without unsafe patterns.
 
-**Implementation Options**:
+**Implementation Approach**:
 
-The SDK constraint requires choosing between these approaches:
+Since `Generate()` lacks context access, we use a two-phase creation pattern:
 
-**Option A: Hybrid approach (minimal changes to current flow)** ⭐ **Recommended for Phase 1**
-- Discovery middleware discovers capabilities and stores in context (current behavior)
-- `Generate()` creates session ID, stores empty session
-- `OnRegisterSession` hook retrieves capabilities from context and calls `SessionFactory.MakeSession()`
-- Replace empty session with fully-formed session in SessionManager
-- **Pros**: Works with SDK as-is, minimal risk, no unsafe patterns
-- **Cons**: Still uses context-passing and hook pattern (not fully encapsulated)
+1. **Phase 1 - Session ID generation**: `Generate()` creates session ID, stores empty session placeholder
+2. **Phase 2 - Session population**: `OnRegisterSession` hook retrieves backends and identity from request context and calls `SessionFactory.MakeSession()` to create the fully-formed session, then replaces the placeholder
 
-**Option B: Upstream SDK change**
-- Contribute patch to mark3labs/mcp-go to add context parameter: `Generate(ctx context.Context) string`
-- Once merged, migrate to clean flow where middleware creates session via `CreateSession(ctx, ...)`
-- **Pros**: Clean interface, proper context propagation, no workarounds
-- **Cons**: Requires upstream coordination, blocks implementation until merged
+This hybrid approach:
+- Works with SDK as-is (no unsafe patterns like goroutine-local storage)
+- Reuses existing discovery middleware and context-passing patterns
+- Enables incremental migration without blocking on upstream changes
 
-**Option C: Fork SDK** (not recommended)
-- Maintain internal fork with `Generate(ctx context.Context)` signature
-- **Pros**: Clean interface immediately available
-- **Cons**: Maintenance burden, divergence from upstream, delayed security/bug fixes
-
-**Recommendation**: **Option A** for initial implementation (Phase 1-2), then propose **Option B** as upstream improvement for Phase 3-4.
+**Note**: While we could contribute a patch to mark3labs/mcp-go adding `Generate(ctx context.Context) string`, this would block implementation and isn't necessary—the two-phase pattern is pragmatic and maintains safety.
 
 ##### SessionManager Design
 
@@ -395,7 +426,7 @@ The SDK constraint requires choosing between these approaches:
    - Returns session ID (or error if creation fails)
 
 2. **SDK lifecycle** (implements `SessionIdManager`):
-   - `Generate() string` - Returns session ID (pre-created or newly created depending on option)
+   - `Generate() string` - Creates empty session placeholder, returns session ID (phase 1 of two-phase creation)
    - `Validate(sessionID) (bool, error)` - Checks if session exists
    - `Terminate(sessionID) (bool, error)` - Loads session, calls `Close()`, removes from map
 
@@ -412,13 +443,15 @@ The SDK constraint requires choosing between these approaches:
 - Return MCP-formatted response
 
 **SDK Registration Flow**:
-1. Create SessionManager with SessionFactory
-2. Pass to SDK as `WithSessionIdManager(sessionManager)`
+1. Construct SessionManager with SessionFactory as a dependency: `sessionManager := NewSessionManager(sessionFactory)`
+2. Pass SessionManager to SDK: `WithSessionIdManager(sessionManager)`
 3. In `OnRegisterSession` hook: register tools via `sessionManager.GetAdaptedTools(sessionID)`
 
 #### 5. Migration from Current Architecture
 
 **Phase 1**: Introduce interfaces and new implementation alongside existing code
+- **Note**: Phase 1 will be done incrementally across multiple PRs if necessary, reusing existing implementation pieces. This allows us to introduce the bulk of the code without having to worry about refactoring the existing system.
+
 **Phase 2**: Update server initialization to use new SessionManager
 **Phase 3**: Remove old discovery middleware and httpBackendClient patterns
 **Phase 4**: Clean up deprecated code paths
@@ -427,9 +460,9 @@ Details in Implementation Plan section below.
 
 #### 6. Error Handling
 
-**Session Creation Failures (Option A - Hybrid Approach)**:
+**Session Creation Failures**:
 
-With the recommended Option A implementation:
+With the two-phase creation pattern:
 
 1. **`Generate()` phase**: Creates empty session (UUID only), always succeeds
    - Stores empty session in map
@@ -439,14 +472,14 @@ With the recommended Option A implementation:
 2. **`OnRegisterSession` hook phase**: Calls `SessionFactory.MakeSession()` - failure possible here
    - If `MakeSession()` fails completely (e.g., all backends unreachable):
      - Log error with session ID and failure details
-     - Store error state in session metadata (e.g., `session.SetMetadata("init_error", err.Error())`)
-     - Keep session in map but mark as failed
+     - Create a failed session that stores the initialization error internally
+     - Keep session in map (tool calls will check `session.InitError()`)
    - Subsequent tool calls to this session:
-     - Check session metadata for `init_error`
-     - Return clear error: "Session initialization failed: [details]"
+     - Check `session.InitError()` before processing request
+     - If non-nil, return clear error: "Session initialization failed: [details from InitError()]"
      - Client should delete session and re-initialize
 
-**Rationale**: Option A uses a two-phase creation (empty session + populate via hook). The SDK's `Generate()` must return a session ID, so failures during `MakeSession()` are handled by storing error state in the session object itself.
+**Rationale**: The two-phase creation pattern (empty session + populate via hook) is necessary because the SDK's `Generate()` must return a session ID. Additionally, the SDK's `OnRegisterSession` hook does not allow returning an error, so failures during `MakeSession()` cannot be propagated directly. Instead, errors are stored in the session object via `InitError()`, and subsequent tool calls check this state before processing requests. The Session interface includes `InitError() error` to support this pattern.
 
 **Partial Backend Initialization**:
 
@@ -503,7 +536,7 @@ No new security boundaries are introduced. This is a refactoring of existing ses
 
 **Mitigation strategies** (implementation details for future work):
 1. **Per-request header injection**: Resolve credentials fresh for each request, inject into MCP client headers
-2. **Token refresh hooks**: Backend client library refreshes tokens automatically (if supported by `mcp-go`)
+2. **Manual token refresh**: Use `mcp-go`'s `OAuthHandler.RefreshToken()` to refresh OAuth tokens when they expire (note: mcp-go provides refresh capability but does not do it automatically - requires explicit calls)
 3. **Client recreation on auth failure**: Detect 401/403 errors, recreate client with refreshed credentials
 4. **Session TTL alignment**: Set session TTL shorter than credential lifetime
 
@@ -653,34 +686,15 @@ The interface-based design enables future enhancements:
 - **Health-based initialization**: Skip unhealthy backends in `SessionFactory.MakeSession()`
 - **Credential refresh**: Add token refresh hooks in session implementation
 
-**Decorators and Composition**:
+### Decorator Pattern and Extensibility
 
-The `Session` interface enables clean feature composition through decoration. This addresses complexity issues seen in previous feature additions:
+The Session interface enables clean feature composition through the decorator pattern. External components and features can be integrated by wrapping the base session implementation (see Appendix A for the optimizer integration example).
 
-**Example: Optimizer-in-vMCP** (simplified approach vs [PR #3517](https://github.com/stacklok/toolhive/pull/3517)):
-
-The optimizer can be implemented as a `Session` decorator that wraps an underlying session and adds semantic search capabilities. The decorator:
-- Stores a reference to the inner `Session` and maintains an in-memory vector database
-- Implements the `Session` interface
-- Intercepts `CallTool()` - if tool name is "find_tool", performs semantic search over `inner.Tools()` and returns matching tools; otherwise delegates to `inner.CallTool()`
-- Delegates all other methods (`Tools()`, `Resources()`, `Close()`) directly to the inner session
-
-**Benefits vs [PR #3517](https://github.com/stacklok/toolhive/pull/3517) approach**:
-1. **No SDK integration concerns**: Optimizer doesn't touch MCP protocol or server.go hooks
-2. **Testable**: Unit test optimizer with mock inner session, no vMCP server required
-3. **Minimal cognitive load**: Standard decorator pattern, clear separation of concerns
-
-**Example: Session Capability Refresh** (simplified vs [PR #3642](https://github.com/stacklok/toolhive/pull/3642)):
-
-With Session as a domain object, refreshing capabilities becomes straightforward: add a `RefreshCapabilities(ctx)` method that calls the aggregator to re-discover capabilities from backends, then updates the session's internal routing table and tools list under a write lock. The session state update is encapsulated—no middleware coordination needed.
-
-**Note**: SDK tool registration would need a separate refresh mechanism, but the session domain logic is simple and self-contained.
-
-**Other Decoration Examples**:
-- **Caching layer**: Wrap session to cache tool results for repeated calls
-- **Rate limiting**: Wrap session to enforce per-session rate limits
-- **Audit logging**: Wrap session to log all tool calls with detailed context
-- **Circuit breaker**: Wrap session to implement circuit breaker pattern per backend
+**Potential decorators**:
+- **Caching layer**: Cache tool results for repeated calls
+- **Rate limiting**: Enforce per-session rate limits
+- **Audit logging**: Log all tool calls with detailed context
+- **Capability refresh**: Re-discover capabilities and update routing table (simplified vs [PR #3642](https://github.com/stacklok/toolhive/pull/3642))
 
 **Testing Benefits** (addresses [toolhive#2852](https://github.com/stacklok/toolhive/issues/2852)):
 
@@ -694,11 +708,11 @@ With the Session interface, you can unit test session routing logic without spin
 
 ## Implementation Plan
 
-This implementation introduces new interfaces and gradually migrates from the current architecture to the proposed design. All phases are additive until Phase 4, ensuring low risk and easy rollback.
+This implementation introduces new interfaces and gradually migrates from the current architecture to the proposed design. Phases 1-2 are purely additive (ensuring low risk and easy rollback), while Phase 3 switches over and removes old code.
 
 ### Phase 1: Introduce Core Interfaces and Factory
 
-**Goal**: Establish the `Session` and `SessionFactory` interfaces and provide a working implementation without changing existing flows.
+**Goal**: Create the `Session` and `SessionFactory` interfaces and provide working implementations, but do not wire them up to the existing system yet (purely additive, no changes to existing flows).
 
 **New Files**:
 - `pkg/vmcp/session/session.go` - Define `Session` interface
@@ -708,9 +722,9 @@ This implementation introduces new interfaces and gradually migrates from the cu
 **Implementation Details**:
 
 The `defaultSession` implementation owns backend clients in an internal map. When `SessionFactory.MakeSession()` runs:
-1. Aggregate capabilities from all backends
-2. Create and initialize one MCP client per backend
-3. Return session with pre-initialized clients map
+1. Create and initialize one MCP client per backend
+2. Pass clients to aggregator to discover capabilities from all backends
+3. Return session with pre-initialized clients map (same clients used for discovery)
 
 **Testing**:
 - Unit tests for `Session` interface methods (CallTool, ReadResource, Close)
@@ -720,44 +734,63 @@ The `defaultSession` implementation owns backend clients in an internal map. Whe
 
 **Files Modified**: None (purely additive)
 
-### Phase 2: Introduce SessionManager and Wire to SDK
+### Phase 2: Wire Up New Code Path Behind Feature Flag
 
-**Goal**: Create `SessionManager` that uses `SessionFactory` and implements the SDK's `SessionIdManager` interface.
+**Goal**: Implement the new ideal code path using `SessionManager` + `SessionFactory` + `Session`, but hide it behind a `sessionManagementV2` config flag (defaults to disabled). Do not attempt to migrate/refactor existing code - write fresh ideal implementation.
 
 **New Files**:
 - `pkg/vmcp/server/session_manager.go` - Implement `SessionManager` bridging domain (Session) to protocol (SDK)
+- `pkg/vmcp/config/config.go` - Add `sessionManagementV2` feature flag (defaults to `false`)
 
-**Core structure**: SessionManager stores a `SessionFactory` reference and a concurrent map of sessions (keyed by session ID).
+**Feature Flag Integration**:
+Add conditional logic in server/hooks/middleware to toggle between old and new behavior:
 
-**Key methods** (see "Wiring into the MCP SDK" section in Detailed Design for full behavior):
-- `Generate() string` - Creates session via factory or returns pre-created ID (depending on SDK constraint workaround chosen)
+```go
+if config.SessionManagementV2 {
+    // New code path: Use SessionFactory + Session interface
+    sessionManager := NewSessionManager(sessionFactory)
+    server.WithSessionIdManager(sessionManager)
+    // ... new hooks using sessionManager.GetAdaptedTools()
+} else {
+    // Old code path: Existing VMCPSession + httpBackendClient + discovery middleware
+    // ... existing code unchanged
+}
+```
+
+**Key methods in SessionManager** (see "Wiring into the MCP SDK" section in Detailed Design for full behavior):
+- `Generate() string` - Creates empty session (two-phase creation pattern)
 - `Terminate(sessionID) (bool, error)` - Loads session, calls `Close()`, removes from map
 - `GetAdaptedTools(sessionID) []mcp.Tool` - Retrieves session, converts its tools to SDK format with handlers
-- `CreateSession(ctx, identity, backends) (string, error)` - Creates fully-formed session via factory (used by discovery middleware)
-
-**Integration steps**:
-1. Create `SessionManager` with `SessionFactory` dependency
-2. Pass to SDK as `WithSessionIdManager(sessionManager)`
-3. In `OnRegisterSession` hook: register tools via `GetAdaptedTools()`
-4. For SDK constraint workarounds, see "SDK Interface Constraint" in Detailed Design
+- `CreateSession(ctx, identity, backends) (string, error)` - Called from `OnRegisterSession` hook to create fully-formed session via factory
 
 **Testing**:
-- Integration tests: Create session via `SessionManager.Generate()`, verify session stored
+- Integration tests with feature flag enabled: Create session via `SessionManager.Generate()`, verify session stored
 - Test tool handler routing: Call tool, verify session's `CallTool()` is invoked
 - Test session termination: Call `Terminate()`, verify session closed
 - Test SDK integration: Initialize session via HTTP `/mcp/initialize`, verify tools registered
+- Verify old code path still works when flag is disabled (no regressions)
 
 **Files Modified**:
-- `pkg/vmcp/server/server.go` - Add SessionManager creation and wiring
+- `pkg/vmcp/server/server.go` - Add conditional logic based on `sessionManagementV2` flag
+- `pkg/vmcp/server/hooks.go` - Add conditional logic for new vs old session registration
 
-### Phase 3: Migrate Existing Code to Use Session Interface
+**Rationale**: Writing new ideal code behind a feature flag is easier than incrementally refactoring tangled existing code. Once validated, we can delete the old code path entirely (Phase 3) rather than spending cycles on gradual migration.
 
-**Goal**: Update callsites to use the new `Session` interface instead of accessing `VMCPSession` directly or using `httpBackendClient`.
+### Phase 3: Validate, Switch Over, and Delete Old Code
 
-**Changes**:
-- Remove discovery middleware's context-passing pattern (capabilities no longer passed via context)
-- Remove `httpBackendClient` per-request client creation pattern (session owns clients now)
-- Update any code that called `VMCPSession.SetRoutingTable()` / `SetTools()` to use `Session` interface methods
+**Goal**: Validate the new code path, flip the default to enabled, and delete the old implementation entirely (no gradual migration).
+
+**Validation and rollout**:
+1. Enable `sessionManagementV2` flag in CI to validate new code path
+2. Change `sessionManagementV2` default from `false` to `true` and release
+3. Let it bake in production and fix any bugs that arise
+4. Monitor metrics: session creation latency, tool call latency, connection counts, error rates
+
+**Cleanup** (after successful bake period with no rollbacks):
+- Remove old `VMCPSession` data container implementation (replaced by `defaultSession`)
+- Remove old discovery middleware context-passing pattern (replaced by `SessionFactory`)
+- Remove old `httpBackendClient` per-request creation pattern (replaced by session-owned clients)
+- Remove feature flag and conditional logic (only new code path remains)
 
 **Testing**:
 - End-to-end tests: Full vMCP workflow with multiple backends
@@ -766,18 +799,16 @@ The `defaultSession` implementation owns backend clients in an internal map. Whe
 - Session expiration test: Verify TTL cleanup closes all clients
 
 **Files Modified**:
-- `pkg/vmcp/discovery/middleware.go` - Remove context-based capability passing (deprecated by SessionFactory)
-- `pkg/vmcp/client/client.go` - Remove `httpBackendClient` per-request creation (deprecated by Session ownership)
-- Any code directly accessing `VMCPSession` fields - Migrate to `Session` interface
+- `pkg/vmcp/server/server.go` - Remove old code path and feature flag conditionals
+- `pkg/vmcp/discovery/middleware.go` - Delete (replaced by SessionFactory)
+- `pkg/vmcp/client/client.go` - Remove `httpBackendClient` (replaced by Session ownership)
+- Delete old `VMCPSession` implementation files
 
-### Phase 4: Cleanup and Observability
+**Rationale**: Once the new code path is validated, delete the old code entirely rather than maintaining both paths. This avoids technical debt and ongoing maintenance burden.
 
-**Goal**: Remove deprecated code and add observability for session lifecycle.
+### Phase 4: Add Observability
 
-**Cleanup**:
-- Remove old `VMCPSession` data container implementation (replaced by `defaultSession`)
-- Remove old discovery middleware hooks (replaced by `SessionFactory`)
-- Remove old `httpBackendClient` patterns (replaced by session-owned clients)
+**Goal**: Add comprehensive observability for session lifecycle (cleanup is done in Phase 3).
 
 **Observability**:
 - Add audit log events for session creation with backend initialization results
@@ -816,10 +847,10 @@ The `defaultSession` implementation owns backend clients in an internal map. Whe
 
 Each phase is independently testable and can be rolled back:
 
-- **Phase 1**: New interfaces unused, no behavior change
-- **Phase 2**: SessionManager wired but old code paths still present
-- **Phase 3**: Can revert to Phase 2 state (both implementations coexist)
-- **Phase 4**: Can keep deprecated code if needed (cleanup optional)
+- **Phase 1**: New interfaces unused, no behavior change. Can be safely ignored or deleted.
+- **Phase 2**: Feature flag `sessionManagementV2` defaults to `false`, old code path still active. No behavior change unless flag is explicitly enabled.
+- **Phase 3**: Can toggle `sessionManagementV2` back to `false` to revert to old code path. Once old code is deleted, rollback requires redeploying Phase 2 code.
+- **Phase 4**: Observability additions are purely additive, no rollback needed.
 
 ### Testing Strategy
 
@@ -878,7 +909,7 @@ Each phase is independently testable and can be rolled back:
 
 ## Open Questions
 
-Most major design questions have been resolved during RFC review. One implementation detail requires resolution:
+Most major design questions have been resolved during RFC review. One architectural question requires design during implementation:
 
 1. ~~Should clients be created eagerly or lazily?~~ → **Resolved: Eager initialization during `SessionFactory.MakeSession()`**
 2. ~~How should session concerns be organized?~~ → **Resolved: Encapsulate in `Session` interface (domain object), separate from SDK wiring (`SessionManager`)**
@@ -886,11 +917,25 @@ Most major design questions have been resolved during RFC review. One implementa
 4. ~~Should we share clients across sessions for efficiency?~~ → **Resolved: No, session isolation is critical (prevents state leakage, security risks)**
 5. ~~How to handle short-lived credentials with session-scoped clients?~~ → **Resolved: Document limitation, provide mitigation strategies (per-request header injection, token refresh hooks), assume most backends use long-lived credentials for initial implementation**
 6. ~~How should client closure be triggered?~~ → **Resolved: Session owns clients, `Session.Close()` called on expiration/termination via `SessionManager.Terminate()`**
-7. **How to work around SDK `Generate()` having no context parameter?** → **Requires resolution during Phase 2 implementation**
-   - SDK's `SessionIdManager.Generate()` has no context, cannot access identity/backends directly
-   - Three options documented: (A) Hybrid with OnRegisterSession hook, (B) Custom HTTP middleware wrapper, (C) Fork SDK
-   - **Recommendation**: Start with Option A (pragmatic), evaluate Option B for better encapsulation
-   - See "SDK Interface Constraint" section in Detailed Design for full analysis
+7. ~~How to work around SDK `Generate()` having no context parameter?~~ → **Resolved: Use two-phase creation pattern**
+   - SDK's `SessionIdManager.Generate()` has no context parameter
+   - Solution: Two-phase pattern where `Generate()` creates empty session, then `OnRegisterSession` hook calls `SessionFactory.MakeSession()` to populate it
+   - Works with SDK as-is, no unsafe patterns (e.g., goroutine-local storage)
+   - See "SDK Interface Constraint" section in Detailed Design for details
+
+8. **How does this architecture work with inter-session state like circuit breakers and health checks?** → **Requires design during Phase 1-2 implementation**
+   - **Current state**: Circuit breaker and health monitoring exist at backend level (across all sessions) in `pkg/vmcp/health`
+   - **Challenge**: Clients are now session-scoped, but circuit breaker state must be shared across sessions
+   - **Proposed approach**:
+     - Circuit breaker and health check state remains at **backend/aggregator level** (inter-session, shared state)
+     - During `SessionFactory.MakeSession()`, consult health monitor to exclude unhealthy/circuit-broken backends
+     - Individual sessions don't maintain circuit breaker state - they call through to a shared health monitor service
+     - When a tool call fails, session delegates error reporting to the health monitor which updates shared circuit breaker state
+     - Existing health monitoring system (`pkg/vmcp/health`) continues tracking backend health independently of sessions
+   - **Open design questions**:
+     - Should sessions created before a backend is circuit-broken continue using that backend's client, or should they dynamically check health state on each call?
+     - How to handle mid-session backend failures? (Current mitigation: session storage extends TTL, short TTL limits exposure)
+   - **Recommendation**: Defer detailed design to Phase 1-2 implementation, leverage existing health monitoring patterns where possible
 
 ## References
 
@@ -907,6 +952,27 @@ Most major design questions have been resolved during RFC review. One implementa
 
 ---
 
+## Appendix A: Optimizer Integration
+
+The session architecture directly enables integration of the MCP Optimizer into vMCP. Per [stacklok-epics#201](https://github.com/stacklok/stacklok-epics/issues/201), the standalone optimizer will be migrated into vMCP to address production requirements:
+- Support searching over ~150 tools with reasonable latency (<5s cold start)
+- Production-grade reliability (standalone optimizer crashes with 3+ servers, 20+ tools)
+
+### Integration Approach
+
+The optimizer will be integrated as a `Session` decorator that wraps the base session implementation. This decorator:
+- Stores a reference to the inner `Session` and maintains an in-memory vector database of tool embeddings
+- Implements the `Session` interface
+- Intercepts `CallTool()`:
+  - If tool name is `"find_tool"`, performs semantic search over `inner.Tools()` and returns matching tools
+  - If tool name is `"call_tool"`, delegates to appropriate backend via `inner.CallTool()` with the target tool name
+  - Otherwise, delegates directly to `inner.CallTool()`
+- Delegates all other methods (`Tools()`, `Resources()`, `Close()`) directly to the inner session
+
+This decorator pattern allows the optimizer to be added without modifying core session logic or SDK integration, demonstrating how the Session interface enables clean feature composition.
+
+---
+
 ## RFC Lifecycle
 
 <!-- This section is maintained by RFC reviewers -->
@@ -916,6 +982,7 @@ Most major design questions have been resolved during RFC review. One implementa
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-02-04 | @yrobla, @jerm-dro | Draft | Initial submission |
+| 2026-02-09 | @jerm-dro, Copilot | Under Review | Addressed PR #38 comments |
 
 ### Implementation Tracking
 
