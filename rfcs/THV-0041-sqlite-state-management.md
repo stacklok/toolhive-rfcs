@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
 - **Created**: 2026-02-09
-- **Last Updated**: 2026-02-09
+- **Last Updated**: 2026-02-10
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3648](https://github.com/stacklok/toolhive/issues/3648)
 
@@ -103,7 +103,7 @@ flowchart TD
     StoreIface["storage.SkillStore<br/>(pkg/storage/)"]
     SQLiteImpl["sqlite.SkillStore<br/>(pkg/storage/sqlite/)"]
     NoopImpl["NoopSkillStore<br/>(pkg/storage/)"]
-    DB["toolhive.db<br/>(~/.local/state/toolhive/)"]
+    DB["toolhive.db<br/>(xdg.StateHome/toolhive/)"]
 
     Studio -->|REST API| API
     API --> SkillSvc
@@ -145,7 +145,7 @@ pkg/storage/sqlite/
     db.go               -- DB handle, Open/Close, PRAGMA configuration
     migrations.go       -- Embedded SQL migration runner
     migrations/
-        001_create_skills.sql
+        001_create_entries_and_skills.sql
     skill_store.go      -- SQLite SkillStore implementation
 ```
 
@@ -164,12 +164,13 @@ does not need to change.
 #### Storage Interfaces
 
 Domain-specific interfaces rather than one generic store. Each domain has
-different query and filter semantics (skills filter by scope; statuses filter
-by labels and running state; groups have client registration operations). The
-`SkillStore` interface maps directly to the CRUD operations the `SkillService`
-needs:
+different query and filter semantics (skills filter by scope and project;
+statuses filter by labels and running state; groups have client registration
+operations). The `SkillStore` interface maps directly to the CRUD operations
+the `SkillService` needs:
 
-- `Create`, `Get`, `List` (with optional scope filter), `Update`, `Delete`
+- `Create`, `Get`, `List` (with optional scope, project, and client filters),
+  `Update`, `Delete`
 - Returns `ErrNotFound` or `ErrAlreadyExists` sentinel errors
 - Accepts and returns existing `skills.InstalledSkill` types
 
@@ -189,16 +190,32 @@ builder with no CGo support. There are no existing CGo dependencies.
 requires CGo and would break the build pipeline. The ~10-20% performance
 difference vs native C SQLite is irrelevant for this use case.
 
+As of this writing, `modernc.org/sqlite` implements SQLite 3.51.2 (the
+current stable release). This includes full JSONB support (introduced in
+SQLite 3.45.0, January 2024), enabling storage of `tags` and `client_apps`
+as JSONB `BLOB` columns with native query support via `json_each()`,
+`jsonb_extract()`, and related functions.
+
 #### Database Location
 
-Following the existing XDG convention from `pkg/state/local.go`:
+Following the existing XDG convention from `pkg/state/local.go`, the database
+is placed at:
 
 ```
-$XDG_STATE_HOME/toolhive/toolhive.db
+<xdg.StateHome>/toolhive/toolhive.db
 ```
 
-Typically `~/.local/state/toolhive/toolhive.db`. This is the same directory
-where RunConfig files already live (`runconfigs/` subdirectory).
+ToolHive uses `github.com/adrg/xdg` which resolves `StateHome` to
+platform-native paths:
+
+| Platform | Path |
+|----------|------|
+| Linux | `~/.local/state/toolhive/toolhive.db` |
+| macOS | `~/Library/Application Support/toolhive/toolhive.db` |
+
+This is the same base directory where RunConfig files already live
+(`runconfigs/` subdirectory). The new `pkg/storage/sqlite/` package uses the
+same `xdg` library for path resolution.
 
 WAL mode creates two sidecar files (`toolhive.db-wal` and `toolhive.db-shm`)
 alongside the database. These are normal and must not be deleted while any
@@ -297,81 +314,131 @@ CREATE TABLE IF NOT EXISTS schema_version (
 try to migrate, the first acquires the write lock; the second blocks on
 `busy_timeout`, then sees the migration is already applied and skips it.
 
-#### Data Model: Skills Schema
+#### Data Model: Entries and Skills Schema
+
+Phase 1 introduces a thin `entries` identity table shared across managed
+entity types (skills now, workload statuses in future phases), plus
+skill-specific tables. Groups are standalone organizational containers
+referenced by entries rather than being entries themselves.
 
 ```sql
--- migrations/001_create_skills.sql
+-- migrations/001_create_entries_and_skills.sql
 
+-- Shared identity table for ToolHive-managed entities.
+-- Each lifecycle-tracked entity type (skill, workload) gets a row here.
+-- Domain-specific data lives in child tables.
+CREATE TABLE entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_type  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (entry_type, name)
+);
+
+-- Tracks each skill installation. A single skill (entry) can have multiple
+-- installations: once at user scope (global) and once per project.
 CREATE TABLE installed_skills (
-    name         TEXT NOT NULL,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id     INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
     scope        TEXT NOT NULL DEFAULT 'user'
-                      CHECK (scope IN ('user', 'system')),
+                      CHECK (scope IN ('user', 'project')),
+    project_root TEXT NOT NULL DEFAULT '',
+    -- OCI artifact tracking (replaces skillet's .skillet.json)
+    reference    TEXT NOT NULL DEFAULT '',   -- full OCI ref, e.g. ghcr.io/org/skill:v1
+    tag          TEXT NOT NULL DEFAULT '',   -- OCI tag, e.g. v1.0.0
+    digest       TEXT NOT NULL DEFAULT '',   -- sha256:... for upgrade detection
+    -- Metadata from SKILL.md frontmatter
     version      TEXT NOT NULL DEFAULT '',
     description  TEXT NOT NULL DEFAULT '',
     author       TEXT NOT NULL DEFAULT '',
-    tags         TEXT NOT NULL DEFAULT '[]',   -- JSON array of strings
+    tags         BLOB DEFAULT NULL,          -- JSONB array of strings
+    client_apps  BLOB DEFAULT NULL,          -- JSONB array of ClientApp strings
+    -- State
     status       TEXT NOT NULL DEFAULT 'pending'
                       CHECK (status IN ('installed', 'pending', 'failed')),
     installed_at TEXT NOT NULL
                       DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    clients      TEXT NOT NULL DEFAULT '[]',   -- JSON array of client names
-    PRIMARY KEY (name, scope)
+    UNIQUE (entry_id, scope, project_root)
 );
 
-CREATE INDEX idx_installed_skills_status ON installed_skills (status);
+-- Tracks skill dependencies (from SKILL.md `requires:` field)
+CREATE TABLE skill_dependencies (
+    installed_skill_id INTEGER NOT NULL
+                           REFERENCES installed_skills(id) ON DELETE CASCADE,
+    dep_name           TEXT NOT NULL DEFAULT '',
+    dep_reference      TEXT NOT NULL,   -- OCI reference
+    dep_digest         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (installed_skill_id, dep_reference)
+);
+
+-- OCI store index (replaces skillet's index.json).
+-- Maps OCI references/tags to resolved manifest digests.
+CREATE TABLE oci_tags (
+    reference TEXT NOT NULL,
+    digest    TEXT NOT NULL,
+    PRIMARY KEY (reference)
+);
 ```
 
 **Design decisions:**
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Primary key | `(name, scope)` | Same skill can exist independently at user and system scope. |
-| Clients storage | JSON array | Matches the existing `InstalledSkill.Clients []string` type. Can normalize later if needed. |
-| Tags storage | JSON array | Read-only metadata. Never queried independently. |
+| Entries table | Thin identity layer | Shared `(entry_type, name)` uniqueness across lifecycle-tracked entities (skills, workloads). Only fields common to all entity types (name + timestamps) live here; domain-specific data stays in child tables. Groups are standalone tables referenced by entries. |
+| Scope model | `user` / `project` | `user` = installed under home directory (global). `project` = installed in a project directory (detected via `.git`). Matches the [Agent Skills spec](https://agentskills.io/specification) scoping and PR #3712. |
+| Project root | `project_root TEXT` | A user-scoped skill has `project_root = ''`. A project-scoped skill stores the absolute project path, enabling the same skill to be installed in multiple projects. |
+| Primary key | `(entry_id, scope, project_root)` | Uniquely identifies each installation across scope and project dimensions. |
+| OCI tracking | `reference`, `tag`, `digest` | Replaces skillet's `.skillet.json`. The `digest` enables upgrade detection (same digest = unchanged). |
+| Client apps | JSONB array | Maps directly to Go's `[]string` / `ClientApp` type. `modernc.org/sqlite` implements SQLite 3.51.2 with full JSONB support. Can query via `json_each()` when needed. Can normalize to junction table later if query patterns justify it. |
+| Tags | JSONB array | Read-only metadata from SKILL.md frontmatter. Stored as JSONB `BLOB` for efficient access via SQLite JSON functions. |
+| Dependencies | Separate table | Normalized from skillet's `external_dependencies` JSON array. Enables querying "which skills depend on X?" efficiently. |
+| OCI tags | Separate table | Replaces skillet's file-based `index.json`. Provides the same tag-to-digest resolution with transactional safety. |
+| No status index | Omitted | Small table (dozens of rows). Sequential scan is negligible. Add indexes later if profiling shows need. |
 | Timestamps | RFC 3339 TEXT | Human-readable, consistent with existing JSON files. |
 | CHECK constraints | On `scope` and `status` | Defense-in-depth validation at the DB level. |
 
 #### Future Phase 2+ Tables (Design Reference)
 
 These validate that the schema foundation supports future needs. Not
-implemented in Phase 1.
+implemented in Phase 1. Future phases create their own entries and reference
+the shared `entries` table.
 
 ```sql
 -- migrations/002_create_workload_statuses.sql (future)
 CREATE TABLE workload_statuses (
-    name           TEXT PRIMARY KEY,
+    entry_id       INTEGER PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE,
     status         TEXT NOT NULL,
     status_context TEXT NOT NULL DEFAULT '',
     process_id     INTEGER NOT NULL DEFAULT 0,
     group_name     TEXT NOT NULL DEFAULT '',
     is_remote      INTEGER NOT NULL DEFAULT 0,
     transport      TEXT NOT NULL DEFAULT '',
-    port           INTEGER NOT NULL DEFAULT 0,
-    created_at     TEXT NOT NULL
-                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at     TEXT NOT NULL
-                        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    port           INTEGER NOT NULL DEFAULT 0
 );
 ```
 
-Note: `workload_statuses` includes denormalized fields (`group_name`,
-`is_remote`, `transport`, `port`) from RunConfigs. This eliminates the current
+Note: `workload_statuses` references `entries` via FK, reusing the shared
+identity layer. It includes denormalized fields (`group_name`, `is_remote`,
+`transport`, `port`) from RunConfigs. This eliminates the current
 `isRemoteWorkload` hack in `file_status.go` where the status manager reaches
-into the RunConfig store to check the `remote_url` field.
+into the RunConfig store to check the `remote_url` field. Timestamps come
+from the parent `entries` row. The `group_name` references the `groups` table.
 
 ```sql
 -- migrations/003_create_groups.sql (future)
 CREATE TABLE groups (
-    name TEXT PRIMARY KEY
-);
-
-CREATE TABLE group_clients (
-    group_name  TEXT NOT NULL,
-    client_name TEXT NOT NULL,
-    PRIMARY KEY (group_name, client_name),
-    FOREIGN KEY (group_name) REFERENCES groups (name) ON DELETE CASCADE
+    name                   TEXT PRIMARY KEY,
+    registered_client_apps BLOB DEFAULT NULL   -- JSONB array of ClientApp strings
 );
 ```
+
+Note: Groups are standalone organizational containers, not managed entities.
+They are *referenced by* other entries (skills and workloads belong to groups),
+rather than being entries themselves. This reflects their role as a grouping
+mechanism rather than a lifecycle-tracked entity.
 
 #### Dependency Graph
 
@@ -477,15 +544,20 @@ Database operations logged at DEBUG level, consistent with existing patterns.
 - **Why not chosen**: Single `toolhive.db` is simpler and enables cross-table
   transactions when needed.
 
-### Alternative 5: Normalized `skill_clients` Junction Table
+### Alternative 5: Normalized `skill_client_apps` Junction Table
 
-- **Description**: Separate `skill_clients` table instead of JSON array.
+- **Description**: Separate `skill_client_apps` table instead of JSONB array.
 - **Pros**: Efficient "list skills for client X" queries. Atomic per-client
-  operations.
-- **Cons**: More complex schema. Current `SkillService` interface doesn't
-  expose client-level queries.
-- **Why not chosen for Phase 1**: JSON array matches existing type directly.
-  Can normalize later if needed.
+  operations. Relational integrity.
+- **Cons**: At this scale (dozens of rows, 1-3 client apps per skill), the
+  benefits are marginal. Introduces complexity around whether skills and groups
+  share the same junction table -- since skills associate client apps
+  per-installation (scope + project) while groups associate them at the group
+  level, a shared table needs qualifiers that get awkward fast.
+- **Why not chosen for Phase 1**: JSONB array maps directly to Go's
+  `[]string` / `ClientApp` type. `json_each()` handles per-client queries at
+  this data volume. Can normalize via migration later if query patterns justify
+  it.
 
 ## Compatibility
 
@@ -513,7 +585,8 @@ For future phases (statuses, groups), the migration strategy is:
 - Add `modernc.org/sqlite` dependency to `go.mod`
 - Create `pkg/storage/` package: interfaces, errors, noop, factory
 - Create `pkg/storage/sqlite/` package: db, migrations, skill_store
-- Create `migrations/001_create_skills.sql`
+- Create `migrations/001_create_entries_and_skills.sql` (entries, installed_skills,
+  skill_dependencies, oci_tags)
 - Wire `SkillService` to accept `storage.SkillStore` via constructor injection
 - Add `sqlite.Close()` to CLI and `thv serve` shutdown paths
 - Generate mocks with `mockgen`
@@ -521,15 +594,15 @@ For future phases (statuses, groups), the migration strategy is:
 ### Phase 2: Workload Statuses (Future)
 
 - Add `StatusStore` interface to `pkg/storage/interfaces.go`
-- Create `migrations/002_create_workload_statuses.sql` with denormalized
-  RunConfig fields
+- Create `migrations/002_create_workload_statuses.sql` (references `entries`)
 - Migrate `fileStatusManager` to use SQLite (eliminates flock/recovery code)
 - File-to-SQLite migration for existing status files
 
 ### Phase 3: Groups (Future)
 
 - Add `GroupStore` interface
-- Create `migrations/003_create_groups.sql`
+- Create `migrations/003_create_groups.sql` (standalone table, referenced by
+  entries via `group_name`)
 - Migrate `cliManager` to SQLite (fixes `RegisterClients` race)
 - File-to-SQLite migration for existing group files
 
@@ -555,22 +628,19 @@ For future phases (statuses, groups), the migration strategy is:
 
 ## Open Questions
 
-1. **Client normalization**: JSON array for now. Normalize to junction table if
-   client-level queries become a requirement.
-
-2. **Database file permissions**: Explicitly `chmod 0600` after creation, or
+1. **Database file permissions**: Explicitly `chmod 0600` after creation, or
    rely on directory permissions and umask?
-
-3. **WAL checkpoint on close**: Explicitly `PRAGMA wal_checkpoint(TRUNCATE)` on
-   clean shutdown to minimize sidecar files?
 
 ## References
 
 - [SQLite WAL mode](https://www.sqlite.org/wal.html)
+- [SQLite JSONB](https://www.sqlite.org/jsonb.html)
 - [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)
+- [Agent Skills Specification](https://agentskills.io/specification)
 - [RFC-0030: Skills Lifecycle Management](./THV-0030-skills-lifecycle-management.md)
 - [Issue #3648: Skill state management](https://github.com/stacklok/toolhive/issues/3648)
 - [Issue #3645: Skills domain types](https://github.com/stacklok/toolhive/issues/3645)
+- [PR #3712: Client skill metadata](https://github.com/stacklok/toolhive/pull/3712)
 
 ---
 
@@ -581,6 +651,7 @@ For future phases (statuses, groups), the migration strategy is:
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-02-09 | @JAORMX | Draft | Initial submission |
+| 2026-02-10 | @JAORMX | Revised | Addressed review feedback: entries table, JSONB, scope model, OCI tracking |
 
 ### Implementation Tracking
 
