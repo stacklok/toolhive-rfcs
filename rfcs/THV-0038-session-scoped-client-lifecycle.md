@@ -3,13 +3,13 @@
 - **Status**: Draft
 - **Author(s)**: @yrobla, @jerm-dro
 - **Created**: 2026-02-04
-- **Last Updated**: 2026-02-09
+- **Last Updated**: 2026-02-12
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3062](https://github.com/stacklok/toolhive/issues/3062)
 
 ## Summary
 
-Refactor vMCP session architecture to encapsulate behavior in well-defined interfaces (`Session` and `SessionFactory`), decoupling session creation (domain logic) from SDK integration (protocol concerns).
+Refactor vMCP session architecture around three core components: `Session` (domain object with behavior), `SessionFactory` (creates fully-formed sessions), and `SessionManager` (bridges domain logic to MCP SDK protocol). This separates session creation (domain logic) from SDK integration (protocol concerns) and integrates with the existing pluggable session storage architecture.
 
 Restructuring the session management enables:
 
@@ -156,47 +156,54 @@ This makes testing difficult (can't create sessions without full server) and add
 
 ### Proposed Design
 
-This RFC proposes restructuring around two key interfaces:
+This RFC proposes restructuring around three core components:
 
-1. **SessionFactory**: Creates fully-formed sessions with all dependencies (capability discovery, client initialization, resource allocation)
-2. **Session**: A domain object that owns its resources, encapsulates routing logic, and manages its own lifecycle
+1. **Session**: A domain object that owns its resources (clients), encapsulates routing logic, and manages its own lifecycle
+2. **SessionFactory**: Creates fully-formed sessions with all dependencies (capability discovery, client initialization, resource allocation)
+3. **SessionManager**: Bridges domain logic (Session/SessionFactory) to MCP SDK protocol, using the existing `transportsession.Manager` for storage
 
-**Proposed session creation flow:**
+**Proposed session creation flow** (two-phase pattern due to SDK constraints):
 
 ```mermaid
 sequenceDiagram
     participant Client
+    participant SDK as MCP SDK
     participant SessionMgr as SessionManager
     participant Factory as SessionFactory
     participant Aggregator
     participant Session
-    participant SDK as MCP SDK
 
-    Client->>SessionMgr: POST /mcp/initialize
+    Client->>SDK: POST /mcp/initialize
+    Note over SDK: SDK handles initialize,<br/>needs session ID
+    SDK->>SessionMgr: Generate() // No context!
+    Note over SessionMgr: Phase 1: Create empty<br/>session placeholder
+    SessionMgr->>SessionMgr: Store empty session by ID
+    SessionMgr-->>SDK: sessionID
+    SDK->>SessionMgr: OnRegisterSession(sessionID, ctx)
+    Note over SessionMgr: Phase 2: Now we have context!<br/>Populate the session
     SessionMgr->>Factory: MakeSession(ctx, identity, backends)
-    Factory->>Aggregator: AggregateCapabilities(ctx, backends)
-    Aggregator-->>Factory: {Capabilities, Clients}
+    Factory->>Factory: Create clients for each backend
+    Factory->>Aggregator: AggregateCapabilities(ctx, clients)
+    Aggregator-->>Factory: Capabilities (tools, resources, routing)
     Factory->>Session: new Session(capabilities, clients)
     Session-->>Factory: session
     Factory-->>SessionMgr: session
-    SessionMgr->>SessionMgr: Store session by ID
-    SessionMgr->>SDK: Wire session to SDK
-    SDK->>SessionMgr: Generate() // Returns session ID
-    SessionMgr-->>SDK: sessionID
-    SDK->>SessionMgr: OnRegisterSession(sessionID)
+    SessionMgr->>SessionMgr: Replace placeholder with real session
     SessionMgr->>Session: Tools(), Resources()
     Session-->>SessionMgr: capabilities
     SessionMgr->>SDK: AddSessionTools(sessionID, tools)
     SDK-->>Client: InitializeResult with Mcp-Session-Id header
 ```
 
-**Key Flow:**
-1. Initialize request triggers `SessionManager` to create session via `SessionFactory`
-2. SessionFactory creates clients, passes them to aggregator for capability discovery
-3. SessionFactory returns fully-formed session (capabilities + pre-initialized clients)
-4. Session stored in SessionManager before SDK registration
-5. SDK calls `Generate()` which returns the session ID
-6. SDK registers session's tools/resources via `OnRegisterSession` hook
+**Key Flow (two-phase creation):**
+1. SDK receives initialize request, needs session ID
+2. **Phase 1**: SDK calls `Generate()` (no context) → SessionManager creates empty session placeholder, stores it, returns session ID
+3. **Phase 2**: SDK calls `OnRegisterSession(sessionID, ctx)` (has context) → SessionManager calls `SessionFactory.MakeSession()` to create fully-formed session (capability discovery, client initialization)
+4. SessionManager replaces empty placeholder with fully-formed session
+5. SDK registers session's tools/resources via `AddSessionTools()`
+6. Client receives InitializeResult with session ID header
+
+**Why two phases?** The SDK's `Generate()` has no context parameter (see "SDK Interface Constraint" section below), so we cannot create fully-formed sessions until `OnRegisterSession` hook provides request context.
 
 ### Terminology Clarification
 
@@ -291,13 +298,15 @@ type Session interface {
 - **Manageable lifetime**: `Close()` cleans up clients and any other resources. The SessionManager/caller is decoupled from what exactly happens on close()
 - **Thread-safe**: All methods protected by internal RWMutex for concurrent access to prevent data races on internal state. Read operations (Tools, Resources, Prompts, CallTool, ReadResource, GetPrompt) use read locks; write operations (Close) use write locks. Methods like `Tools()`, `Resources()`, `Prompts()` return defensive copies (not references to internal slices) to prevent caller mutations. Internal maps and slices are never exposed directly. Note: The RWMutex prevents data races but does not prevent `CallTool()` from using a closed client after `Close()` completes—the session implementation must track closed state explicitly (see "Client Closed Mid-Request" in Error Handling). Proper encapsulation may allow removal of mutexes elsewhere (e.g., SessionManager, current VMCPSession) since state is now owned by the Session
 
-**Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). This RFC builds on the existing pluggable session storage architecture ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)) which provides `Storage` interface and `Manager` for Redis/Valkey support. The architecture uses a **dual-layer model** (detailed in section "Session Architecture and Serializability"):
+**Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). This RFC builds on the existing pluggable session storage architecture ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)) which provides `Storage` interface and `Manager` for Redis/Valkey support.
+
+**Dual-layer architecture** (detailed in section "Session Architecture and Serializability"):
 - **Metadata layer** (serializable): Session ID, timestamps, identity reference - stored via `transportsession.Manager` + `Storage` interface (supports `LocalStorage` today, `RedisStorage` in future)
 - **Runtime layer** (in-memory only): MCP client objects, routing table, capabilities - cannot be serialized due to TCP connections and goroutines
 
-**Important notes**:
-- The existing `Storage.DeleteExpired()` only removes from storage without calling `Close()`, which would leak backend client connections. As part of this RFC, the session storage layer must be updated to call `session.Close()` before removing expired sessions from storage.
-- **Horizontal scaling**: Session metadata can be in Redis/Valkey, but MCP clients are in-process only. Horizontal scaling requires sticky sessions (session affinity at load balancer) to ensure requests route to the instance holding the client objects. Without sticky sessions, clients must be recreated on instance switch (acceptable one-time cost per [Issue #2417](https://github.com/stacklok/toolhive/issues/2417)).
+**Lifecycle management**: Sessions are stored via `transportsession.Manager.AddSession()` and expire based on configured TTL. Proper cleanup requires calling `session.Close()` to release backend client connections before removing from storage. The existing `Storage.DeleteExpired()` implementation only removes metadata without calling `Close()`, which would leak connections. This RFC updates the storage layer to call `Close()` before deletion, ensuring complete resource cleanup (see Implementation Plan Phase 3).
+
+**Horizontal scaling**: Session metadata can be in Redis/Valkey, but MCP clients are in-process only. Horizontal scaling requires sticky sessions (session affinity at load balancer) to ensure requests route to the instance holding the client objects. Without sticky sessions, clients must be recreated on instance switch (acceptable one-time cost per [Issue #2417](https://github.com/stacklok/toolhive/issues/2417)).
 
 **SessionFactory Interface** - Creates fully-formed sessions:
 
@@ -328,7 +337,7 @@ The default factory implementation follows this pattern:
 
 1. **Create MCP clients**: Initialize clients for each backend **in parallel**
    - Factory creates one client per backend using existing client factory
-   - **Performance requirement**: Use parallel initialization (e.g., `errgroup` with bounded concurrency) to avoid sequential latency accumulation. With 20 backends at 100-500ms each, sequential would mean 2-10 seconds of session creation latency.
+   - **Performance requirement**: Use parallel initialization (e.g., `errgroup` with bounded concurrency) to avoid sequential latency accumulation. Connection initialization (TCP handshake + TLS negotiation + MCP protocol handshake) can take tens to hundreds of milliseconds per backend depending on network latency and backend responsiveness. With 20 backends, sequential initialization could easily exceed acceptable session creation latency.
    - **Bounded concurrency**: Limit parallel goroutines (e.g., 10 concurrent initializations) to avoid resource exhaustion
    - **Per-backend timeout**: Apply context timeout (e.g., 5s per backend) so one slow backend doesn't block session creation
    - **Partial initialization**: If some backends fail, log warnings and continue with successfully initialized backends (failed backends not added to clients map)
@@ -359,7 +368,7 @@ AggregateCapabilities(ctx context.Context, clients map[string]*Client) (*Aggrega
 
 **Rationale**: Separates client lifecycle (factory's concern) from capability discovery (aggregator's concern). The factory creates clients once, passes them to aggregator for discovery, then passes same clients to session for reuse.
 
-**Performance impact**: Reusing discovery clients eliminates redundant connection setup (TCP handshake + TLS negotiation + MCP initialization), saving ~100-500ms per backend depending on network conditions.
+**Performance impact**: Reusing discovery clients eliminates redundant connection setup (TCP handshake + TLS negotiation + MCP initialization), avoiding connection overhead on every request (this overhead varies significantly based on network latency, TLS configuration, and backend responsiveness).
 
 #### 3. Session Implementation
 
@@ -382,83 +391,49 @@ The default session implementation stores:
 
 **Thread safety**: Read operations (CallTool, ReadResource) use read locks; Close uses write lock.
 
-#### 4. Session Architecture and Serializability
+**Health monitoring integration**: Sessions interact with the existing global health monitor (`pkg/vmcp/health`) to handle backend failures:
+- **Session creation**: `SessionFactory.MakeSession()` consults health monitor to exclude unhealthy/circuit-broken backends (don't create clients for known-bad backends)
+- **Mid-session failures**: When `CallTool()` fails (connection error, timeout), mark backend unhealthy in session-local state and delegate error reporting to global health monitor
+- **Recovery**: On subsequent calls to unhealthy backend, check global health monitor; if recovered, lazily recreate client
+- **Design approach**: Global health monitor maintains shared circuit breaker state across sessions. Individual sessions track local backend health (unhealthy flag) to avoid redundant connection attempts while allowing recovery when backends come back online. Implementation details deferred to Phase 1-2.
 
-**Dual-Layer Session Model**: This RFC builds on the existing session storage architecture introduced in [PR #1989](https://github.com/stacklok/toolhive/pull/1989) and [Issue #2417](https://github.com/stacklok/toolhive/issues/2417), which established a pluggable `Storage` interface designed for Redis/Valkey externalization. The session architecture follows a **two-layer model**:
+#### 4. Storage Integration and Distributed Deployment
 
-**Layer 1: Metadata (Serializable)** - Managed by `transportsession.Manager` + `Storage` interface:
-- Session ID (string)
-- Session type (string)
-- Creation timestamp
-- Last access timestamp (TTL tracking)
-- User identity reference
-- Backend workload IDs list
-- **Stored via**: `pkg/transport/session/storage.Storage` interface (`Store`, `Load`, `Delete`, `DeleteExpired`, `Close`)
-- **Backends**: `LocalStorage` (in-memory `sync.Map`) today, `RedisStorage` in future
-- **Serialization**: JSON format already implemented in `pkg/transport/session/serialization.go`
+**Building on existing architecture**: This RFC integrates with the existing pluggable session storage layer ([PR #1989](https://github.com/stacklok/toolhive/pull/1989), [Issue #2417](https://github.com/stacklok/toolhive/issues/2417)). The existing architecture provides:
+- `Storage` interface with pluggable backends (`LocalStorage` today, `RedisStorage` in future)
+- `transportsession.Manager` for session lifecycle management
+- JSON serialization for session metadata
 
-**Layer 2: Runtime State (In-Memory Only)** - Managed by behavior-oriented `Session`:
-- Pre-initialized MCP client objects (contain TCP connections, goroutines)
-- Routing table (tool/resource name → backend workload ID mapping)
-- Discovered capabilities (tools, resources, prompts)
-- Closed state flag
-- **Cannot be serialized**: MCP clients contain active TCP connections and goroutine state that cannot be persisted
+**The fundamental constraint**: MCP clients contain active TCP connections and goroutine state that **cannot be serialized**. This is a technical limitation, not an implementation choice. You cannot persist a live TCP connection to Redis.
 
-**Composition Model**: How the two layers relate:
+**The solution: Dual-layer model**
 
-```go
-// Existing storage-oriented session interface (pkg/transport/session/session.go)
-type Session interface {
-    ID() string
-    Type() string
-    Touch() time.Time
-    GetData() any
-}
+Sessions are split into two layers with different lifecycles:
 
-// New behavior-oriented vMCP session implementation
-type vmcpSession struct {
-    // Metadata layer - embeds transportsession.Session
-    transportSession transportsession.Session  // provides ID(), Type(), Touch(), GetData()
+| Layer | Contents | Storage | Lifetime |
+|-------|----------|---------|----------|
+| **Metadata** | Session ID, timestamps, identity reference, backend IDs list | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
+| **Runtime** | MCP client objects, routing table, capabilities, closed flag | In-process memory only | Lives only while vMCP instance is running |
 
-    // Runtime layer - behavior and clients
-    identity       *auth.Identity
-    routingTable   map[string]string  // tool name → backend ID
-    capabilities   []Tool
-    clients        map[string]*mcp.Client  // backend ID → MCP client
-    closed         bool
-    mu             sync.RWMutex
-}
+**How it works**:
+- The behavior-oriented `Session` embeds `transportsession.Session` (metadata layer) and owns MCP clients (runtime layer)
+- Sessions are stored via `transportsession.Manager.AddSession()` which uses the pluggable `Storage` interface
+- When `RedisStorage` is implemented, metadata automatically persists to Redis, clients remain in-memory
+- No parallel storage path—all sessions go through the same `Storage` interface
 
-// Implements both interfaces
-func (s *vmcpSession) ID() string { return s.transportSession.ID() }
-func (s *vmcpSession) Type() string { return s.transportSession.Type() }
-func (s *vmcpSession) Touch() time.Time { return s.transportSession.Touch() }
-func (s *vmcpSession) GetData() any { return s.transportSession.GetData() }
+**Distributed deployment implications**:
 
-func (s *vmcpSession) CallTool(ctx, name, args) (*ToolResult, error) { /* behavior */ }
-// ... other behavior methods
-```
+With **sticky sessions** (recommended):
+- Load balancer routes client to same vMCP instance → clients stay warm, optimal performance
+- Session metadata in Redis (shared), clients in-memory (per-instance)
 
-**Integration with `transportsession.Manager`**: The behavior-oriented `Session` is stored in `transportsession.Manager` (which uses the pluggable `Storage` interface), NOT in a separate `sync.Map`. This ensures:
-- Redis/Valkey support works automatically when `RedisStorage` is implemented
-- No parallel storage path that bypasses the existing architecture
-- Consistent TTL management and expiration across all session types
+Without sticky sessions (graceful degradation):
+- Request routes to different vMCP instance → that instance loads metadata from Redis
+- **Clients must be recreated** (connection initialization overhead: TCP + TLS + MCP handshake, varies with network conditions)
+- Subsequent requests to same instance reuse recreated clients
+- Trade-off: horizontal scaling flexibility vs temporary performance impact on instance switch
 
-**Distributed Deployment Considerations** ([Issue #2417](https://github.com/stacklok/toolhive/issues/2417)):
-
-1. **With sticky sessions (recommended)**:
-   - Load balancer routes client to same vMCP instance for session lifetime
-   - Session metadata in Redis (shared), clients in-memory (per-instance)
-   - Optimal performance: clients reused across requests
-
-2. **Without sticky sessions (graceful degradation)**:
-   - Request may route to different vMCP instance
-   - New instance loads session metadata from Redis
-   - **Clients must be recreated** (one-time initialization cost ~100-500ms per backend)
-   - Subsequent requests to same instance reuse clients
-   - Acceptable trade-off: horizontal scaling with temporary perf hit on instance switch
-
-**Serializability constraints**: Only session metadata can be stored in Redis/Valkey. Runtime state (MCP clients) cannot be serialized due to TCP connections and goroutines. This is a **fundamental technical limitation**, not an implementation choice.
+**Implementation detail**: See Phase 1 in Implementation Plan for how `vmcpSession` struct composes `transportsession.Session` (metadata) with runtime state (clients map, routing table).
 
 #### 5. Wiring into the MCP SDK
 
@@ -498,61 +473,50 @@ This hybrid approach:
 
 ##### SessionManager Design
 
-**SessionManager** (`pkg/vmcp/server/session_manager.go`) bridges domain logic (behavior-oriented `Session`) to SDK protocol. It **delegates session storage to the existing `transportsession.Manager`**, which uses the pluggable `Storage` interface ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)).
+**SessionManager** (`pkg/vmcp/server/session_manager.go`) bridges domain logic to SDK protocol, coordinating three components:
+1. `SessionFactory` - Creates fully-formed sessions with initialized clients
+2. `transportsession.Manager` - Handles session storage via pluggable `Storage` interface ([PR #1989](https://github.com/stacklok/toolhive/pull/1989))
+3. MCP SDK's `SessionIdManager` - Lifecycle hooks for session creation/termination
 
-**Architecture**:
-```go
-type sessionManager struct {
-    factory         SessionFactory
-    sessionStorage  *transportsession.Manager  // Uses Storage interface
-}
+**Key insight**: By delegating storage to `transportsession.Manager`, SessionManager automatically supports pluggable backends (LocalStorage today, RedisStorage in future) without creating a parallel storage path.
 
-func NewSessionManager(factory SessionFactory, storage transportsession.Storage) *sessionManager {
-    return &sessionManager{
-        factory:        factory,
-        sessionStorage: transportsession.NewManagerWithStorage(storage),
-    }
-}
+**Session lifecycle flow**:
+
+```
+Client Request
+    ↓
+Generate() → Create empty placeholder → sessionStorage.AddSession() → Return session ID
+    ↓
+OnRegisterSession hook → factory.MakeSession() → Wrap in transportsession.Session → sessionStorage.AddSession() → SDK registers tools
+    ↓
+CallTool request → sessionStorage.Get(sessionID) → Extract behavior session → session.CallTool() → Return result
+    ↓
+Terminate() → sessionStorage.Get() → session.Close() → sessionStorage.Delete()
 ```
 
-**Key responsibilities:**
+**Implementation structure**:
+```go
+type sessionManager struct {
+    factory        SessionFactory
+    sessionStorage *transportsession.Manager  // Delegates to Storage interface
+}
 
-1. **Session creation**: `CreateSession(ctx, identity, backends)` - Used by discovery middleware
-   - Calls `factory.MakeSession()` to build fully-formed behavior-oriented session
-   - Wraps session in `transportsession.Session` (metadata layer)
-   - Stores via `sessionStorage.AddSession()` (uses `Storage` interface)
-   - Returns session ID (or error if creation fails)
+// Constructor accepts pluggable storage backend
+func NewSessionManager(factory SessionFactory, storage transportsession.Storage) *sessionManager
+```
 
-2. **SDK lifecycle** (implements `SessionIdManager`):
-   - `Generate() string` - Creates empty session placeholder, stores via `sessionStorage.AddSession()`, returns session ID (phase 1 of two-phase creation)
-   - `Validate(sessionID) (bool, error)` - Checks if session exists via `sessionStorage.Get(sessionID)`
-   - `Terminate(sessionID) (bool, error)` - Loads session via `sessionStorage.Get()`, calls `Close()` on behavior-oriented session, removes via `sessionStorage.Delete()`
+**Core operations** (implements SDK's `SessionIdManager`):
+- `Generate()` - Creates empty session, stores via `sessionStorage.AddSession()`, returns ID (phase 1 of two-phase pattern)
+- `CreateSession(ctx, identity, backends)` - Calls `factory.MakeSession()`, stores fully-formed session (phase 2, called by `OnRegisterSession` hook)
+- `Validate(sessionID)` - Checks session exists via `sessionStorage.Get()`
+- `Terminate(sessionID)` - Loads session, calls `Close()` on clients, removes via `sessionStorage.Delete()`
+- `GetAdaptedTools(sessionID)` - Loads session, converts domain types to SDK format, creates handlers that delegate to `session.CallTool()`
 
-3. **SDK adaptation**:
-   - `GetAdaptedTools(sessionID)` - Loads session via `sessionStorage.Get()`, converts tools to SDK format
-   - Creates tool handlers that delegate to `session.CallTool()`
-   - Wraps results in SDK types (`mcp.ToolResult`)
-
-**Why use `transportsession.Manager` instead of `sync.Map`?**
-- **Pluggable storage**: Automatically supports `LocalStorage` (in-memory) and future `RedisStorage` (distributed) without code changes
-- **No parallel storage path**: All sessions go through the same `Storage` interface, avoiding architectural debt
-- **Consistent TTL**: `sessionStorage.Get()` automatically extends TTL via `Touch()` (existing behavior)
-- **Expiration cleanup**: `sessionStorage.DeleteExpired()` (updated to call `session.Close()` before deletion) works uniformly
-
-**Handler pattern**: Tool handlers are closures that:
-- Load session from `sessionStorage` by ID
-- Extract behavior-oriented session from metadata layer (`GetData()`)
-- Validate request arguments (type assertions)
-- Call `session.CallTool()` with validated args
-- Convert domain result to SDK format
-- Return MCP-formatted response
-
-**SDK Registration Flow**:
-1. Construct SessionManager with factory and storage: `sessionManager := NewSessionManager(sessionFactory, localStorage)`
-2. Pass SessionManager to SDK: `WithSessionIdManager(sessionManager)`
-3. In `OnRegisterSession` hook: register tools via `sessionManager.GetAdaptedTools(sessionID)`
-
-**Redis/Valkey support**: When `RedisStorage` is implemented, just pass it to `NewSessionManager()` instead of `LocalStorage`. Session metadata goes to Redis, runtime state (clients) remains in-memory. No other changes needed.
+**Benefits of using `transportsession.Manager`**:
+- Pluggable storage works automatically (just pass `RedisStorage` instead of `LocalStorage` to constructor)
+- TTL management handled by existing `sessionStorage.Get()` which calls `Touch()`
+- No parallel storage path—consistent with all other session types
+- Expiration cleanup works uniformly (updated to call `session.Close()` before deletion)
 
 #### 5. Migration from Current Architecture
 
@@ -611,11 +575,21 @@ If a tool call fails after successful session creation:
 
 Race condition exists: session may be terminated while a request is in flight:
 - Session `Close()` closes all backend clients
-- **Race scenario**: RWMutex serializes access but doesn't prevent using closed clients—`CallTool()` can acquire a read lock after `Close()` completes and attempt to use a closed client
-- In-flight requests receive "client closed" error from MCP library
-- **Required mitigation**: Session implementation must track a `closed` flag; `CallTool()`, `ReadResource()`, and `GetPrompt()` check this flag under read lock before using clients, returning "session closed" error if true
-- **Additional mitigation**: Session storage layer extends TTL on every request (via existing `Get()` call which touches session), reducing race window
-- Future enhancement: Add reference counting to delay `Close()` until in-flight requests complete
+- **Race scenario**: RWMutex serializes access but doesn't fully prevent using closed clients—even with a `closed` flag check, there's a window between checking the flag (under read lock) and actually invoking the client method where `Close()` could complete
+- **Timing issue**: Thread A checks `closed == false` → releases read lock → Thread B calls `Close()` (acquires write lock, closes clients, sets `closed = true`) → Thread A invokes client method on closed client
+- In-flight requests receive "client closed" error from MCP library when this race occurs
+
+**Required mitigation (Phase 1 implementation)**:
+- **Reference counting**: Session tracks in-flight operation count with atomic operations:
+  - `CallTool()`, `ReadResource()`, `GetPrompt()` atomically increment counter before using client, decrement after completion
+  - `Close()` sets `closed` flag, waits for counter to reach zero (with timeout, e.g., 30s), then closes clients
+  - Operations check `closed` flag with atomic load; if true, return "session closed" error without incrementing counter
+  - This eliminates the race window by ensuring `Close()` waits for all in-flight operations
+- **Graceful degradation**: If `Close()` timeout expires with operations still in-flight, log warning and close clients anyway (in-flight operations get "client closed" errors)
+- **Alternative approach**: Use context cancellation—`Close()` cancels session context, operations detect cancellation and abort before using clients
+
+**Additional mitigation**:
+- Session storage layer extends TTL on every request (via existing `Get()` call which touches session), reducing likelihood of expiration during active use
 
 **Session Not Found**:
 
@@ -647,15 +621,16 @@ No new security boundaries are introduced. This is a refactoring of existing ses
 **Mitigation strategies**:
 
 **Phase 1 (initial implementation)**:
-1. **Automatic client recreation on auth failure**: Detect 401/403 errors from backend calls, automatically recreate client with fresh credentials from `OutgoingAuthRegistry`, retry the operation. This handles token expiration gracefully without requiring new sessions.
+1. **Automatic client recreation on auth failure**: Detect 401/403 errors from backend calls, automatically recreate client with fresh credentials from `OutgoingAuthRegistry`, retry the operation with safeguards:
+   - **Retry limit**: Maximum 3 attempts per operation to prevent infinite retry loops
+   - **Exponential backoff**: Initial 100ms delay, doubling on each retry (100ms, 200ms, 400ms) to avoid overwhelming backends
+   - **Circuit breaker integration**: Report auth failures to existing health monitor; if backend exceeds threshold (e.g., 5 failures in 60s), open circuit to prevent cascading failures
+   - **Audit logging**: Log each retry attempt with session ID, backend ID, and attempt number for debugging
+   - This handles token expiration gracefully without requiring new sessions while preventing resource exhaustion from misconfigured backends
 2. **Session TTL alignment**: Set session TTL (typically 30 minutes) shorter than expected credential lifetime to reduce stale credential exposure.
 
 **Recommended approach (Phase 2 enhancement)**:
 - **Modify `identityPropagatingRoundTripper`** (`pkg/vmcp/client/client.go`): Instead of capturing identity/credentials at client creation time, read identity from the request context on each operation. This ensures each backend call picks up the latest credentials dynamically, eliminating stale credential issues entirely.
-
-**Alternative approaches** (for reference):
-- **Manual token refresh**: Use `mcp-go`'s `OAuthHandler.RefreshToken()` to refresh OAuth tokens when they expire (note: mcp-go provides refresh capability but does not do it automatically - requires explicit calls)
-- **Per-request header injection**: Resolve credentials fresh for each request, inject into MCP client headers
 
 For initial implementation, we assume most backends use long-lived credentials (API keys, client certificates), and Phase 1's automatic recreation on auth failure is sufficient.
 
@@ -667,7 +642,7 @@ For initial implementation, we assume most backends use long-lived credentials (
 
 **Recommended mitigations**:
 
-**Phase 1 (required for production)**:
+**Required for production deployment**:
 1. **Session binding to authentication token**:
    - Store a cryptographic hash of the original authentication token (e.g., `SHA256(bearerToken)`) in the session during creation
    - On each request, validate that the current auth token hash matches the session's bound token hash
@@ -682,12 +657,12 @@ For initial implementation, we assume most backends use long-lived credentials (
    - Default 30-minute TTL limits exposure window for stolen session IDs
    - Already specified in design, reinforces hijacking mitigation
 
-**Phase 2 (optional enhancements)**:
+**Optional enhancements**:
 - **mTLS client certificate binding**: If using mTLS, bind session to client certificate fingerprint for stronger binding
 - **IP address validation**: Optionally validate client IP hasn't changed (breaks mobile clients, proxies - use with caution)
 - **Session rotation**: Periodically rotate session IDs (e.g., every 10 minutes) to limit stolen session lifetime
 
-**Implementation**: Add token hash binding in Phase 2 SessionManager implementation. Store `tokenHash` in session metadata, validate on each request via middleware.
+**Implementation timing**: Token hash binding should be implemented during Implementation Plan Phase 2 (SessionManager implementation) before production rollout. Store `tokenHash` in session metadata, validate on each request via middleware.
 
 ### Data Protection
 
@@ -732,7 +707,7 @@ For initial implementation, we assume most backends use long-lived credentials (
 - **Existing protections**: MCP client library handles credential redaction in logs and error messages (inherited behavior)
 
 **Security trade-off**: Moving from per-request clients to session-scoped clients **significantly increases credential exposure window**:
-- **Before**: Credentials in memory for milliseconds (duration of single request ~100-500ms)
+- **Before**: Credentials in memory for milliseconds to seconds (duration of single request)
 - **After**: Credentials in memory for minutes (duration of session, typically 30 minutes)
 
 This trade-off is acceptable because:
@@ -759,56 +734,6 @@ This is a **deliberate trade-off** prioritizing performance and functionality wh
 ```
 
 **Existing Events Unchanged**: Tool call logs, authentication logs, and session lifecycle logs remain the same.
-
-## Alternatives Considered
-
-### Alternative 1: Keep Per-Request Pattern with Connection Pooling
-
-**Approach**: Continue creating/closing clients per request but add a connection pool underneath to reuse TCP connections.
-
-**Pros**:
-- Minimal changes to existing code
-- Reduces TCP handshake overhead
-
-**Cons**:
-- Doesn't address MCP protocol initialization overhead (still happens per request)
-- Doesn't solve state preservation problem (each request still gets fresh MCP client)
-- Authentication still resolved and validated per request
-- Adds complexity at wrong layer
-
-**Decision**: Rejected. This addresses symptoms but not the root cause.
-
-### Alternative 2: Lazy Client Creation on First Use
-
-**Approach**: Create clients on first tool call to a backend, then store in session for reuse.
-
-**Pros**:
-- Avoids creating clients for unused backends
-- Delays initialization until needed
-
-**Cons**:
-- First tool call to each backend still has initialization latency
-- More complex state management (need to track which clients exist)
-- Doesn't leverage existing capability discovery phase
-- Inconsistent performance (first vs subsequent calls)
-
-**Decision**: Rejected. Complexity outweighs benefits. Capability discovery already knows which backends exist.
-
-### Alternative 3: Global Client Cache Across Sessions
-
-**Approach**: Share clients across all sessions using a global cache, keyed by backend + auth identity.
-
-**Pros**:
-- Maximum connection reuse
-- Lowest initialization overhead
-
-**Cons**:
-- **State Pollution**: Backend state (Playwright contexts, DB transactions) would leak across sessions
-- **Security Risk**: Potential for cross-session data exposure if keying is incorrect
-- **Complexity**: Requires complex cache eviction, client sanitization, and identity tracking
-- **Violates Session Isolation**: Sessions should be independent
-
-**Decision**: Rejected. Session isolation is a core requirement for vMCP. The security and complexity risks outweigh performance gains.
 
 ## Compatibility
 
@@ -1091,41 +1016,9 @@ Each phase is independently testable and can be rolled back:
   - Traces: Session creation span → first tool call span (shows reduced latency)
 - Add runbook for investigating client initialization failures
 
-## Open Questions
-
-Most major design questions have been resolved during RFC review. One architectural question requires design during implementation:
-
-1. ~~Should clients be created eagerly or lazily?~~ → **Resolved: Eager initialization during `SessionFactory.MakeSession()`**
-2. ~~How should session concerns be organized?~~ → **Resolved: Encapsulate in `Session` interface (domain object), separate from SDK wiring (`SessionManager`)**
-3. ~~What happens if backend client initialization fails during session creation?~~ → **Resolved: Log warning, continue with partial initialization, failed backends not in clients map**
-4. ~~Should we share clients across sessions for efficiency?~~ → **Resolved: No, session isolation is critical (prevents state leakage, security risks)**
-5. ~~How to handle short-lived credentials with session-scoped clients?~~ → **Resolved: Document limitation, provide mitigation strategies (per-request header injection, token refresh hooks), assume most backends use long-lived credentials for initial implementation**
-6. ~~How should client closure be triggered?~~ → **Resolved: Session owns clients, `Session.Close()` called on expiration/termination via `SessionManager.Terminate()`**
-7. ~~How to work around SDK `Generate()` having no context parameter?~~ → **Resolved: Use two-phase creation pattern**
-   - SDK's `SessionIdManager.Generate()` has no context parameter
-   - Solution: Two-phase pattern where `Generate()` creates empty session, then `OnRegisterSession` hook calls `SessionFactory.MakeSession()` to populate it
-   - Works with SDK as-is, no unsafe patterns (e.g., goroutine-local storage)
-   - See "SDK Interface Constraint" section in Detailed Design for details
-
-8. **How does this architecture work with inter-session state like circuit breakers and health checks?** → **Requires design during Phase 1-2 implementation**
-   - **Current state**: Circuit breaker and health monitoring exist at backend level (across all sessions) in `pkg/vmcp/health`
-   - **Challenge**: Clients are now session-scoped, but circuit breaker state must be shared across sessions
-   - **Proposed approach**:
-     - Circuit breaker and health check state remains at **backend/aggregator level** (inter-session, shared state)
-     - During `SessionFactory.MakeSession()`, consult health monitor to exclude unhealthy/circuit-broken backends
-     - Individual sessions don't maintain circuit breaker state - they call through to a shared health monitor service
-     - When a tool call fails, session delegates error reporting to the health monitor which updates shared circuit breaker state
-     - Existing health monitoring system (`pkg/vmcp/health`) continues tracking backend health independently of sessions
-   - **Recommended approach for mid-session backend failures**:
-     - **Track backend health in session state**: When a tool call to a backend fails (connection error, timeout, etc.), mark that backend as unhealthy in session-local state
-     - **Return clean errors**: If a backend is marked unhealthy, subsequent calls to that backend return "backend unavailable" error immediately without attempting connection
-     - **Lazy reconnection**: On tool call to an unhealthy backend, check global health monitor to see if backend has recovered. If recovered, attempt to recreate client lazily and mark backend healthy again
-     - This avoids checking global health state on every call (performance) while allowing sessions to recover from transient failures
-   - **Implementation details**: Defer to Phase 1-2 implementation, leverage existing health monitoring patterns where possible
-
 ## References
 
-- [MCP Specification](https://modelcontextprotocol.io/specification/2025-06-18) - Model Context Protocol specification
+- [MCP Specification](https://modelcontextprotocol.io/specification) - Model Context Protocol specification
 - [toolhive#3062](https://github.com/stacklok/toolhive/issues/3062) - Original issue: Per-request client creation overhead
 - [toolhive#2417](https://github.com/stacklok/toolhive/issues/2417) - Session storage architecture and dual-layer model (metadata vs runtime state)
 - [toolhive#2852](https://github.com/stacklok/toolhive/issues/2852) - Missing integration tests below server level
@@ -1174,6 +1067,7 @@ This decorator pattern allows the optimizer to be added without modifying core s
 |------|----------|----------|-------|
 | 2026-02-04 | @yrobla, @jerm-dro | Draft | Initial submission |
 | 2026-02-09 | @jerm-dro, Copilot | Under Review | Addressed PR #38 comments |
+| 2026-02-12 | @jerm-dro, @ChrisJBurns | Under Review | Major revisions: Integrated with existing transportsession.Manager architecture, added dual-layer storage model, addressed security concerns (session hijacking, credential exposure, resource exhaustion), clarified error handling (removed InitError pattern), added parallel client initialization, simplified SessionManager design |
 
 ### Implementation Tracking
 
