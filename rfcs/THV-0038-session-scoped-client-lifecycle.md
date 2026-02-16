@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: @yrobla, @jerm-dro
 - **Created**: 2026-02-04
-- **Last Updated**: 2026-02-12
+- **Last Updated**: 2026-02-16
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3062](https://github.com/stacklok/toolhive/issues/3062)
 
@@ -11,11 +11,30 @@
 
 Refactor vMCP session architecture around three core components: `Session` (domain object with behavior), `SessionFactory` (creates fully-formed sessions), and `SessionManager` (bridges domain logic to MCP SDK protocol). This separates session creation (domain logic) from SDK integration (protocol concerns) and integrates with the existing pluggable session storage architecture.
 
+**Multi-client session model**: One vMCP instance serves multiple clients (e.g., Claude Desktop, VSCode, Cursor) via a single HTTP endpoint. Each client that sends an `InitializeRequest` gets a unique session ID (per MCP Streamable HTTP protocol). Sessions are created dynamically when clients connect, not pre-created at startup. Each session owns its own backend clients for complete isolation.
+
 Restructuring the session management enables:
 
-- **Client reuse throughout the session**: Clients are created once during initialization, reused for all requests, and closed during cleanup, enabling stateful workflows (e.g., Playwright browser sessions, database transactions)
+- **Client reuse throughout the session**: Backend clients are created once during session initialization, reused for all requests within that session, and closed during cleanup, enabling stateful workflows (e.g., Playwright browser sessions, database transactions)
 - **Integration testing without full server**: Test session capabilities and routing logic in isolation without spinning up the complete vMCP server
 - **Simplified feature extensions**: Add capabilities like optimizer-in-vmcp and capability refresh through interface decoration, since protocol concerns are decoupled from how capabilities are calculated
+
+## Terminology
+
+This RFC uses the following terms consistently:
+
+| Term | Definition | Example |
+|------|------------|---------|
+| **Backend** | A deployed MCP server instance that vMCP aggregates | Filesystem MCP server, Playwright MCP server |
+| **Backend workload** | Same as "backend" - the deployment unit | Used interchangeably with "backend" |
+| **MCP server** | Generic term for any MCP-compliant server | Can refer to vMCP itself or a backend |
+| **vMCP session** | Client-to-vMCP session identified by vMCP's session ID | Session created when Claude Desktop initializes with vMCP |
+| **Backend session** | vMCP-to-backend session identified by backend's session ID | Session between vMCP's client and a Playwright backend |
+| **Backend client** | MCP client instance connecting vMCP to one backend | Instance of `mcp-go/client.Client` |
+| **Session-scoped** | Resources that live for the duration of a vMCP session | Backend clients created at init, closed at session expiration |
+| **Session ID** | Unique identifier for a vMCP session (UUID) | Returned in `Mcp-Session-Id` header |
+
+**Key distinction**: A single **vMCP session** owns multiple **backend clients**, each potentially maintaining its own **backend session** with the respective backend MCP server.
 
 ## Problem Statement
 
@@ -128,7 +147,7 @@ sequenceDiagram
     participant Hook as OnRegisterSession
     participant VMCPSess as VMCPSession
 
-    Client->>DiscoveryMW: POST /mcp/initialize
+    Client->>DiscoveryMW: POST /mcp<br/>(method: initialize)
     Note over DiscoveryMW: Capabilities discovered<br/>BEFORE session exists
     DiscoveryMW->>DiscoveryMW: Discover capabilities
     DiscoveryMW->>DiscoveryMW: Stuff into request context
@@ -162,7 +181,51 @@ This RFC proposes restructuring around three core components:
 2. **SessionFactory**: Creates fully-formed sessions with all dependencies (capability discovery, client initialization, resource allocation)
 3. **SessionManager**: Bridges domain logic (Session/SessionFactory) to MCP SDK protocol, using the existing `transportsession.Manager` for storage
 
-**Proposed session creation flow** (two-phase pattern due to SDK constraints):
+#### Multi-Client Session Model
+
+**One vMCP instance serves multiple clients**, each with their own isolated session:
+
+```
+┌─────────────┐
+│ Client A    │──┐
+│ (Claude)    │  │
+└─────────────┘  │     ┌────────────────────────────┐
+                 │     │  vMCP Server               │
+┌─────────────┐  ├────→│  Endpoint: /mcp            │
+│ Client B    │──┤     │  (Streamable HTTP)         │
+│ (VSCode)    │  │     └────────────────────────────┘
+└─────────────┘  │              │
+                 │              ├─ Session aaa-111 (Client A's session)
+┌─────────────┐  │              ├─ Session bbb-222 (Client B's session)
+│ Client C    │──┘              └─ Session ccc-333 (Client C's session)
+│ (Cursor)    │
+└─────────────┘
+```
+
+**How sessions are created per the MCP Streamable HTTP protocol:**
+
+- vMCP exposes **one HTTP endpoint** (e.g., `POST /mcp`) per [MCP Streamable HTTP spec](https://spec.modelcontextprotocol.io/specification/2025-06-18/basic/transports/)
+- **All JSON-RPC methods** (`initialize`, `tools/call`, `resources/read`, etc.) go to the **same endpoint**
+  - Method specified in JSON-RPC body, not URL path
+  - Example: `POST /mcp` with body `{"jsonrpc": "2.0", "method": "initialize", ...}`
+- **Each client** that sends an `InitializeRequest` triggers creation of a **new unique session**
+- The server returns a unique session ID via the `Mcp-Session-Id` header
+- Clients include their session ID in the `Mcp-Session-Id` header on all subsequent requests
+- **Sessions are created dynamically when clients connect**, not pre-created at vMCP startup
+- Each session owns its own backend clients (no sharing between sessions)
+
+**vMCP session vs backend sessions** (see [Terminology](#terminology) for definitions):
+
+Clients interact with a **single vMCP session ID** (e.g., `aaa-111`), but vMCP internally manages **multiple backend session IDs**—one per backend MCP server. vMCP maintains an explicit `[vMCP_session_id] -> {backend_id: backend_session_id}` mapping for observability (logging, metrics, health checks, debugging).
+
+**Key behaviors**:
+- Client objects include backend session IDs in request headers (MCP protocol requirement)
+- vMCP tracks backend session IDs separately (production observability requirement)
+- Each vMCP session owns isolated backend clients and session mappings
+
+For detailed lifecycle management (initialization, runtime, re-initialization, cleanup), see [Backend Session ID Lifecycle Management](#3-session-implementation).
+
+**Proposed session creation flow (per client, two-phase pattern due to SDK constraints):**
 
 ```mermaid
 sequenceDiagram
@@ -173,19 +236,22 @@ sequenceDiagram
     participant Aggregator
     participant Session
 
-    Client->>SDK: POST /mcp/initialize
+    Note over Client,Session: Session Creation (happens for EACH client that connects)
+
+    Client->>SDK: POST /mcp<br/>(method: initialize)
     Note over SDK: SDK handles initialize,<br/>needs session ID
     SDK->>SessionMgr: Generate() // No context!
-    Note over SessionMgr: Phase 1: Create empty<br/>session placeholder
+    Note over SessionMgr: Phase 1: Create NEW unique<br/>session ID and placeholder
     SessionMgr->>SessionMgr: Store empty session by ID
-    SessionMgr-->>SDK: sessionID
+    SessionMgr-->>SDK: sessionID (unique per client)
     SDK->>SessionMgr: OnRegisterSession(sessionID, ctx)
     Note over SessionMgr: Phase 2: Now we have context!<br/>Populate the session
     SessionMgr->>Factory: MakeSession(ctx, identity, backends)
     Factory->>Factory: Create clients for each backend
+    Note over Factory: Each client sends Initialize to<br/>its backend, receives backend's<br/>session ID (stored by client)<br/>Factory captures session IDs<br/>via client.SessionID()
     Factory->>Aggregator: AggregateCapabilities(ctx, clients)
     Aggregator-->>Factory: Capabilities (tools, resources, routing)
-    Factory->>Session: new Session(capabilities, clients)
+    Factory->>Session: new Session(capabilities, clients, backendSessionIDs)
     Session-->>Factory: session
     Factory-->>SessionMgr: session
     SessionMgr->>SessionMgr: Replace placeholder with real session
@@ -193,17 +259,221 @@ sequenceDiagram
     Session-->>SessionMgr: capabilities
     SessionMgr->>SDK: AddSessionTools(sessionID, tools)
     SDK-->>Client: InitializeResult with Mcp-Session-Id header
+
+    Note over Client,Session: Client stores session ID, uses in all subsequent requests
 ```
 
-**Key Flow (two-phase creation):**
-1. SDK receives initialize request, needs session ID
-2. **Phase 1**: SDK calls `Generate()` (no context) → SessionManager creates empty session placeholder, stores it, returns session ID
-3. **Phase 2**: SDK calls `OnRegisterSession(sessionID, ctx)` (has context) → SessionManager calls `SessionFactory.MakeSession()` to create fully-formed session (capability discovery, client initialization)
-4. SessionManager replaces empty placeholder with fully-formed session
-5. SDK registers session's tools/resources via `AddSessionTools()`
-6. Client receives InitializeResult with session ID header
+**Key Flow (two-phase creation per client):**
+
+This flow executes **independently for each client** that connects to vMCP:
+
+1. **Client sends Initialize**: Client (e.g., Claude Desktop, VSCode) sends `POST /mcp` with JSON-RPC method `initialize` to vMCP endpoint
+2. **Phase 1 - Generate unique session ID**: SDK calls `Generate()` (no context) → SessionManager creates a **new unique session ID** (e.g., UUID), stores empty placeholder, returns ID
+3. **Phase 2 - Build full session**: SDK calls `OnRegisterSession(sessionID, ctx)` (has context) → SessionManager calls `SessionFactory.MakeSession()` to create fully-formed session with:
+   - Backend client initialization (one client per backend, each performs MCP `initialize` handshake with its backend; backends respond with their own session IDs which are stored by the client)
+   - Capability discovery (tools, resources, prompts) using the initialized clients
+   - Routing table construction
+4. **Replace placeholder**: SessionManager replaces empty placeholder with fully-formed session
+5. **Register capabilities**: SDK registers session's tools/resources via `AddSessionTools()`
+6. **Return session ID to client**: Client receives `InitializeResult` with `Mcp-Session-Id: <unique-id>` header
+
+**Critical point**: When Client A and Client B both send Initialize requests:
+- Client A triggers `Generate()` → gets session ID `aaa-111` → gets Session A with its own backend clients
+- Client B triggers `Generate()` → gets session ID `bbb-222` → gets Session B with its own backend clients
+- Sessions are **completely isolated** - no shared state, no shared clients
 
 **Why two phases?** The SDK's `Generate()` has no context parameter (see "SDK Interface Constraint" section below), so we cannot create fully-formed sessions until `OnRegisterSession` hook provides request context.
+
+#### Multi-Client Isolation
+
+To illustrate how multiple clients get isolated sessions:
+
+```mermaid
+sequenceDiagram
+    participant CA as Client A<br/>(Claude)
+    participant CB as Client B<br/>(VSCode)
+    participant vMCP as vMCP Server<br/>(Single Endpoint)
+    participant SessionMgr as SessionManager
+    participant SA as Session A
+    participant SB as Session B
+
+    Note over CA,SB: Both clients connect to same vMCP endpoint
+
+    CA->>vMCP: POST /mcp<br/>(method: initialize)
+    vMCP->>SessionMgr: Generate()
+    SessionMgr->>SessionMgr: Create session ID "aaa-111"
+    SessionMgr->>SA: Create Session A with backend clients
+    SessionMgr-->>vMCP: sessionID "aaa-111"
+    vMCP-->>CA: Mcp-Session-Id: aaa-111
+
+    CB->>vMCP: POST /mcp<br/>(method: initialize)
+    vMCP->>SessionMgr: Generate()
+    SessionMgr->>SessionMgr: Create session ID "bbb-222"
+    SessionMgr->>SB: Create Session B with backend clients
+    SessionMgr-->>vMCP: sessionID "bbb-222"
+    vMCP-->>CB: Mcp-Session-Id: bbb-222
+
+    Note over CA,SB: Clients use their session IDs in subsequent requests
+
+    CA->>vMCP: POST /mcp<br/>(method: tools/call)<br/>Mcp-Session-Id: aaa-111
+    vMCP->>SessionMgr: Get session "aaa-111"
+    SessionMgr->>SA: CallTool(...)
+    SA-->>CA: Tool result
+
+    CB->>vMCP: POST /mcp<br/>(method: tools/call)<br/>Mcp-Session-Id: bbb-222
+    vMCP->>SessionMgr: Get session "bbb-222"
+    SessionMgr->>SB: CallTool(...)
+    SB-->>CB: Tool result
+
+    Note over CA,SB: Sessions are completely isolated
+```
+
+**Key points:**
+- **Single endpoint serves all clients**: All clients POST to the same `/mcp` endpoint
+- **Unique session per Initialize**: Each `InitializeRequest` creates a new session with unique ID
+- **Session isolation**: Session A and Session B have separate backend clients, routing tables, and state
+- **Session ID routing**: `Mcp-Session-Id` header routes requests to the correct session
+
+#### Session Routing Mechanism (How vMCP Associates Requests to Sessions)
+
+**Critical question**: With a single endpoint (`POST /mcp`) serving multiple clients, how does vMCP know which session each request belongs to?
+
+**Answer**: The `Mcp-Session-Id` HTTP header (per [MCP Streamable HTTP spec](https://spec.modelcontextprotocol.io/specification/2025-06-18/basic/transports/)).
+
+**Step-by-step flow:**
+
+1. **Initialize request (no session yet)**:
+   ```http
+   POST /mcp
+   Content-Type: application/json
+   # NO Mcp-Session-Id header
+
+   {"jsonrpc": "2.0", "method": "initialize", ...}
+   ```
+
+   vMCP logic:
+   ```go
+   // Request has NO Mcp-Session-Id header → This is initialization
+   sessionID := sessionManager.Generate()  // Create new session "aaa-111"
+
+   // Return session ID to client
+   w.Header().Set("Mcp-Session-Id", sessionID)  // "aaa-111"
+   w.Write(initializeResult)
+   ```
+
+2. **Client receives and stores session ID**:
+   ```http
+   HTTP/1.1 200 OK
+   Mcp-Session-Id: aaa-111   # ← Client stores this
+   Content-Type: application/json
+
+   {"result": {...}}
+   ```
+
+3. **Subsequent request (with session ID)**:
+   ```http
+   POST /mcp
+   Mcp-Session-Id: aaa-111   # ← Client includes stored ID
+   Content-Type: application/json
+
+   {"jsonrpc": "2.0", "method": "tools/call", "params": {...}}
+   ```
+
+   vMCP logic:
+   ```go
+   // Request HAS Mcp-Session-Id header → Look up existing session
+   sessionID := r.Header.Get("Mcp-Session-Id")  // "aaa-111"
+
+   session := sessionStorage.Get(sessionID)  // Retrieve Session A
+   if session == nil {
+       return Error("session not found or expired")
+   }
+
+   // Route to session's backend
+   result := session.CallTool(ctx, toolName, args)
+   w.Write(result)
+   ```
+
+**How vMCP determines request type:**
+
+| Scenario | `Mcp-Session-Id` Header | vMCP Action |
+|----------|------------------------|-------------|
+| **First Initialize** | ❌ Not present | `Generate()` → Create new session → Return new ID |
+| **Subsequent call** | ✅ Present (e.g., `aaa-111`) | `Get(sessionID)` → Retrieve session → Route request |
+| **Invalid session ID** | ✅ Present but expired/invalid | Return `404 Session Not Found` |
+| **Re-initialize after expire** | ❌ Not present (client deleted ID) | `Generate()` → Create new session |
+
+**Session storage and lookup:**
+
+```go
+type SessionManager struct {
+    sessionStorage *transportsession.Manager  // Maps sessionID → Session
+}
+
+func (sm *SessionManager) HandleRequest(r *http.Request, w http.ResponseWriter) {
+    // Parse JSON-RPC request
+    var req struct {
+        JSONRPC string      `json:"jsonrpc"`
+        Method  string      `json:"method"`
+        Params  interface{} `json:"params"`
+        ID      interface{} `json:"id"`
+    }
+    json.NewDecoder(r.Body).Decode(&req)
+
+    sessionID := r.Header.Get("Mcp-Session-Id")
+
+    if sessionID == "" {
+        // No session ID → Must be Initialize request
+        if req.Method != "initialize" {
+            http.Error(w, "Session required", 400)
+            return
+        }
+        newSessionID := sm.Generate()
+        // ... handle initialization ...
+        w.Header().Set("Mcp-Session-Id", newSessionID)
+        return
+    }
+
+    // Session ID present → Look up existing session
+    session := sm.sessionStorage.Get(sessionID)
+    if session == nil {
+        http.Error(w, "Session not found or expired", 404)
+        return
+    }
+
+    // Route request to session based on JSON-RPC method
+    switch req.Method {
+    case "tools/call":
+        result := session.CallTool(req.Params)
+    case "resources/read":
+        result := session.ReadResource(req.Params)
+    case "prompts/get":
+        result := session.GetPrompt(req.Params)
+    default:
+        http.Error(w, "Unknown method", 400)
+    }
+}
+```
+
+**Parallel clients (completely independent):**
+
+```
+Time T0: Both clients send Initialize (no session headers)
+  Client A → POST /mcp (no header) → Generate() → Session "aaa-111"
+  Client B → POST /mcp (no header) → Generate() → Session "bbb-222"
+
+Time T1: Both clients make tool calls (with their session headers)
+  Client A → POST /mcp (Mcp-Session-Id: aaa-111) → Get("aaa-111") → Session A
+  Client B → POST /mcp (Mcp-Session-Id: bbb-222) → Get("bbb-222") → Session B
+```
+
+**Sessions never collide** because:
+- ✅ Session IDs are UUIDs (globally unique)
+- ✅ Each Generate() call creates NEW unique ID
+- ✅ Clients explicitly include their session ID in header
+- ✅ vMCP maps requests to sessions via header lookup
+
+**This is standard MCP Streamable HTTP protocol behavior** - vMCP doesn't invent this mechanism, it follows the spec.
 
 ### Terminology Clarification
 
@@ -233,6 +503,9 @@ type Session interface {
     Tools() []Tool
     Resources() []Resource
     Prompts() []Prompt
+
+    // Backend session tracking - for observability and debugging
+    BackendSessions() map[string]string  // Returns map of backendID -> backendSessionID
 
     // MCP operations - routing logic is encapsulated here
     CallTool(ctx context.Context, name string, arguments map[string]any) (*ToolResult, error)
@@ -282,6 +555,9 @@ type Session interface {
     Resources() []Resource
     Prompts() []Prompt
 
+    // Backend session tracking - for observability and debugging
+    BackendSessions() map[string]string  // Returns map of backendID -> backendSessionID
+
     // MCP operations - routing logic is encapsulated here
     CallTool(ctx context.Context, name string, arguments map[string]any) (*ToolResult, error)
     ReadResource(ctx context.Context, uri string) (*ResourceResult, error)
@@ -296,7 +572,7 @@ type Session interface {
 - **Owns backend clients**: Session stores pre-initialized MCP clients in an internal map
 - **Encapsulates routing**: `CallTool()` looks up tool in routing table, routes to correct backend client
 - **Manageable lifetime**: `Close()` cleans up clients and any other resources. The SessionManager/caller is decoupled from what exactly happens on close()
-- **Thread-safe**: All methods protected by internal RWMutex for concurrent access to prevent data races on internal state. Read operations (Tools, Resources, Prompts, CallTool, ReadResource, GetPrompt) use read locks; write operations (Close) use write locks. Methods like `Tools()`, `Resources()`, `Prompts()` return defensive copies (not references to internal slices) to prevent caller mutations. Internal maps and slices are never exposed directly. Note: The RWMutex prevents data races but does not prevent `CallTool()` from using a closed client after `Close()` completes—the session implementation must track closed state explicitly (see "Client Closed Mid-Request" in Error Handling). Proper encapsulation may allow removal of mutexes elsewhere (e.g., SessionManager, current VMCPSession) since state is now owned by the Session
+- **Thread-safe**: Internal RWMutex protects access to internal data structures (routing table, client map, closed flag) but is NOT held across network I/O—locks are acquired only while reading/mutating state, then released before invoking client methods. Methods like `Tools()`, `Resources()`, `Prompts()` return defensive copies to prevent caller mutations. Internal maps and slices are never exposed directly. **Coordination with Close()**: Since locks are released before network I/O, the session uses **context cancellation** (not locks) to coordinate—operations check `ctx.Done()` before using clients, and `Close()` cancels the context. This prevents holding locks during long network operations while providing safe cleanup (see "Client Closed Mid-Request" in Error Handling for details). Proper encapsulation may allow removal of mutexes elsewhere (e.g., SessionManager, current VMCPSession) since state is now owned by the Session
 
 **Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). This RFC builds on the existing pluggable session storage architecture ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)) which provides `Storage` interface and `Manager` for Redis/Valkey support.
 
@@ -335,13 +611,15 @@ type SessionFactory interface {
 
 The default factory implementation follows this pattern:
 
-1. **Create MCP clients**: Initialize clients for each backend **in parallel**
+1. **Create MCP clients and capture backend session IDs**: Initialize clients for each backend **in parallel**
    - Factory creates one client per backend using existing client factory
+   - **Client initialization includes MCP handshake**: Each client sends `InitializeRequest` to its backend, and the backend responds with capabilities and its own `Mcp-Session-Id`. The client stores the session ID for protocol compliance (includes it in subsequent request headers).
+   - **Capture backend session IDs**: Factory also captures each backend's session ID (via `client.SessionID()`) for observability, storing them in a map to pass to the session
    - **Performance requirement**: Use parallel initialization (e.g., `errgroup` with bounded concurrency) to avoid sequential latency accumulation. Connection initialization (TCP handshake + TLS negotiation + MCP protocol handshake) can take tens to hundreds of milliseconds per backend depending on network latency and backend responsiveness. With 20 backends, sequential initialization could easily exceed acceptable session creation latency.
    - **Bounded concurrency**: Limit parallel goroutines (e.g., 10 concurrent initializations) to avoid resource exhaustion
    - **Per-backend timeout**: Apply context timeout (e.g., 5s per backend) so one slow backend doesn't block session creation
    - **Partial initialization**: If some backends fail, log warnings and continue with successfully initialized backends (failed backends not added to clients map)
-   - Clients are connection-ready but not yet used
+   - Clients are connection-ready and stateful (each maintains its backend session for protocol use)
 
 2. **Capability discovery**: Pass clients to `aggregator.AggregateCapabilities(ctx, clients)`
    - Aggregator uses provided clients to query capabilities (tools, resources, prompts) from each backend
@@ -355,8 +633,53 @@ The default factory implementation follows this pattern:
    - Routing table (maps tool names to backend workload IDs)
    - Tools, resources, prompts (aggregated from backends)
    - Pre-initialized clients map (keyed by workload ID) - same clients used for discovery
+   - Backend session IDs map (keyed by workload ID) - captured from `client.SessionID()` calls
 
-**Key Design Decision**: Clients are created once by the factory and threaded through: factory → aggregator (for discovery) → session (for reuse). This avoids redundant connection setup while maintaining clean separation of concerns (factory owns client creation, aggregator only queries capabilities).
+**Key Design Decision**: Clients are created once and threaded through: factory → aggregator → session. This eliminates redundant connection setup (TCP handshake + TLS + MCP initialization) while maintaining separation of concerns.
+
+**Example: Factory capturing backend session IDs**:
+
+```go
+func (f *defaultSessionFactory) MakeSession(ctx context.Context, identity *auth.Identity, backends []Backend) (Session, error) {
+    clients := make(map[string]*Client)
+    backendSessions := make(map[string]string)  // NEW: Track backend session IDs
+
+    // Create clients in parallel (simplified for brevity)
+    for _, backend := range backends {
+        client, err := f.clientFactory.CreateClient(ctx, backend, identity)
+        if err != nil {
+            log.Warn("Failed to initialize backend %s: %v", backend.ID, err)
+            continue
+        }
+
+        clients[backend.ID] = client
+
+        // Capture backend session ID for observability
+        if sessionID := client.SessionID(); sessionID != "" {
+            backendSessions[backend.ID] = sessionID
+            log.Debug("Backend %s initialized with session %s", backend.ID, sessionID)
+        }
+    }
+
+    // Aggregate capabilities using the clients
+    capabilities, err := f.aggregator.AggregateCapabilities(ctx, clients)
+    if err != nil {
+        return nil, fmt.Errorf("capability aggregation failed: %w", err)
+    }
+
+    // Create session with clients AND backend session IDs
+    return &defaultSession{
+        vmcpSessionID:   uuid.New().String(),
+        identity:        identity,
+        clients:         clients,
+        backendSessions: backendSessions,  // Pass the captured session IDs
+        routingTable:    capabilities.RoutingTable,
+        tools:           capabilities.Tools,
+        resources:       capabilities.Resources,
+        prompts:         capabilities.Prompts,
+    }, nil
+}
+```
 
 **Updated Aggregator Interface**:
 
@@ -366,20 +689,57 @@ The aggregator interface takes clients as input instead of creating them interna
 AggregateCapabilities(ctx context.Context, clients map[string]*Client) (*AggregationResult, error)
 ```
 
-**Rationale**: Separates client lifecycle (factory's concern) from capability discovery (aggregator's concern). The factory creates clients once, passes them to aggregator for discovery, then passes same clients to session for reuse.
-
-**Performance impact**: Reusing discovery clients eliminates redundant connection setup (TCP handshake + TLS negotiation + MCP initialization), avoiding connection overhead on every request (this overhead varies significantly based on network latency, TLS configuration, and backend responsiveness).
+**Rationale**: Separates client lifecycle (factory's concern) from capability discovery (aggregator's concern).
 
 #### 3. Session Implementation
 
 **Internal structure** (`pkg/vmcp/session/default_session.go`):
 
 The default session implementation stores:
-- Session ID and user identity
+- **vMCP session ID** and user identity (this is the session ID clients use)
 - Routing table mapping tool/resource names to backend workload IDs
 - Discovered capabilities (tools, resources, prompts)
 - Pre-initialized backend clients map (keyed by workload ID)
+- **Backend session IDs map** (keyed by workload ID) - explicit `[vMCP_session_id] -> [backend_session_ids]` mapping
+  - Stored separately from client objects for observability and lifecycle management
+  - Captured during client initialization when backends return `Mcp-Session-Id` headers
+  - Used for: logging, metrics, health checks, debugging, and explicit session cleanup
+  - Updated when clients are re-initialized (e.g., after backend session expiration)
 - RWMutex for thread-safe access (read lock for queries/calls, write lock for Close)
+
+**Backend session ID lifecycle management:**
+
+The session maintains an explicit mapping of `[vMCP_session_id] -> {backend_id: backend_session_id}` throughout its lifetime:
+
+1. **Initialization** (`SessionFactory.MakeSession()`):
+   - Factory creates clients for each backend (which send `InitializeRequest`)
+   - Backends respond with `Mcp-Session-Id` headers
+   - Factory captures session IDs and passes them to session constructor
+   - Session stores the mapping: `backendSessions[backendID] = sessionID`
+
+2. **Runtime operations** (`CallTool`, `ReadResource`):
+   - Client objects include backend session IDs in request headers (handled by MCP client library)
+   - vMCP uses stored session IDs for logging, metrics, and observability
+   - Example log: `"Calling tool 'create_pr' on backend 'github' (backend_session: abc-123)"`
+
+3. **Re-initialization** (when backend session expires):
+   - Detect expiration via 404/"session expired" error
+   - Create new client (sends new `InitializeRequest`)
+   - Backend responds with new `Mcp-Session-Id`
+   - Update mapping: `backendSessions[backendID] = newSessionID`
+   - Log: `"Backend 'github' session re-initialized: old=abc-123, new=def-456"`
+
+4. **Cleanup** (`Close()`):
+   - Iterate through all clients and call `Close()`
+   - Closing clients implicitly terminates backend sessions (connection close)
+   - Clear backend session mapping: `backendSessions = nil`
+   - Log: `"Closed vMCP session xyz-789 with N backend sessions"`
+
+5. **Observability uses**:
+   - Health endpoints: `GET /health` returns active backend sessions per vMCP session
+   - Metrics: Track backend session churn rate, re-initialization frequency
+   - Debugging: Associate tool call errors with specific backend sessions
+   - Audit logs: Record which backend sessions were used for compliance
 
 **Method behaviors:**
 
@@ -391,11 +751,11 @@ The default session implementation stores:
 
 **Thread safety**: Read operations (CallTool, ReadResource) use read locks; Close uses write lock.
 
-**Health monitoring integration**: Sessions interact with the existing global health monitor (`pkg/vmcp/health`) to handle backend failures:
-- **Session creation**: `SessionFactory.MakeSession()` consults health monitor to exclude unhealthy/circuit-broken backends (don't create clients for known-bad backends)
-- **Mid-session failures**: When `CallTool()` fails (connection error, timeout), mark backend unhealthy in session-local state and delegate error reporting to global health monitor
-- **Recovery**: On subsequent calls to unhealthy backend, check global health monitor; if recovered, lazily recreate client
-- **Design approach**: Global health monitor maintains shared circuit breaker state across sessions. Individual sessions track local backend health (unhealthy flag) to avoid redundant connection attempts while allowing recovery when backends come back online. Implementation details deferred to Phase 1-2.
+**Session lifecycle**: Sessions own backend clients for their lifetime:
+- **Session creation**: `SessionFactory.MakeSession()` creates backend clients during initialization
+- **Mid-session failures**: If backend client call fails, error is returned to the caller. Session remains active.
+- **Session continuity**: Session remains active even if individual backend calls fail. Other backends continue operating normally.
+- **No automatic recovery**: Sessions do not attempt to recreate failed clients. Client must handle errors (retry, use different tool, or reinitialize session).
 
 #### 4. Storage Integration and Distributed Deployment
 
@@ -412,8 +772,8 @@ Sessions are split into two layers with different lifecycles:
 
 | Layer | Contents | Storage | Lifetime |
 |-------|----------|---------|----------|
-| **Metadata** | Session ID, timestamps, identity reference, backend IDs list | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
-| **Runtime** | MCP client objects, routing table, capabilities, closed flag | In-process memory only | Lives only while vMCP instance is running |
+| **Metadata** | vMCP session ID, timestamps, identity reference, backend IDs list | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
+| **Runtime** | MCP client objects, backend session IDs map (`backendID -> sessionID`), routing table, capabilities, closed flag | In-process memory only | Lives only while vMCP instance is running |
 
 **How it works**:
 - The behavior-oriented `Session` embeds `transportsession.Session` (metadata layer) and owns MCP clients (runtime layer)
@@ -433,7 +793,7 @@ Without sticky sessions (graceful degradation):
 - Subsequent requests to same instance reuse recreated clients
 - Trade-off: horizontal scaling flexibility vs temporary performance impact on instance switch
 
-**Implementation detail**: See Phase 1 in Implementation Plan for how `vmcpSession` struct composes `transportsession.Session` (metadata) with runtime state (clients map, routing table).
+**Implementation detail**: See Phase 1 in Implementation Plan for how `defaultSession` struct composes `transportsession.Session` (metadata) with runtime state (clients map, routing table).
 
 #### 5. Wiring into the MCP SDK
 
@@ -551,7 +911,13 @@ With the two-phase creation pattern:
      - Client can query session but sees empty tool list
      - Client may delete session and re-initialize, or backend recovery may populate capabilities later
 
-**Rationale**: The two-phase creation pattern (empty session + populate via hook) is necessary because the SDK's `Generate()` must return a session ID. Additionally, the SDK's `OnRegisterSession` hook does not allow returning an error, so failures during `MakeSession()` cannot be propagated directly. Instead of storing initialization errors that require checks in every method (`InitError()` pattern is error-prone - easy to forget checks when adding new methods), we create sessions with empty capabilities. Failed backends don't advertise tools/resources, so clients never try to call them. This is simpler and safer than requiring defensive `InitError()` checks throughout the codebase.
+**Rationale**: The two-phase creation pattern (empty session + populate via hook) is necessary because the SDK's `Generate()` must return a session ID. Additionally, the SDK's `OnRegisterSession` hook does not allow returning an error, so failures during `MakeSession()` cannot be propagated directly. Instead of storing initialization errors that require checks in every method (`InitError()` pattern is error-prone - easy to forget checks when adding new methods), we create sessions with empty capabilities. Failed backends don't advertise tools/resources, so clients never try to call them.
+
+**Error messages for empty-capability sessions**: If a client attempts to call a tool on a session with empty capabilities (due to complete initialization failure), the session returns a clear error:
+- **NOT**: "Tool not found" (misleading - implies tool doesn't exist in general)
+- **INSTEAD**: "Session has no available tools - backend initialization failed during session creation" (accurate - indicates setup failure)
+
+This is simpler and safer than requiring defensive `InitError()` checks throughout the codebase.
 
 **Partial Backend Initialization**:
 
@@ -568,8 +934,77 @@ If some backends fail during `MakeSession()`:
 If a tool call fails after successful session creation:
 - Return error to client (existing behavior)
 - Client remains usable for subsequent requests
-- No automatic client re-initialization (clients live for session lifetime)
 - Health monitoring tracks backend health (existing behavior)
+- See "Mid-Session Backend Failures" below for recovery strategies
+
+**Mid-Session Backend Failures**:
+
+⚠️ **Critical scenario**: A session successfully initialized with 5 backend clients, but during the session lifetime, one backend crashes, times out, or terminates its connection while the other 4 backends remain healthy.
+
+**Example**:
+```
+Session ABC-123 (30 minutes old):
+  ✅ Backend 1 (filesystem) - HEALTHY
+  ❌ Backend 2 (database)   - CRASHED (connection lost)
+  ✅ Backend 3 (browser)    - HEALTHY
+  ✅ Backend 4 (slack)      - HEALTHY
+  ✅ Backend 5 (github)     - HEALTHY
+
+Client calls tool on Backend 2 → Connection error
+```
+
+**Question**: Should the entire session be terminated, or can it continue with the remaining healthy backends?
+
+**Proposed Strategy: Simple Error Propagation**
+
+The session **continues operating** with remaining backends. If a backend client fails, the error is returned to the client.
+
+**Implementation approach**:
+
+```go
+func (s *Session) CallTool(ctx context.Context, name string, arguments map[string]any) (*ToolResult, error) {
+    backend := s.routingTable.Lookup(name)
+    client := s.clients[backend.ID]
+
+    // Call backend client - if it fails, return the error
+    result, err := client.CallTool(ctx, name, arguments)
+    if err != nil {
+        return nil, fmt.Errorf("backend %s call failed: %w", backend.ID, err)
+    }
+
+    return result, nil
+}
+```
+
+**Behavior summary**:
+
+| Failure Type | Session Behavior | Client Action |
+|--------------|------------------|---------------|
+| **Single backend crashes** | Session continues with other backends | Returns error for that backend, client can retry or use other tools |
+| **Multiple backends fail** | Session continues with remaining healthy backends | Returns errors for failed backends |
+| **All backends fail** | Session remains active but all tool calls fail | Client should delete session and reinitialize |
+| **Backend times out** | Return timeout error, mark backend unhealthy | Client can retry or switch to different tool |
+| **Backend terminates (graceful)** | Detect via connection close, mark unavailable | Client receives error, can retry later |
+| **Backend terminates (crash)** | Detect on next call (connection error) | Client receives error indicating backend unavailable |
+
+**Benefits of this approach**:
+1. ✅ **Session resilience** - One backend failure doesn't kill entire session
+2. ✅ **Simplicity** - No automatic retry/recovery logic complexity
+3. ✅ **Stateful workflows preserved** - Healthy backends (e.g., browser session) remain unaffected
+4. ✅ **Clear error messages** - Client knows exactly which backend failed
+
+**Client experience**:
+- **Call to failed backend**: Returns clear error "backend X unavailable: connection lost"
+- **Retry behavior**: Client decides whether to retry, switch tools, or reinitialize
+- **Other backends**: Continue working normally, unaffected by single backend failure
+
+**Alternative considered: Fail entire session**
+- ❌ Requires client to reinitialize (loses all state)
+- ❌ Kills healthy backend connections (e.g., browser session with open tabs)
+- ❌ No automatic recovery (client must manually retry)
+- ❌ Poor user experience (disrupts workflow)
+
+**Implementation timing**: Implementation Plan Phase 1 (error propagation only - no recovery logic).
 
 **Client Closed Mid-Request**:
 
@@ -579,23 +1014,157 @@ Race condition exists: session may be terminated while a request is in flight:
 - **Timing issue**: Thread A checks `closed == false` → releases read lock → Thread B calls `Close()` (acquires write lock, closes clients, sets `closed = true`) → Thread A invokes client method on closed client
 - In-flight requests receive "client closed" error from MCP library when this race occurs
 
-**Required mitigation (Phase 1 implementation)**:
-- **Reference counting**: Session tracks in-flight operation count with atomic operations:
-  - `CallTool()`, `ReadResource()`, `GetPrompt()` atomically increment counter before using client, decrement after completion
-  - `Close()` sets `closed` flag, waits for counter to reach zero (with timeout, e.g., 30s), then closes clients
-  - Operations check `closed` flag with atomic load; if true, return "session closed" error without incrementing counter
-  - This eliminates the race window by ensuring `Close()` waits for all in-flight operations
-- **Graceful degradation**: If `Close()` timeout expires with operations still in-flight, log warning and close clients anyway (in-flight operations get "client closed" errors)
-- **Alternative approach**: Use context cancellation—`Close()` cancels session context, operations detect cancellation and abort before using clients
+**Mitigation strategy**:
 
-**Additional mitigation**:
-- Session storage layer extends TTL on every request (via existing `Get()` call which touches session), reducing likelihood of expiration during active use
+- **Context cancellation**: Session has a context that's cancelled on `Close()`
+  - `CallTool()` checks `ctx.Done()` before using client
+  - If cancelled, return "session closed" error without touching client
+  - Acceptable race window: client might get "connection closed" error in rare cases
+- **Graceful error handling**: MCP client library handles `Close()` on active connections gracefully (returns errors)
+- **TTL extension**: Session storage extends TTL on every request (via existing `Get()` call which touches session), reducing likelihood of expiration during active use
 
-**Session Not Found**:
+**Backend MCP Server Session Expiration**:
 
-If client uses expired/invalid session ID:
+⚠️ **Critical scenario**: Backend MCP servers have their **own session management** independent of vMCP. The backend might expire its session while vMCP's session is still active.
+
+**Example**:
+```
+vMCP Session ABC-123 (created 30 minutes ago, TTL: 60 min) ✅
+  ├─ vMCP Backend Client 1 → Backend MCP Server 1
+  │    vMCP side: Connection alive, client reused ✅
+  │    Backend side: Session expired (10 min TTL) ❌
+  │
+  │  Client calls tool → Backend returns:
+  │  HTTP 404 "session not found" or
+  │  JSON-RPC error "session expired"
+```
+
+**Root cause**: Backend MCP servers can:
+- Have shorter session TTLs than vMCP (e.g., backend: 10 min, vMCP: 30 min)
+- Restart and lose all session state
+- Terminate sessions due to inactivity
+- Use different session management strategies
+
+**Problem**: vMCP's client holds a reference to a **dead backend session**. The connection is alive, but the backend doesn't recognize the session ID.
+
+**Proposed Solution: Automatic Backend Session Re-initialization**
+
+When vMCP detects backend session expiration (404 or "session expired" error), automatically re-initialize with that backend:
+
+```go
+func (s *Session) CallTool(ctx context.Context, name string, arguments map[string]any) (*ToolResult, error) {
+    backend := s.routingTable.Lookup(name)
+    client := s.clients[backend.ID]
+
+    result, err := client.CallTool(ctx, name, arguments)
+
+    // Detect backend session expiration
+    if isSessionExpiredError(err) {  // 404 or "session not found"
+        log.Warn("Backend %s session expired, re-initializing", backend.ID)
+
+        // Re-initialize the backend session
+        if reinitErr := s.reinitializeBackend(ctx, backend.ID); reinitErr != nil {
+            return nil, fmt.Errorf("failed to reinitialize backend %s: %w",
+                backend.ID, reinitErr)
+        }
+
+        // Retry the operation with re-initialized session
+        client = s.clients[backend.ID]  // Get updated client
+        return client.CallTool(ctx, name, args)
+    }
+
+    return result, err
+}
+
+func (s *Session) reinitializeBackend(ctx context.Context, backendID string) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    backend := s.getBackendConfig(backendID)
+
+    // Close old client (with expired backend session)
+    if oldClient := s.clients[backendID]; oldClient != nil {
+        oldClient.Close()
+    }
+
+    // Create NEW client (triggers new Initialize handshake with backend)
+    // This sends InitializeRequest to backend MCP server
+    newClient, err := s.clientFactory.CreateClient(ctx, backend, s.identity)
+    if err != nil {
+        return fmt.Errorf("client creation failed: %w", err)
+    }
+
+    // Backend responds with new session ID (in Mcp-Session-Id header)
+    // The client stores it for subsequent requests (protocol requirement)
+
+    // Capture the new backend session ID for observability
+    newBackendSessionID := newClient.SessionID()  // Assuming client exposes this method
+
+    // Update session state
+    oldSessionID := s.backendSessions[backendID]
+    s.backendSessions[backendID] = newBackendSessionID
+    s.clients[backendID] = newClient
+
+    log.Info("Backend %s session re-initialized: old=%s, new=%s",
+        backendID, oldSessionID, newBackendSessionID)
+
+    log.Info("Backend %s re-initialized with new session", backendID)
+    return nil
+}
+```
+
+**Flow**: Detect expiration (404/"session expired") → Close old client → Create new client (new backend session) → Update mapping → Retry operation.
+
+**Trade-offs**:
+
+⚠️ **State loss on backend**: Re-initialization creates a **new backend session**, losing any stateful context:
+- **Playwright backends**: Browser tabs, cookies, auth state lost
+- **Database backends**: Open transactions, temporary tables lost
+- **File system backends**: Working directory, file handles lost
+
+**Mitigation strategies for stateful backends**:
+
+⚠️ **Problem**: Stateful backends (Playwright, databases) lose state on re-initialization. Most stateful resources (browser tabs, open transactions) cannot be serialized and restored.
+
+**Mitigations (best effort)**:
+
+1. **Optional keepalive** (prevents expiration):
+   - vMCP can periodically call low-cost operations on backends (e.g., `ping`, `listCapabilities`)
+   - Extends backend session TTL while vMCP session is active
+   - **Limitation**: Not all MCP servers support ping/low-cost operations
+   - **Approach**: Best effort - attempt keepalive, gracefully handle backends that don't support it
+   - **Configuration**: Enable per backend, configurable interval (default: 5 min)
+
+2. **Session TTL alignment**:
+   - Configure backend session TTLs longer than vMCP session TTL
+   - Reduces likelihood of backend expiration during active vMCP session
+
+3. **Graceful state loss**:
+   - When backend session expires, vMCP re-initializes automatically
+   - Return warning in tool result metadata: `backend_reinitialized: true`
+   - Client can decide whether to continue or restart workflow
+
+**Fundamental limitations**:
+- Some state cannot be preserved (browser DOM, active transactions)
+- Keepalive depends on backend support (best effort)
+- Re-initialization is unavoidable on backend restart
+
+**Flow comparison**:
+
+| Scenario | vMCP Session | Backend Session | Behavior |
+|----------|--------------|-----------------|----------|
+| **Backend session expires** | ✅ Active | ❌ Expired | Automatic re-init, retry succeeds, backend state lost |
+| **Backend server crashes** | ✅ Active | ❌ Gone | Automatic reconnect, retry succeeds (if backend recovered) |
+| **vMCP session expires** | ❌ Expired | ✅ Active | Client must re-initialize vMCP session (top-level) |
+| **Both sessions active** | ✅ Active | ✅ Active | Normal operation, state preserved |
+
+**Implementation timing**: Phase 2 (automatic backend session re-initialization with state loss awareness).
+
+**Session Not Found (vMCP-level)**:
+
+If client uses expired/invalid vMCP session ID:
 - Return clear error: "session not found" or "session expired"
-- Client should re-initialize via `/mcp/initialize` endpoint to create new session
+- Client should re-initialize via `POST /mcp` with `initialize` method to create new vMCP session
 
 ## Security Considerations
 
@@ -662,7 +1231,7 @@ For initial implementation, we assume most backends use long-lived credentials (
 - **IP address validation**: Optionally validate client IP hasn't changed (breaks mobile clients, proxies - use with caution)
 - **Session rotation**: Periodically rotate session IDs (e.g., every 10 minutes) to limit stolen session lifetime
 
-**Implementation timing**: Token hash binding should be implemented during Implementation Plan Phase 2 (SessionManager implementation) before production rollout. Store `tokenHash` in session metadata, validate on each request via middleware.
+**Implementation timing**: Token hash binding is **required** for Implementation Plan Phase 2 (SessionManager implementation) - this is a **blocking requirement** before production rollout. Without this mitigation, session hijacking is possible. Implementation: Store `tokenHash` in session metadata, validate on each request via middleware.
 
 ### Data Protection
 
@@ -674,17 +1243,23 @@ For initial implementation, we assume most backends use long-lived credentials (
 
 **Client Usage During Cleanup**:
 - Race condition exists: request may use client while session is being closed
-- Mitigation: Session storage layer extends TTL on every request (via existing `Get()` call which touches session), reducing race window
-- MCP client library handles `Close()` on active connections gracefully (returns errors)
-- Handlers should catch and handle "client closed" errors appropriately
-- Future Enhancement: Add reference counting to delay `Close()` until all in-flight requests complete
+- **Mitigation**: Context cancellation + graceful error handling
+  - Session storage extends TTL on every request (reduces race window)
+  - Operations check context cancellation before using clients
+  - MCP client library handles `Close()` on active connections gracefully (returns errors)
+  - Handlers catch and handle "client closed" errors appropriately
+  - See "Error Handling → Client Closed Mid-Request" for detailed implementation
 
 **Resource Exhaustion & DoS Protection**:
 
 ⚠️ **Connection multiplication**: Session-scoped clients create N sessions × M backends = N×M backend connections. At scale (e.g., 500 sessions × 20 backends = 10,000 connections), this can lead to resource exhaustion or DoS.
 
 **Required mitigations**:
-1. **Max concurrent sessions limit**: Implement configurable limit on active sessions (e.g., `TOOLHIVE_MAX_SESSIONS=1000`). Return clear error when limit reached: "maximum concurrent sessions exceeded, try again later"
+1. **Max concurrent sessions limit**: Implement configurable limit on active sessions (e.g., `TOOLHIVE_MAX_SESSIONS=1000`).
+   - **Behavior when limit reached**: Immediately reject new `InitializeRequest` with HTTP 503 Service Unavailable
+   - **Error response**: `{"error": {"code": -32000, "message": "Maximum concurrent sessions (1000) exceeded. Please try again later or contact administrator."}}`
+   - **Client experience**: Client should retry with exponential backoff or notify user
+   - **No queueing**: Requests are rejected immediately (not queued) to prevent resource exhaustion
 2. **Per-client session limits**: Track sessions per client identity/IP, enforce per-client limits (e.g., 10 sessions per client) to prevent single client from exhausting resources
 3. **Aggressive session TTL**: Default 30-minute TTL with idle timeout (e.g., 5 minutes of inactivity) to reclaim unused sessions faster
 4. **Connection pooling consideration**: Future enhancement to share connections across sessions for same backend+identity combination (out of scope for this RFC but noted for future work)
@@ -804,6 +1379,34 @@ With the Session interface, you can unit test session routing logic without spin
 
 **After this RFC**: Session is a testable domain object. Instantiate it directly with mocked dependencies (clients, routing table), test the routing and client delegation logic in isolation.
 
+## Alternatives Considered
+
+### Alternative: Rely on Backend MCP Server Session Management
+
+**Approach**: Instead of vMCP managing session-scoped clients, rely entirely on backend MCP servers to manage their own stateful sessions via the [MCP Streamable HTTP transport session management](https://spec.modelcontextprotocol.io/specification/2025-06-18/basic/transports/).
+
+**How it would work**:
+- Each backend MCP server returns `Mcp-Session-Id` header during initialization
+- Backend manages its own session state (browser tabs, transactions, etc.)
+- vMCP passes through session IDs without managing backend client lifecycle
+- Backend responsible for session persistence and resumption
+
+**Why not chosen**:
+
+1. **Inconsistent backend support**: Not all MCP servers implement stateful sessions or session persistence. The MCP protocol makes sessions optional, and many backends are stateless (REST APIs, simple tools).
+
+2. **Protocol moving toward stateless-by-default**: The MCP community is actively working on [making the protocol stateless by default](https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1442) to improve scalability and resilience. Relying on backend statefulness goes against this direction.
+
+3. **vMCP-specific aggregation needs**: vMCP aggregates multiple backends with capability discovery, conflict resolution, and routing logic that requires vMCP-level session management. Backend sessions don't help with vMCP's aggregation layer.
+
+4. **No guarantees for stateful backends**: Even backends that support sessions (like Playwright) may not persist state across restarts or provide resumption capabilities. vMCP would still need fallback mechanisms.
+
+5. **Complex coordination**: Managing per-backend session lifecycles (different TTLs, expiration strategies, restart behaviors) across multiple backends would be more complex than managing a single vMCP session with owned clients.
+
+6. **Scaling challenges**: Per [MCP scaling discussions](https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/102), stateful connections create bottlenecks for load balancing and enterprise deployments. vMCP sessions with sticky load balancing are more practical.
+
+**Conclusion**: Backend session management doesn't solve vMCP's core problems (per-request client creation, aggregation complexity). The proposed vMCP-level session architecture provides consistent behavior regardless of backend capabilities, with optional keepalive as best-effort mitigation for backends that do support stateful sessions.
+
 ## Implementation Plan
 
 This implementation introduces new interfaces and gradually migrates from the current architecture to the proposed design. Phases 1-2 are purely additive (ensuring low risk and easy rollback), while Phase 3 switches over and removes old code.
@@ -822,13 +1425,15 @@ This implementation introduces new interfaces and gradually migrates from the cu
 The `defaultSession` implementation:
 - **Embeds `transportsession.Session`** for metadata layer (ID, Type, Touch, GetData)
 - **Owns backend clients** in an internal map (runtime layer)
+- **Tracks backend session IDs** in a separate map for observability
 - **Implements both interfaces**: storage-oriented `transportsession.Session` + behavior-oriented vMCP `Session`
 
 When `SessionFactory.MakeSession()` runs:
 1. Create and initialize one MCP client per backend **in parallel** (with bounded concurrency, per-backend timeouts)
-2. Pass clients to aggregator to discover capabilities from all backends
-3. Create `transportsession.Session` for metadata layer (ID, timestamps)
-4. Return behavior-oriented session that embeds transport session + owns clients map (same clients used for discovery)
+2. Capture backend session IDs from clients (via `client.SessionID()`) for observability
+3. Pass clients to aggregator to discover capabilities from all backends
+4. Create `transportsession.Session` for metadata layer (ID, timestamps)
+5. Return behavior-oriented session that embeds transport session + owns clients map + backend session IDs map
 
 **Testing**:
 - Unit tests for `Session` interface methods (CallTool, ReadResource, Close)
@@ -875,7 +1480,7 @@ if config.SessionManagementV2 {
 - Integration tests with feature flag enabled: Create session via `SessionManager.Generate()`, verify session stored
 - Test tool handler routing: Call tool, verify session's `CallTool()` is invoked
 - Test session termination: Call `Terminate()`, verify session closed
-- Test SDK integration: Initialize session via HTTP `/mcp/initialize`, verify tools registered
+- Test SDK integration: Initialize session via `POST /mcp` (method: `initialize`), verify tools registered
 - Verify old code path still works when flag is disabled (no regressions)
 
 **Files Modified**:
@@ -926,7 +1531,13 @@ if config.SessionManagementV2 {
     "event": "session_created",
     "session_id": "sess-123",
     "backends_initialized": 3,
-    "backends_failed": 1
+    "backends_failed": 1,
+    "backend_sessions": {
+      "github": "backend-sess-abc",
+      "slack": "backend-sess-def",
+      "playwright": "backend-sess-ghi"
+    },
+    "failed_backends": ["database"]
   }
   ```
 - Add metrics:
@@ -964,13 +1575,15 @@ Each phase is independently testable and can be rolled back:
 ### Testing Strategy
 
 **Unit Tests** (each phase):
-- Session interface methods (CallTool, ReadResource, Close)
+- Session interface methods (CallTool, ReadResource, Close, BackendSessions)
 - SessionFactory capability discovery and client initialization
+- Backend session ID capture during client initialization
+- Backend session ID updates during re-initialization
 - SessionManager SDK integration (Generate, Terminate)
 - Error handling (partial initialization, client closed, session not found)
 
 **Integration Tests** (Phase 2+):
-- Session creation via HTTP `/mcp/initialize` endpoint
+- Session creation via `POST /mcp` with `initialize` method
 - Tool calls routed to correct backends via session
 - Session expiration triggers client closure
 - Multiple tool calls reuse same clients (no reconnection overhead)
@@ -980,6 +1593,24 @@ Each phase is independently testable and can be rolled back:
 - Backend state preservation across tool calls (Playwright browser context, database transaction)
 - High-throughput scenarios (verify no connection leaks, reduced latency)
 - Session lifecycle (create, use, expire, cleanup)
+
+**Future Enhancement: Multi-Client Conformance Test Suite** (Not implemented in this RFC):
+
+A comprehensive test suite to validate multi-client session behavior would be valuable, but this is better suited at the **MCP protocol level** rather than vMCP-specific implementation:
+
+- **Ideal approach**: Contribute to MCP specification with standardized multi-client conformance tests
+  - Test suite validates that servers correctly handle multiple concurrent clients
+  - Each client gets unique session ID via `Mcp-Session-Id` header
+  - Sessions are properly isolated (no cross-contamination)
+  - Session lifecycle (init, use, expire, cleanup) works correctly per client
+  - Would benefit the entire MCP ecosystem, not just vMCP
+
+- **vMCP reuse**: Once MCP protocol-level test suite exists, vMCP can:
+  - Run the conformance suite against vMCP implementation
+  - Extend with vMCP-specific scenarios (aggregation, routing, backend failures)
+  - Ensure vMCP behaves as a compliant MCP server
+
+- **Current approach**: Phase 3 E2E tests cover multi-client behavior sufficiently for initial implementation. Protocol-level test suite can be contributed later as ecosystem matures.
 
 ## Documentation
 
@@ -1019,6 +1650,7 @@ Each phase is independently testable and can be rolled back:
 ## References
 
 - [MCP Specification](https://modelcontextprotocol.io/specification) - Model Context Protocol specification
+- [MCP Streamable HTTP Transport](https://spec.modelcontextprotocol.io/specification/2025-06-18/basic/transports/) - Streamable HTTP transport specification including session management via `Mcp-Session-Id` header
 - [toolhive#3062](https://github.com/stacklok/toolhive/issues/3062) - Original issue: Per-request client creation overhead
 - [toolhive#2417](https://github.com/stacklok/toolhive/issues/2417) - Session storage architecture and dual-layer model (metadata vs runtime state)
 - [toolhive#2852](https://github.com/stacklok/toolhive/issues/2852) - Missing integration tests below server level
@@ -1068,6 +1700,7 @@ This decorator pattern allows the optimizer to be added without modifying core s
 | 2026-02-04 | @yrobla, @jerm-dro | Draft | Initial submission |
 | 2026-02-09 | @jerm-dro, Copilot | Under Review | Addressed PR #38 comments |
 | 2026-02-12 | @jerm-dro, @ChrisJBurns | Under Review | Major revisions: Integrated with existing transportsession.Manager architecture, added dual-layer storage model, addressed security concerns (session hijacking, credential exposure, resource exhaustion), clarified error handling (removed InitError pattern), added parallel client initialization, simplified SessionManager design |
+| 2026-02-16 | @yrobla, Claude Sonnet 4.5 | Under Review | Multi-client session clarifications: Added explicit multi-client session model section, documented session routing mechanism via Mcp-Session-Id header, added mid-session backend failure handling with automatic recovery and circuit breaker, addressed backend MCP server session expiration with optional keepalive (best effort), added "Alternatives Considered" section explaining why not relying on backend session management, added future enhancement for MCP-level multi-client conformance test suite, clarified single endpoint serves multiple isolated sessions per MCP Streamable HTTP spec |
 
 ### Implementation Tracking
 
