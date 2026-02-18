@@ -572,7 +572,7 @@ type Session interface {
 - **Owns backend clients**: Session stores pre-initialized MCP clients in an internal map
 - **Encapsulates routing**: `CallTool()` looks up tool in routing table, routes to correct backend client
 - **Manageable lifetime**: `Close()` cleans up clients and any other resources. The SessionManager/caller is decoupled from what exactly happens on close()
-- **Thread-safe**: Internal RWMutex protects access to internal data structures (routing table, client map, closed flag) but is NOT held across network I/O—locks are acquired only while reading/mutating state, then released before invoking client methods. Methods like `Tools()`, `Resources()`, `Prompts()` return defensive copies to prevent caller mutations. Internal maps and slices are never exposed directly. **Coordination with Close()**: Since locks are released before network I/O, the session uses **context cancellation** (not locks) to coordinate—operations check `ctx.Done()` before using clients, and `Close()` cancels the context. This prevents holding locks during long network operations while providing safe cleanup (see "Client Closed Mid-Request" in Error Handling for details). Proper encapsulation may allow removal of mutexes elsewhere (e.g., SessionManager, current VMCPSession) since state is now owned by the Session
+- **Thread-safe**: Internal RWMutex protects access to internal data structures (routing table, client map, closed flag) but is NOT held across network I/O—locks are acquired only while reading/mutating state, then released before invoking client methods. Methods like `Tools()`, `Resources()`, `Prompts()` return defensive copies to prevent caller mutations. Internal maps and slices are never exposed directly. **Coordination with Close()**: Checking `ctx.Done()` before invoking a client is insufficient on its own—`Close()` could cancel the context and destroy the client between the check and the call (TOCTOU race). The correct pattern is a **`sync.WaitGroup` (in-flight counter)**: each operation increments the counter before invoking a client method and decrements it on return; `Close()` sets an atomic "closed" flag first (so new operations are rejected immediately), then waits for the counter to reach zero before closing clients. This ensures in-flight operations complete safely without holding locks during network I/O. (See "Client Closed Mid-Request" in Error Handling for details.) Proper encapsulation may allow removal of mutexes elsewhere (e.g., SessionManager, current VMCPSession) since state is now owned by the Session
 
 **Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). This RFC builds on the existing pluggable session storage architecture ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)) which provides `Storage` interface and `Manager` for Redis/Valkey support.
 
@@ -616,7 +616,7 @@ The default factory implementation follows this pattern:
    - **Client initialization includes MCP handshake**: Each client sends `InitializeRequest` to its backend, and the backend responds with capabilities and its own `Mcp-Session-Id`. The client stores the session ID for protocol compliance (includes it in subsequent request headers).
    - **Capture backend session IDs**: Factory also captures each backend's session ID (via `client.SessionID()`) for observability, storing them in a map to pass to the session
    - **Performance requirement**: Use parallel initialization (e.g., `errgroup` with bounded concurrency) to avoid sequential latency accumulation. Connection initialization (TCP handshake + TLS negotiation + MCP protocol handshake) can take tens to hundreds of milliseconds per backend depending on network latency and backend responsiveness. With 20 backends, sequential initialization could easily exceed acceptable session creation latency.
-   - **Bounded concurrency**: Limit parallel goroutines (e.g., 10 concurrent initializations) to avoid resource exhaustion
+   - **Bounded concurrency**: Limit parallel goroutines (e.g., 10 concurrent initializations) to avoid resource exhaustion. This limit is **per-session-creation** (not global), implemented as a semaphore inside the factory. It should be a configurable vMCP server-level parameter (e.g., `max_backend_init_concurrency`, default: 10). Operators with many backends on a fast private network can raise it; resource-constrained deployments or backends with expensive initialization should lower it. A global limit across concurrent session creations is not necessary — the per-session semaphore already bounds the worst case per event.
    - **Per-backend timeout**: Apply context timeout (e.g., 5s per backend) so one slow backend doesn't block session creation
    - **Partial initialization**: If some backends fail, log warnings and continue with successfully initialized backends (failed backends not added to clients map)
    - Clients are connection-ready and stateful (each maintains its backend session for protocol use)
@@ -915,7 +915,7 @@ With the two-phase creation pattern:
 
 **Error messages for empty-capability sessions**: If a client attempts to call a tool on a session with empty capabilities (due to complete initialization failure), the session returns a clear error:
 - **NOT**: "Tool not found" (misleading - implies tool doesn't exist in general)
-- **INSTEAD**: "Session has no available tools - backend initialization failed during session creation" (accurate - indicates setup failure)
+- **INSTEAD**: "No tools available: all backends failed to initialize during session setup. Check backend health and retry." (accurate and actionable)
 
 This is simpler and safer than requiring defensive `InitError()` checks throughout the codebase.
 
@@ -1054,7 +1054,11 @@ When vMCP detects backend session expiration (404 or "session expired" error), a
 ```go
 func (s *Session) CallTool(ctx context.Context, name string, arguments map[string]any) (*ToolResult, error) {
     backend := s.routingTable.Lookup(name)
+
+    // Hold RLock only while reading from shared state; release before network I/O.
+    s.mu.RLock()
     client := s.clients[backend.ID]
+    s.mu.RUnlock()
 
     result, err := client.CallTool(ctx, name, arguments)
 
@@ -1062,15 +1066,26 @@ func (s *Session) CallTool(ctx context.Context, name string, arguments map[strin
     if isSessionExpiredError(err) {  // 404 or "session not found"
         log.Warn("Backend %s session expired, re-initializing", backend.ID)
 
-        // Re-initialize the backend session
+        // Re-initialize the backend session (acquires write lock internally).
         if reinitErr := s.reinitializeBackend(ctx, backend.ID); reinitErr != nil {
             return nil, fmt.Errorf("failed to reinitialize backend %s: %w",
                 backend.ID, reinitErr)
         }
 
-        // Retry the operation with re-initialized session
-        client = s.clients[backend.ID]  // Get updated client
-        return client.CallTool(ctx, name, args)
+        // Retry the operation once with the re-initialized session.
+        // No further retries: if the new session also fails, surface the error
+        // immediately to avoid infinite loops or resource exhaustion.
+        // Re-read under RLock: reinitializeBackend replaced the client under write lock.
+        s.mu.RLock()
+        client = s.clients[backend.ID]
+        s.mu.RUnlock()
+
+        result, err = client.CallTool(ctx, name, arguments)
+        if err != nil {
+            return nil, fmt.Errorf("backend %s failed after re-initialization: %w",
+                backend.ID, err)
+        }
+        return result, nil
     }
 
     return result, err
@@ -1107,8 +1122,6 @@ func (s *Session) reinitializeBackend(ctx context.Context, backendID string) err
 
     log.Info("Backend %s session re-initialized: old=%s, new=%s",
         backendID, oldSessionID, newBackendSessionID)
-
-    log.Info("Backend %s re-initialized with new session", backendID)
     return nil
 }
 ```
@@ -1134,6 +1147,8 @@ func (s *Session) reinitializeBackend(ctx context.Context, backendID string) err
    - **Limitation**: Not all MCP servers support ping/low-cost operations
    - **Approach**: Best effort - attempt keepalive, gracefully handle backends that don't support it
    - **Configuration**: Enable per backend, configurable interval (default: 5 min)
+
+   The preferred keepalive method is the MCP spec-defined `ping` protocol request, which is side-effect-free and supported by all compliant servers; explicit tool calls should only be used as a fallback. Keepalive failures must not affect healthy sessions — after N consecutive failures the feature should be disabled for that backend, with a periodic probe to re-enable on recovery. Keepalive should default to disabled for stateless backends or where TTL alignment already covers the session lifetime. The keepalive goroutine must hold the backend lock to avoid races with session re-initialization. Operators should be able to observe keepalive health via per-backend metrics covering attempt counts, failure reasons, and auto-disable events.
 
 2. **Session TTL alignment**:
    - Configure backend session TTLs longer than vMCP session TTL
@@ -1196,6 +1211,9 @@ No new security boundaries are introduced. This is a refactoring of existing ses
    - **Circuit breaker integration**: Report auth failures to existing health monitor; if backend exceeds threshold (e.g., 5 failures in 60s), open circuit to prevent cascading failures
    - **Audit logging**: Log each retry attempt with session ID, backend ID, and attempt number for debugging
    - This handles token expiration gracefully without requiring new sessions while preventing resource exhaustion from misconfigured backends
+   - **Concurrent recreation**: If multiple requests for the same backend trigger recreation simultaneously, only one recreation attempt should proceed (e.g., using `singleflight`); others wait and reuse the result. Without this, a burst of concurrent requests on an expired credential creates a thundering herd of recreation attempts.
+   - **Latency**: Auth-failure retries add non-trivial latency due to backoff delays. This overhead should be documented and surfaced in traces.
+   - **Proactive refresh**: Where credentials carry an explicit expiry (e.g., JWT `exp` claim, OAuth token response `expires_in`), the client SHOULD schedule recreation slightly before expiry rather than waiting for a 401. This eliminates the retry cost entirely for known-expiry credentials.
 2. **Session TTL alignment**: Set session TTL (typically 30 minutes) shorter than expected credential lifetime to reduce stale credential exposure.
 
 **Recommended approach (Phase 2 enhancement)**:
@@ -1256,10 +1274,11 @@ For initial implementation, we assume most backends use long-lived credentials (
 
 **Required mitigations**:
 1. **Max concurrent sessions limit**: Implement configurable limit on active sessions (e.g., `TOOLHIVE_MAX_SESSIONS=1000`).
-   - **Behavior when limit reached**: Immediately reject new `InitializeRequest` with HTTP 503 Service Unavailable
-   - **Error response**: `{"error": {"code": -32000, "message": "Maximum concurrent sessions (1000) exceeded. Please try again later or contact administrator."}}`
-   - **Client experience**: Client should retry with exponential backoff or notify user
-   - **No queueing**: Requests are rejected immediately (not queued) to prevent resource exhaustion
+   - **Behavior when limit reached**: Immediately reject new `InitializeRequest` with HTTP 503 Service Unavailable and a `Retry-After` header (e.g., 30 seconds) so clients can back off without guessing
+   - **Error response**: `{"error": {"code": -32000, "message": "Maximum concurrent sessions exceeded. Please try again later or contact administrator."}}`
+   - **Client experience**: Client should retry with exponential backoff using the `Retry-After` hint, or notify the user
+   - **No queueing**: Requests are rejected immediately (not queued) to prevent resource exhaustion. A short queue would not meaningfully help under sustained overload and adds complexity; the `Retry-After` header gives clients the retry signal instead
+   - **No load metrics in response**: Do not expose current session counts in error responses — this leaks system state that could help attackers time requests
 2. **Per-client session limits**: Track sessions per client identity/IP, enforce per-client limits (e.g., 10 sessions per client) to prevent single client from exhausting resources
 3. **Aggressive session TTL**: Default 30-minute TTL with idle timeout (e.g., 5 minutes of inactivity) to reclaim unused sessions faster
 4. **Connection pooling consideration**: Future enhancement to share connections across sessions for same backend+identity combination (out of scope for this RFC but noted for future work)
@@ -1355,7 +1374,7 @@ The interface-based design enables future enhancements:
 
 **Session Features**:
 - **Capability refresh**: `Session.RefreshCapabilities()` method for updating tools/resources mid-session
-- **Connection warming**: Pre-connect to backends during idle time
+- **Eager session pre-initialization**: Pre-create MCP clients (including the full `InitializeRequest` handshake) for known backends during idle time, so the first user request to a new session does not pay the initialization latency cost
 - **Health-based initialization**: Skip unhealthy backends in `SessionFactory.MakeSession()`
 - **Credential refresh**: Add token refresh hooks in session implementation
 
@@ -1483,6 +1502,9 @@ if config.SessionManagementV2 {
 - Test SDK integration: Initialize session via `POST /mcp` (method: `initialize`), verify tools registered
 - Verify old code path still works when flag is disabled (no regressions)
 
+**Security (blocking for production rollout)**:
+- Implement token hash binding during `CreateSession()`: store `SHA256(bearerToken)` in the session, validate on each subsequent request, reject with "session authentication mismatch" and terminate on mismatch (see Security Considerations → Session Hijacking Prevention). This must be completed before the feature flag is enabled in any production environment.
+
 **Files Modified**:
 - `pkg/vmcp/server/server.go` - Add conditional logic based on `sessionManagementV2` flag
 - `pkg/vmcp/server/hooks.go` - Add conditional logic for new vs old session registration
@@ -1508,14 +1530,14 @@ if config.SessionManagementV2 {
 **Testing**:
 - End-to-end tests: Full vMCP workflow with multiple backends
 - Verify backend state preservation across tool calls (e.g., Playwright browser session maintains context)
-- High-throughput tests: Verify no connection leaks, clients reused across tool calls
+- High-throughput tests: Verify no connection leaks and client reuse under sustained concurrent load. Success criteria: connection count and heap allocation remain stable above a post-warmup baseline with no unbounded growth. Verify using connection-count metrics and memory profiling.
 - Session expiration test: Verify TTL cleanup closes all clients
 
 **Files Modified**:
 - `pkg/vmcp/server/server.go` - Remove old code path and feature flag conditionals
 - `pkg/vmcp/discovery/middleware.go` - Delete (replaced by SessionFactory)
 - `pkg/vmcp/client/client.go` - Remove `httpBackendClient` (replaced by Session ownership)
-- `pkg/transport/session/manager.go` - Update `DeleteExpired()` to call `session.Close()` before removing from storage (fixes resource leak)
+- `pkg/transport/session/manager.go` - Update `DeleteExpired()` to call `session.Close()` before removing from storage (fixes resource leak). Because the storage layer operates on the `Session` interface (which has no `Close()` method), use an optional interface check: `if closer, ok := sess.(io.Closer); ok { closer.Close() }`. This avoids adding `Close()` to the base interface (which would require all existing session types to implement it) while still dispatching cleanup to sessions that carry resources.
 - Delete old `VMCPSession` implementation files
 
 **Rationale**: Once the new code path is validated, delete the old code entirely rather than maintaining both paths. This avoids technical debt and ongoing maintenance burden.
