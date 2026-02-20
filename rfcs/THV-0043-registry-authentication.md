@@ -1,4 +1,4 @@
-# RFC-XXXX: Registry Authentication
+# RFC-0043: Registry Authentication
 
 - **Status**: Draft
 - **Author(s)**: Chris Burns (@ChrisJBurns)
