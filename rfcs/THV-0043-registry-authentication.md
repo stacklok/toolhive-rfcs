@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Chris Burns (@ChrisJBurns)
 - **Created**: 2026-02-20
-- **Last Updated**: 2026-02-20
+- **Last Updated**: 2026-03-02
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#2962](https://github.com/stacklok/toolhive/issues/2962)
 
@@ -49,8 +49,8 @@ this infrastructure rather than building a parallel implementation.
 
 - **Per-server authentication.** Auth is per-registry, not per-MCP-server
   within a registry.
-- **Client secret management in Phase 1.** Phase 1 uses public clients with
-  PKCE only. Confidential client support (client secrets) may be added later.
+- **Confidential client support.** Not in scope for Phase 1. Phase 1 uses
+  public clients with PKCE only.
 - **Dynamic Client Registration (RFC 7591).** Auto-registering the CLI as an
   OAuth client would eliminate manual `client-id` configuration but is not
   universally supported by identity providers. Deferred.
@@ -197,7 +197,6 @@ type RegistryAuth struct {
 type RegistryOAuthConfig struct {
     Issuer       string   `yaml:"issuer"`
     ClientID     string   `yaml:"client_id"`
-    ClientSecret string   `yaml:"client_secret,omitempty"` // For future confidential clients
     Scopes       []string `yaml:"scopes,omitempty"`
     Audience     string   `yaml:"audience,omitempty"`       // RFC 8707 resource indicator
     UsePKCE      bool     `yaml:"use_pkce"`
@@ -244,6 +243,25 @@ The `set-registry-auth` command validates the issuer by performing OIDC
 discovery before saving the configuration. This catches typos and
 unreachable issuers early.
 
+**`get-registry` output changes:**
+
+The existing `thv config get-registry` command is updated to display auth
+status alongside the registry URL:
+
+```
+# OAuth configured but no cached tokens yet
+Current registry: https://registry.company.com/api (API endpoint, OAuth configured)
+
+# OAuth configured with cached tokens (authenticated)
+Current registry: https://registry.company.com/api (API endpoint, OAuth authenticated)
+
+# No auth configured (unchanged from current behavior)
+Current registry: https://registry.company.com/api (API endpoint)
+```
+
+The suffix is determined by checking `RegistryAuth.Type` and whether
+`CachedRefreshTokenRef` is populated (indicating a prior successful login).
+
 #### Token Lifecycle
 
 ```mermaid
@@ -272,6 +290,7 @@ flowchart TD
 | Subsequent CLI invocations | Restore refresh token from secrets → silent token refresh (no browser) |
 | Within same process | In-memory token source → auto-refresh via `oauth2` library |
 | Refresh token expired/revoked | Falls back to browser OAuth flow (same as first request) |
+| Secrets manager not configured | `resolveTokenSource` logs a debug message and continues with a `nil` secrets provider. Tokens work for the current session (in-memory) but are not persisted across invocations — each CLI run triggers the browser flow. |
 
 #### Data Flow
 
@@ -291,8 +310,8 @@ sequenceDiagram
     Factory->>Factory: NewCachedAPIRegistryProvider(url, tokenSource)
     Note over Factory: Skip validation probe<br/>(auth requires user interaction)
 
-    CLI->>Registry: GET /servers (via auth.Transport)
-    Registry-->>TokenSrc: Transport calls Token()
+    Note over CLI,Registry: auth.Transport intercepts outgoing request
+    CLI->>TokenSrc: auth.Transport calls Token()
     TokenSrc->>TokenSrc: Check in-memory cache (miss)
     TokenSrc->>Secrets: Get refresh token
     Secrets-->>TokenSrc: No cached token
@@ -336,6 +355,14 @@ Registry auth has different concerns than MCP server auth (different config
 model, different token persistence keys, different lifecycle). A separate
 package keeps the boundaries clean while reusing the underlying OAuth
 primitives.
+
+**Why share callback port 8666 with remote MCP auth:**
+Registry auth and remote MCP server auth do not run simultaneously. Registry
+auth happens during `thv registry list` / `thv run` (before any MCP server
+is running), while remote MCP auth happens when the MCP server starts. The
+port is reused intentionally via `remote.DefaultCallbackPort` to keep the
+configuration simple. The `callback_port` config field allows overriding if
+needed.
 
 ## Security Considerations
 
@@ -404,7 +431,7 @@ primitives.
 | Auth code interception | S256 PKCE challenges on all authorization code flows |
 | Refresh token theft | Encrypted at rest via secrets manager (keyring/1Password); not stored in plaintext config |
 | Credential leakage | Token values excluded from all log levels; no tokens in URLs or shell history |
-| Callback port hijack | Local callback server accepts a single callback then shuts down; state parameter prevents CSRF |
+| Callback port hijack | Local callback server accepts a single callback then shuts down; state parameter prevents CSRF. If the user does not authenticate within the timeout window, the server shuts down and an error is returned to the user. |
 
 ## Alternatives Considered
 
@@ -470,8 +497,6 @@ primitives.
   without changing the config structure.
 - The `TokenSource` interface is auth-mechanism agnostic — Phase 2 bearer
   token support implements the same interface.
-- The `ClientSecret` field in `RegistryOAuthConfig` is present but unused
-  in Phase 1, ready for confidential client support.
 
 ## Implementation Plan
 
@@ -511,19 +536,6 @@ primitives.
 - No new external dependencies. Reuses existing `golang.org/x/oauth2`,
   `pkg/auth/oauth/`, `pkg/auth/remote/`, and `pkg/secrets/` packages.
 
-## Testing Strategy
-
-- **Unit tests**: `oauthTokenSource` with mocked secrets provider and OIDC
-  endpoints. `Transport` round-tripper with mock token sources.
-- **Auth configurator tests**: Verify OIDC discovery validation, config
-  read/write operations.
-- **Integration tests**: End-to-end OAuth flow with a test OIDC server
-  (e.g., `ory/fosite` or mock HTTP server returning OIDC discovery documents).
-- **Backward compatibility tests**: Verify unauthenticated registries
-  continue to work when `registry_auth` is absent.
-- **Token lifecycle tests**: Verify cache → restore → refresh → browser
-  flow fallback chain.
-
 ## Documentation
 
 - Update CLI help text for `thv config` subcommands
@@ -537,10 +549,6 @@ primitives.
    registries with different auth requirements, should we support per-registry
    auth profiles? Currently auth is global (tied to whatever registry URL is
    configured).
-
-2. **Callback port conflicts.** The callback server uses port 8666, which
-   is the same as the remote MCP auth callback. Should registry auth use a
-   different port to avoid conflicts if both flows run simultaneously?
 
 ## References
 
@@ -562,6 +570,7 @@ primitives.
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-02-20 | @ChrisJBurns | Draft | Initial submission based on design doc |
+| 2026-03-02 | @ChrisJBurns | Revised | Address review feedback: fix sequence diagram, resolve callback port question, add secrets degradation behavior, document get-registry output, clarify callback timeout, remove ClientSecret field |
 
 ### Implementation Tracking
 
