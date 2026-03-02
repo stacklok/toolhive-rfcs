@@ -14,7 +14,7 @@ remote MCP server registries that require authentication. Phase 1 implements
 browser-based OAuth with PKCE — the CLI opens a browser for user login,
 receives tokens via a local callback, and injects them into all subsequent
 registry API requests. Phase 2 adds static bearer token support for CI/CD
-environments.
+and headless environments (including `thv serve`).
 
 ## Problem Statement
 
@@ -33,6 +33,15 @@ ToolHive already has mature OAuth/OIDC infrastructure for remote MCP *server*
 authentication (`pkg/auth/oauth/`, `pkg/auth/remote/`) and a secrets manager
 for credential persistence (`pkg/secrets/`). The registry auth feature reuses
 this infrastructure rather than building a parallel implementation.
+
+**Note on MCP spec alignment:** The official MCP Registry at
+`registry.modelcontextprotocol.io` is unauthenticated for reads. This RFC
+targets *private* `toolhive-registry-server` instances behind corporate
+identity providers. There is currently no MCP standard for authenticating
+to a private registry's read API — this design is a general-purpose HTTP
+API auth layer for the registry, not an implementation of the MCP
+authorization spec (which governs MCP server-level auth, not registry-level
+auth).
 
 ## Goals
 
@@ -56,6 +65,13 @@ this infrastructure rather than building a parallel implementation.
   universally supported by identity providers. Deferred.
 - **Kubernetes registry auth.** This RFC targets the CLI (`thv`). Kubernetes
   operator registry access uses service accounts and is out of scope.
+- **`RemoteRegistryProvider` authentication.** Auth applies to the API
+  registry provider only. Organizations hosting a static JSON registry file
+  behind authentication should migrate to the API provider
+  (`toolhive-registry-server`). See [Limitations](#limitations).
+- **MCP Protected Resource Metadata (RFC 9728).** Automatic auth discovery
+  from `401 WWW-Authenticate` headers is deferred. Phase 1 uses manual
+  issuer configuration. See [Future Considerations](#future-considerations).
 
 ## Proposed Solution
 
@@ -119,6 +135,10 @@ thv config set-registry-auth --issuer <url> --client-id <id>
          └──▶ LocalRegistryProvider     ──▶ (no network)
 ```
 
+**Note:** Auth is only supported for the API registry provider. The
+`RemoteRegistryProvider` (static JSON file over HTTP) does not support
+authentication. See [Limitations](#limitations).
+
 #### Component Changes
 
 | Component | Location | Role |
@@ -179,11 +199,9 @@ registry_auth:
     client_id: "toolhive-cli"
     scopes: ["openid"]
     audience: "api://my-registry"
-    use_pkce: true
     callback_port: 8666
     # Populated automatically after first login:
-    cached_refresh_token_ref: "REGISTRY_OAUTH_REFRESH_TOKEN"
-    cached_token_expiry: "2026-02-20T12:00:00Z"
+    cached_refresh_token_ref: "REGISTRY_OAUTH_<hash>"
 ```
 
 **Config structs:**
@@ -198,14 +216,28 @@ type RegistryOAuthConfig struct {
     Issuer       string   `yaml:"issuer"`
     ClientID     string   `yaml:"client_id"`
     Scopes       []string `yaml:"scopes,omitempty"`
-    Audience     string   `yaml:"audience,omitempty"`       // RFC 8707 resource indicator
-    UsePKCE      bool     `yaml:"use_pkce"`
+    Audience     string   `yaml:"audience,omitempty"`       // IdP audience parameter
     CallbackPort int      `yaml:"callback_port,omitempty"`
 
-    CachedRefreshTokenRef string    `yaml:"cached_refresh_token_ref,omitempty"`
-    CachedTokenExpiry     time.Time `yaml:"cached_token_expiry,omitempty"`
+    CachedRefreshTokenRef string `yaml:"cached_refresh_token_ref,omitempty"`
 }
 ```
+
+**Changes from original design:**
+- Removed `UsePKCE` field — PKCE with S256 is always enabled (mandatory per
+  OAuth 2.1 for public clients). Not user-configurable.
+- Removed `CachedTokenExpiry` — access tokens are memory-only and their
+  expiry should not be persisted. The `oauth2` library handles expiry
+  internally via the token source.
+- The `Audience` field is an IdP-specific parameter (e.g., Auth0's
+  `audience`, Azure AD's `resource`). It is **not** the RFC 8707 `resource`
+  parameter, which requires an absolute `https://` URI. Most IdPs use a
+  proprietary audience parameter, so this field accommodates that.
+- The secret key for `CachedRefreshTokenRef` is derived from the registry
+  URL and issuer (e.g., `REGISTRY_OAUTH_<sha256(registry_url + "\0" + issuer)[:12]>`)
+  to prevent token clobbering when switching between registries. A null byte
+  delimiter separates the URL and issuer in the hash input to prevent
+  ambiguous concatenation.
 
 #### CLI Commands
 
@@ -233,15 +265,16 @@ thv config unset-registry-auth
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--issuer` | Yes | — | OIDC issuer URL |
+| `--issuer` | Yes | — | OIDC issuer URL (must be `https://`, except `localhost`) |
 | `--client-id` | Yes | — | OAuth client ID |
 | `--scopes` | No | `openid` | OAuth scopes (comma-separated) |
-| `--audience` | No | — | OAuth audience / resource indicator (RFC 8707) |
-| `--use-pkce` | No | `true` | Enable PKCE (recommended for public clients) |
+| `--audience` | No | — | OAuth audience parameter (IdP-specific) |
 
 The `set-registry-auth` command validates the issuer by performing OIDC
 discovery before saving the configuration. This catches typos and
-unreachable issuers early.
+unreachable issuers early. The issuer URL **must** use the `https://` scheme
+(with an exception for `localhost`/`127.0.0.1` for development), per the
+OIDC Discovery specification Section 4.1.
 
 **`get-registry` output changes:**
 
@@ -271,15 +304,17 @@ flowchart TD
     B -->|No| D{"Refresh token<br/>in secrets manager?"}
     D -->|Yes| E["Refresh token exchange"]
     E -->|Success| C
-    E -->|Failure| F["Browser OAuth flow"]
+    E -->|Failure| F{"Interactive<br/>context?"}
     D -->|No| F
-    F --> G["Open browser → issuer authorize endpoint<br/>(with PKCE challenge)"]
-    G --> H["User authenticates in browser"]
-    H --> I["Callback on localhost:8666<br/>with auth code"]
-    I --> J["Exchange code + PKCE verifier<br/>for access + refresh tokens"]
-    J --> K["Persist refresh token<br/>in secrets manager"]
-    K --> L["Update config with<br/>token reference + expiry"]
-    L --> C
+    F -->|Yes| G["Browser OAuth flow"]
+    F -->|No| H["Return error:<br/>run thv config set-registry-auth"]
+    G --> I["Open browser → issuer authorize endpoint<br/>(with PKCE S256 challenge)"]
+    I --> J["User authenticates in browser"]
+    J --> K["Callback on localhost:8666<br/>with auth code"]
+    K --> L["Exchange code + PKCE verifier<br/>for access + refresh tokens"]
+    L --> M["Persist refresh token<br/>in secrets manager"]
+    M --> N["Update config with<br/>token reference"]
+    N --> C
 ```
 
 **Cross-invocation behavior:**
@@ -291,6 +326,16 @@ flowchart TD
 | Within same process | In-memory token source → auto-refresh via `oauth2` library |
 | Refresh token expired/revoked | Falls back to browser OAuth flow (same as first request) |
 | Secrets manager not configured | `resolveTokenSource` logs a debug message and continues with a `nil` secrets provider. Tokens work for the current session (in-memory) but are not persisted across invocations — each CLI run triggers the browser flow. |
+| `thv serve` (headless context) | Uses cached tokens from secrets manager. If no cached tokens exist, returns an error directing the user to authenticate via `thv registry list` first. Browser flow is never triggered from API server context. |
+| Refresh token rotation | When the IdP returns a new refresh token during token refresh, the `PersistingTokenSource` automatically stores the new token, replacing the previous one. |
+
+**PKCE enforcement:** PKCE with `S256` code challenge method is always
+used. The `code_challenge_method` is hardcoded to `S256` — there is no
+fallback to `plain`. This is mandatory per OAuth 2.1 for public clients.
+
+**State parameter:** The `state` parameter is generated as a
+cryptographically random value (32 bytes from `crypto/rand`) and validated
+on callback to prevent CSRF attacks.
 
 #### Data Flow
 
@@ -318,8 +363,8 @@ sequenceDiagram
 
     TokenSrc->>IDP: OIDC Discovery
     IDP-->>TokenSrc: Auth + token endpoints
-    TokenSrc->>TokenSrc: Generate PKCE verifier/challenge
-    TokenSrc->>TokenSrc: Start local server on :8666
+    TokenSrc->>TokenSrc: Generate PKCE verifier/challenge (S256)
+    TokenSrc->>TokenSrc: Start local server on 127.0.0.1:8666
     TokenSrc->>User: Open browser → authorize endpoint
     User->>IDP: Authenticate
     IDP->>TokenSrc: Redirect to localhost:8666/callback
@@ -338,11 +383,12 @@ request. When OAuth is configured, this test request would trigger the
 browser flow within a 10-second timeout, which cannot complete. Instead,
 validation is deferred to the first real API call.
 
-**Why PKCE without client secret:**
+**Why PKCE is mandatory (not configurable):**
 CLI applications are public clients — they cannot securely store a client
-secret. PKCE (RFC 7636) provides equivalent security without requiring a
-secret. The identity provider must be configured as a "Native App" (public
-client) to accept requests without client authentication.
+secret. PKCE (RFC 7636) with S256 is the only mechanism preventing
+authorization code interception attacks for public clients. OAuth 2.1
+mandates PKCE for all authorization code grants. Allowing it to be
+disabled would create a critical security vulnerability.
 
 **Why reuse `pkg/auth/oauth/` instead of a new implementation:**
 ToolHive already has a battle-tested OAuth flow for remote MCP server
@@ -362,7 +408,65 @@ auth happens during `thv registry list` / `thv run` (before any MCP server
 is running), while remote MCP auth happens when the MCP server starts. The
 port is reused intentionally via `remote.DefaultCallbackPort` to keep the
 configuration simple. The `callback_port` config field allows overriding if
-needed.
+needed. The callback server binds to `127.0.0.1` (not `0.0.0.0`) to prevent
+network-based interception.
+
+**Why `audience` instead of RFC 8707 `resource`:**
+RFC 8707 requires the `resource` parameter to be an absolute `https://` URI.
+In practice, most identity providers (Okta, Auth0, Azure AD) use a
+proprietary `audience` parameter that accepts arbitrary strings like
+`api://my-registry`. The `audience` field accommodates real-world IdP
+behavior. If an IdP requires RFC 8707 `resource` semantics, the `audience`
+field can be set to the full `https://` URI of the registry.
+
+**Why derive secret keys from registry URL:**
+Using a fixed secret key (`REGISTRY_OAUTH_REFRESH_TOKEN`) would cause
+token clobbering when switching between registries — the second registry's
+refresh token silently overwrites the first. Deriving the key from the
+registry URL and issuer (e.g., `REGISTRY_OAUTH_<hash>`) allows multiple
+sets of credentials to coexist in the secrets manager, even though only one
+registry can be active at a time.
+
+### Limitations
+
+**`thv serve` (API server context):**
+The browser-based OAuth flow requires user interaction and cannot be
+triggered from within an API server handling HTTP requests. When `thv serve`
+needs to access an authenticated registry (e.g., ToolHive Studio requests
+server list), it relies on cached tokens obtained from a prior CLI session.
+If no cached tokens exist or the refresh token has expired, the API server
+returns an error indicating that authentication is required. The user must
+run `thv registry list` (or any registry command) in a terminal first to
+complete the browser flow and cache tokens. Phase 2 bearer token support
+will provide a non-interactive alternative for `thv serve` deployments.
+
+**`RemoteRegistryProvider` (static JSON file):**
+Auth applies only to the `CachedAPIRegistryProvider` (the API registry
+provider). The `RemoteRegistryProvider`, which fetches a static JSON
+registry file over HTTP, does not support authentication. Organizations
+that host registry files behind authentication should migrate to the API
+registry provider (`toolhive-registry-server`).
+
+**Single active registry:**
+Only one registry can be authenticated at a time (the one configured via
+`registry_api_url`). However, credentials for previously authenticated
+registries are preserved in the secrets manager (keyed by registry URL hash)
+and restored automatically when switching back.
+
+**401/403 error handling:**
+When a registry returns `401 Unauthorized` during the API validation probe,
+the error message should be actionable:
+
+```
+Error: registry at https://registry.company.com returned 401 Unauthorized.
+
+If this registry requires authentication, configure it with:
+  thv config set-registry-auth --issuer <issuer-url> --client-id <client-id>
+```
+
+This requires detecting HTTP 401/403 status codes in the API provider and
+enhancing the error message, rather than surfacing the generic "API endpoint
+not functional" error.
 
 ## Security Considerations
 
@@ -371,10 +475,12 @@ needed.
 | Threat | Description | Likelihood | Impact |
 |--------|-------------|------------|--------|
 | Token interception | Access token intercepted in transit | Low (HTTPS enforced) | High |
-| Auth code interception | Authorization code stolen during callback | Low (PKCE mitigates) | High |
+| Auth code interception | Authorization code stolen during callback | Low (PKCE + state mitigate) | High |
 | Refresh token theft | Refresh token extracted from storage | Low (encrypted at rest) | High |
 | Credential leakage | Tokens appear in logs or shell history | Medium | High |
 | Callback port hijack | Malicious process listens on :8666 | Low | Medium |
+| Config file exposure | Config readable by other users | Medium (depends on umask) | Medium |
+| Phishing via issuer | Malicious issuer URL redirects to phishing page | Low | High |
 
 ### Authentication and Authorization
 
@@ -382,9 +488,11 @@ needed.
 - No changes to MCP server authentication or the embedded auth server.
 - The identity provider controls authorization (scopes, audience). The CLI
   is a relying party only.
-- The `audience` flag (RFC 8707 resource indicator) allows the identity
-  provider to issue registry-scoped tokens, preventing token misuse across
-  services.
+- The `audience` flag allows the identity provider to issue
+  registry-scoped tokens, preventing token misuse across services.
+  **Note:** If `--audience` is omitted, tokens may be valid for multiple
+  services sharing the same IdP. Operators should configure audience
+  restrictions at the IdP level.
 
 ### Data Security
 
@@ -394,14 +502,20 @@ needed.
   a *reference key* (`cached_refresh_token_ref`), not the token value.
 - **No tokens in logs.** Token values never appear in debug logs. Only token
   *presence* is logged (e.g., "using cached refresh token").
+- **Config file permissions.** The `config.yaml` file is programmatically
+  created with mode `0600` (owner read/write only) via `os.OpenFile`. While
+  the file does not contain tokens, it contains the issuer URL, client ID,
+  and token reference key, which are organizational infrastructure details.
 
 ### Input Validation
 
 - The `--issuer` URL is validated via OIDC discovery before saving to
   config. This confirms the URL is reachable and serves a valid
-  `.well-known/openid-configuration` document.
+  `.well-known/openid-configuration` document. The issuer URL **must** use
+  `https://` (with a `localhost` exception for development).
 - OAuth callback parameters (authorization code, state) are validated by
-  the existing `pkg/auth/oauth/` flow implementation.
+  the existing `pkg/auth/oauth/` flow implementation. The `state` parameter
+  is generated with `crypto/rand` (32 bytes) and compared on callback.
 - The `--scopes`, `--audience`, and `--client-id` values are passed through
   to the identity provider, which performs its own validation.
 
@@ -410,10 +524,12 @@ needed.
 - Refresh tokens are stored using ToolHive's existing `pkg/secrets/`
   infrastructure, which supports keyring (macOS Keychain, Linux
   secret-service) and 1Password backends.
-- The secret key (`REGISTRY_OAUTH_REFRESH_TOKEN`) is a fixed identifier.
-  Changing identity providers requires `thv config unset-registry-auth`
-  which clears the cached token reference.
+- The secret key is derived from the registry URL and issuer
+  (`REGISTRY_OAUTH_<hash>`) to prevent clobbering when switching registries.
 - No client secrets are stored in Phase 1 (public client with PKCE).
+- When the IdP rotates refresh tokens during token refresh, the
+  `PersistingTokenSource` automatically stores the new token, replacing the
+  previous one.
 
 ### Audit and Logging
 
@@ -427,11 +543,13 @@ needed.
 
 | Threat | Mitigation |
 |--------|------------|
-| Token interception | HTTPS enforced by `ValidatingTransport`; HTTP only allowed with `--allow-private-ip` for localhost testing |
-| Auth code interception | S256 PKCE challenges on all authorization code flows |
+| Token interception | HTTPS enforced by `ValidatingTransport`; `--allow-private-ip` relaxes both private IP blocking and HTTPS enforcement for registry connections (enabling `http://localhost` testing). This means bearer tokens are sent over plain HTTP when this flag is used — it should only be used for local development. This flag does not affect TLS requirements for IdP communication (token endpoint, authorization endpoint). |
+| Auth code interception | PKCE with S256 (mandatory, not configurable) on all authorization code flows |
 | Refresh token theft | Encrypted at rest via secrets manager (keyring/1Password); not stored in plaintext config |
 | Credential leakage | Token values excluded from all log levels; no tokens in URLs or shell history |
-| Callback port hijack | Local callback server accepts a single callback then shuts down; state parameter prevents CSRF. If the user does not authenticate within the timeout window, the server shuts down and an error is returned to the user. |
+| Callback port hijack | Local callback server binds to `127.0.0.1` (not `0.0.0.0`); accepts a single callback then shuts down; `state` parameter (crypto/rand, 32 bytes) prevents CSRF. The browser flow has a default timeout of 120 seconds — if the user does not authenticate within this window, the callback server shuts down and an error is returned. |
+| Config file exposure | Config created with `0600` permissions; no token values in config |
+| Phishing via issuer | Issuer validated via OIDC discovery at configuration time; HTTPS required |
 
 ## Alternatives Considered
 
@@ -479,6 +597,21 @@ needed.
 - **Why not chosen**: Deferred. May revisit if multiple registries with
   different IdPs become a common use case.
 
+### Alternative 6: Automatic Auth Discovery via 401 + RFC 9728
+
+- **Description**: When the registry returns `401 Unauthorized`, parse the
+  `WWW-Authenticate` header to discover the authorization server via
+  Protected Resource Metadata (RFC 9728), as MCP 2025-11-25 mandates for
+  MCP server auth.
+- **Pros**: Zero-configuration experience — the CLI auto-discovers auth
+  requirements. Aligns with MCP spec direction.
+- **Cons**: Requires the registry server to implement RFC 9728 metadata
+  endpoints. No current `toolhive-registry-server` support. Adds complexity
+  to the initial implementation.
+- **Why not chosen**: Deferred to a future phase. Manual `--issuer`
+  configuration is sufficient for Phase 1 and avoids a dependency on
+  registry server changes.
+
 ## Compatibility
 
 ### Backward Compatibility
@@ -512,7 +645,9 @@ needed.
 - Update `pkg/registry/factory.go` with `resolveTokenSource()` integration
 - Thread `tokenSource` through `NewCachedAPIRegistryProvider` → `NewAPIRegistryProvider` → `NewClient`
 - Skip API validation probe when `tokenSource` is non-nil
+- Detect 401/403 during validation and provide actionable error messages
 - Update `get-registry` output to show auth status
+- Derive secret keys from registry URL hash to prevent token clobbering
 
 ### Phase 2: Bearer Token Authentication (Future)
 
@@ -530,6 +665,24 @@ needed.
   3. Secrets manager via `bearer_token_ref` config field
 - Add `--token` and `--token-file` flags to `set-registry-auth`
 - Add actionable 401/403 error messages with remediation instructions
+- This phase unblocks `thv serve` with authenticated registries (no browser
+  flow required)
+
+### Future Considerations
+
+- **Automatic auth discovery (RFC 9728):** Parse `WWW-Authenticate` headers
+  from 401 responses to auto-discover the authorization server, eliminating
+  manual `--issuer` configuration.
+- **Token revocation on `unset-registry-auth`:** Attempt to call the IdP's
+  revocation endpoint (RFC 7009) when clearing auth config. Currently,
+  `unset-registry-auth` only clears local state — the refresh token remains
+  valid at the IdP until it naturally expires.
+- **Ephemeral callback ports:** Use OS-assigned ephemeral ports (`:0`)
+  instead of the fixed port 8666, reducing collision risk and improving
+  security. Requires IdPs that allow dynamic redirect URIs.
+- **Client ID Metadata Documents:** MCP 2025-11-25 recommends this as
+  the preferred client registration mechanism. Would eliminate the need
+  for manual `--client-id` configuration.
 
 ### Dependencies
 
@@ -541,22 +694,24 @@ needed.
 - Update CLI help text for `thv config` subcommands
 - Add registry authentication guide to user documentation
 - Document identity provider setup requirements (public client, PKCE,
-  callback URL `http://localhost:8666/callback`)
+  callback URL `http://127.0.0.1:8666/callback`)
 
 ## Open Questions
 
 1. **Multiple registry auth configurations.** If a user switches between
    registries with different auth requirements, should we support per-registry
    auth profiles? Currently auth is global (tied to whatever registry URL is
-   configured).
+   configured), though credentials are preserved in the secrets manager
+   keyed by registry URL hash.
 
 ## References
 
 - [MCP Registry API Specification](https://github.com/modelcontextprotocol/registry)
 - [ToolHive Registry Server](https://github.com/stacklok/toolhive-registry-server)
 - [RFC 7636: PKCE](https://tools.ietf.org/html/rfc7636)
-- [RFC 8707: Resource Indicators for OAuth 2.0](https://tools.ietf.org/html/rfc8707)
 - [RFC 6750: Bearer Token Usage](https://tools.ietf.org/html/rfc6750)
+- [RFC 9728: Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
+- [OAuth 2.0 Security BCP](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-security-topics)
 - [toolhive#2962: Registry authentication support](https://github.com/stacklok/toolhive/issues/2962)
 - [toolhive#3908: CLI auth reg implementation](https://github.com/stacklok/toolhive/pull/3908)
 - Existing auth infrastructure: `pkg/auth/oauth/`, `pkg/auth/remote/`, `pkg/secrets/`
@@ -571,6 +726,7 @@ needed.
 |------|----------|----------|-------|
 | 2026-02-20 | @ChrisJBurns | Draft | Initial submission based on design doc |
 | 2026-03-02 | @ChrisJBurns | Revised | Address review feedback: fix sequence diagram, resolve callback port question, add secrets degradation behavior, document get-registry output, clarify callback timeout, remove ClientSecret field |
+| 2026-03-02 | Expert review panel | Revised | Address expert panel findings: remove use_pkce toggle (PKCE mandatory), document thv serve limitation, fix audience/resource terminology, add 401 error handling, derive secret keys from registry URL, add config file permissions, document refresh token rotation, add HTTPS issuer enforcement, document RemoteRegistryProvider limitation, add MCP spec alignment note |
 
 ### Implementation Tracking
 
