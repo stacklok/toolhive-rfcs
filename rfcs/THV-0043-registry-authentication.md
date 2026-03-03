@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Chris Burns (@ChrisJBurns)
 - **Created**: 2026-02-20
-- **Last Updated**: 2026-03-02
+- **Last Updated**: 2026-03-03
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#2962](https://github.com/stacklok/toolhive/issues/2962)
 
@@ -104,11 +104,12 @@ flowchart TD
     end
 ```
 
-The design introduces a `TokenSource` abstraction that plugs into the
-existing registry HTTP client via a custom `http.RoundTripper`. When
-registry auth is configured, every HTTP request to the registry
-transparently acquires and attaches a bearer token. The token lifecycle
-(cache → restore → browser flow → refresh) is handled internally.
+The design uses `oauth2.TokenSource` from `golang.org/x/oauth2` — the same
+interface used throughout ToolHive's existing auth infrastructure — plugged
+into the registry HTTP client via the standard `oauth2.Transport`
+`http.RoundTripper`. When registry auth is configured, every HTTP request to
+the registry transparently acquires and attaches a bearer token. The token
+lifecycle (cache → restore → browser flow → refresh) is handled internally.
 
 ### Detailed Design
 
@@ -145,9 +146,8 @@ authentication. See [Limitations](#limitations).
 |-----------|----------|------|
 | OAuth flow | `pkg/auth/oauth/flow.go` | Existing browser-based PKCE flow with local callback server (reused) |
 | OIDC discovery | `pkg/auth/oauth/oidc.go` | Existing auto-discovery of auth/token endpoints from issuer (reused) |
-| Token source | `pkg/registry/auth/oauth_token_source.go` | **New.** Token lifecycle: cache → restore → browser flow |
-| Auth transport | `pkg/registry/auth/transport.go` | **New.** Injects `Authorization: Bearer` on HTTP requests |
-| Token source interface | `pkg/registry/auth/auth.go` | **New.** `TokenSource` interface and factory |
+| Token source | `pkg/registry/auth/oauth_token_source.go` | **New.** Token lifecycle: cache → restore → browser flow. Implements `oauth2.TokenSource`. |
+| Token source factory | `pkg/registry/auth/auth.go` | **New.** Factory for constructing the appropriate `oauth2.TokenSource` from registry config |
 | Auth configurator | `pkg/registry/auth_configurator.go` | **New.** Business logic for set/unset/get auth config |
 | Token persistence | `pkg/auth/remote/persisting_token_source.go` | Existing token persistence wrapper (reused) |
 | Secrets manager | `pkg/secrets/` | Existing encrypted storage for refresh tokens (reused) |
@@ -156,33 +156,33 @@ authentication. See [Limitations](#limitations).
 The `pkg/registry/auth/` package is deliberately separate from `pkg/auth/`
 because registry auth has different concerns than MCP server auth — different
 config model, different token persistence keys, and different lifecycle. The
-package reuses the underlying OAuth primitives without coupling the two
-domains.
+package is a thin orchestration layer that composes from existing primitives
+in `pkg/auth/oauth/` and `pkg/auth/remote/` without re-implementing the
+OAuth lifecycle. It does not define its own `TokenSource` interface — it uses
+`oauth2.TokenSource` from `golang.org/x/oauth2` directly, and the standard
+`oauth2.Transport` serves as the auth-injecting `http.RoundTripper`.
 
 #### API Changes
 
-**New interface** (`pkg/registry/auth/auth.go`):
-
-```go
-// TokenSource provides authentication tokens for registry HTTP requests.
-type TokenSource interface {
-    // Token returns a valid access token string, or empty string if no auth.
-    // Implementations handle token refresh transparently.
-    Token(ctx context.Context) (string, error)
-}
-```
+**Token source type:** The registry auth package uses `oauth2.TokenSource`
+from `golang.org/x/oauth2` directly — no custom interface is defined. The
+existing ToolHive auth infrastructure (`PersistingTokenSource`,
+`BearerTokenSource`, `MonitoredTokenSource`, `Flow.TokenSource()`) already
+implements `oauth2.TokenSource`, so the registry auth layer composes from
+these without adapter code. The standard `oauth2.Transport` is used as the
+`http.RoundTripper` to inject `Authorization: Bearer` headers.
 
 **Modified signatures:**
 
 ```go
 // pkg/registry/api/client.go — added tokenSource parameter
-func NewClient(baseURL string, allowPrivateIp bool, tokenSource auth.TokenSource) (Client, error)
+func NewClient(baseURL string, allowPrivateIp bool, tokenSource oauth2.TokenSource) (Client, error)
 
 // pkg/registry/provider_api.go — added tokenSource parameter
-func NewAPIRegistryProvider(apiURL string, allowPrivateIp bool, tokenSource auth.TokenSource) (*APIRegistryProvider, error)
+func NewAPIRegistryProvider(apiURL string, allowPrivateIp bool, tokenSource oauth2.TokenSource) (*APIRegistryProvider, error)
 
 // pkg/registry/provider_cached.go — added tokenSource parameter
-func NewCachedAPIRegistryProvider(apiURL string, allowPrivateIp bool, usePersistent bool, tokenSource auth.TokenSource) (*CachedAPIRegistryProvider, error)
+func NewCachedAPIRegistryProvider(apiURL string, allowPrivateIp bool, usePersistent bool, tokenSource oauth2.TokenSource) (*CachedAPIRegistryProvider, error)
 ```
 
 #### Configuration Changes
@@ -261,6 +261,36 @@ thv config get-registry
 thv config unset-registry-auth
 ```
 
+**Authentication:**
+
+```bash
+# Explicitly authenticate to the configured registry (opens browser)
+thv registry login
+# → Opening browser for authentication...
+# → Authenticated to https://registry.company.com as user@company.com
+
+# Remove cached tokens and clear auth config
+thv registry logout
+```
+
+The `thv registry login` command eagerly triggers the browser OAuth flow and
+confirms success. It is functionally equivalent to what happens implicitly on
+the first registry API call, but provides an explicit entry point for:
+- Bootstrapping `thv serve` (authenticate before starting the API server)
+- Verifying auth configuration works after setup
+- Re-authenticating when refresh tokens expire
+- Scripting: `thv registry login && thv serve`
+
+The `thv registry logout` command clears cached tokens from the secrets
+manager and removes the `registry_auth` section from config.
+
+**Pre-loaded configuration (MDM/enterprise):** Organizations using MDM
+solutions (Jamf, Intune, etc.) can deploy `~/.config/toolhive/config.yaml`
+with the `registry_auth` section pre-populated (issuer, client_id, scopes,
+audience). The first `thv registry login` or registry command completes the
+OAuth flow. For fully non-interactive scenarios (service accounts, CI/CD),
+Phase 2 bearer token support provides the path.
+
 **Flags for `set-registry-auth`:**
 
 | Flag | Required | Default | Description |
@@ -326,7 +356,7 @@ flowchart TD
 | Within same process | In-memory token source → auto-refresh via `oauth2` library |
 | Refresh token expired/revoked | Falls back to browser OAuth flow (same as first request) |
 | Secrets manager not configured | `resolveTokenSource` logs a debug message and continues with a `nil` secrets provider. Tokens work for the current session (in-memory) but are not persisted across invocations — each CLI run triggers the browser flow. |
-| `thv serve` (headless context) | Uses cached tokens from secrets manager. If no cached tokens exist, returns an error directing the user to authenticate via `thv registry list` first. Browser flow is never triggered from API server context. |
+| `thv serve` (headless context) | Uses cached tokens from secrets manager. If no cached tokens exist, returns a structured `registry_auth_required` JSON error directing the user to run `thv registry login`. Browser flow is never triggered from API server context. |
 | Refresh token rotation | When the IdP returns a new refresh token during token refresh, the `PersistingTokenSource` automatically stores the new token, replacing the previous one. |
 
 **PKCE enforcement:** PKCE with `S256` code challenge method is always
@@ -397,10 +427,17 @@ authentication. The registry auth reuses the same `oauth.NewFlow`,
 functions, ensuring consistency and avoiding duplication.
 
 **Why a separate `pkg/registry/auth/` package:**
-Registry auth has different concerns than MCP server auth (different config
-model, different token persistence keys, different lifecycle). A separate
-package keeps the boundaries clean while reusing the underlying OAuth
-primitives.
+While `pkg/auth/` is a platform-level auth capability (not MCP-specific),
+registry auth has different concerns than MCP server auth: different config
+model (`RegistryOAuthConfig` vs `remote.Config`), different secret key
+derivation (URL-hashed keys vs per-workload keys), and different lifecycle
+(CLI session vs long-running MCP workload). The `pkg/registry/auth/` package
+is a thin orchestration layer that composes from existing primitives —
+`oauth.NewFlow`, `oauth.CreateOAuthConfigFromOIDC`,
+`remote.NewPersistingTokenSource` — without re-implementing them. It uses
+`oauth2.TokenSource` directly (no custom interface), so all existing token
+source implementations work without adapters. Phase 2 bearer token support
+will import `pkg/auth/remote.BearerTokenSource` rather than duplicating it.
 
 **Why share callback port 8666 with remote MCP auth:**
 Registry auth and remote MCP server auth do not run simultaneously. Registry
@@ -431,14 +468,50 @@ registry can be active at a time.
 
 **`thv serve` (API server context):**
 The browser-based OAuth flow requires user interaction and cannot be
-triggered from within an API server handling HTTP requests. When `thv serve`
-needs to access an authenticated registry (e.g., ToolHive Studio requests
-server list), it relies on cached tokens obtained from a prior CLI session.
-If no cached tokens exist or the refresh token has expired, the API server
-returns an error indicating that authentication is required. The user must
-run `thv registry list` (or any registry command) in a terminal first to
-complete the browser flow and cache tokens. Phase 2 bearer token support
-will provide a non-interactive alternative for `thv serve` deployments.
+triggered from within an API server handling HTTP requests. `thv serve`
+will never call `browser.OpenURL()` — the "interactive context" check in
+the token lifecycle is a boolean flag set during token source construction,
+not runtime detection. When `thv serve` needs to access an authenticated
+registry (e.g., ToolHive Studio requests server list), it relies on cached
+tokens obtained from a prior CLI session. If no cached tokens exist or the
+refresh token has expired, the API server returns a structured JSON error:
+
+```json
+{
+  "code": "registry_auth_required",
+  "message": "Registry authentication required. Run 'thv registry login' to authenticate."
+}
+```
+
+The user must run `thv registry login` in a terminal first to complete the
+browser flow and cache tokens. Phase 2 bearer token support will provide a
+non-interactive alternative for `thv serve` deployments.
+
+**`thv serve` auth status API:**
+The existing `GET /api/v1beta/registry` response is extended to include auth
+status, enabling ToolHive Studio to display the correct UI state without
+implementing its own auth logic:
+
+```json
+{
+  "name": "default",
+  "type": "api",
+  "source": "https://registry.company.com/api",
+  "auth_status": "configured",
+  "auth_type": "oauth"
+}
+```
+
+The `auth_status` field has four possible values:
+- `"none"` — no registry auth configured
+- `"configured"` — auth configured but no cached tokens (user needs to login)
+- `"authenticated"` — auth configured with valid cached tokens
+- `"expired"` — auth configured but cached tokens have expired
+
+The `auth_type` field is `"oauth"`, `"bearer"` (Phase 2), or `""` (none).
+**Tokens are never exposed via this API** — only status and non-secret
+metadata. Studio should use `thv serve` as an authenticated proxy to the
+registry, never obtaining tokens directly.
 
 **`RemoteRegistryProvider` (static JSON file):**
 Auth applies only to the `CachedAPIRegistryProvider` (the API registry
@@ -637,21 +710,24 @@ not functional" error.
 
 - Add `RegistryAuth` and `RegistryOAuthConfig` structs to `pkg/config/config.go`
 - Create `pkg/registry/auth/` package:
-  - `auth.go` — `TokenSource` interface and `NewTokenSource` factory
-  - `oauth_token_source.go` — OAuth token lifecycle (cache → restore → browser flow)
-  - `transport.go` — `http.RoundTripper` wrapper that injects `Authorization: Bearer`
+  - `auth.go` — `NewTokenSource` factory returning `oauth2.TokenSource`
+  - `oauth_token_source.go` — OAuth token lifecycle (cache → restore → browser flow), implements `oauth2.TokenSource`
+  - Uses standard `oauth2.Transport` as the auth-injecting `http.RoundTripper`
 - Create `pkg/registry/auth_configurator.go` — business logic for CLI commands
 - Add `set-registry-auth` and `unset-registry-auth` commands to `cmd/thv/app/config.go`
+- Add `thv registry login` and `thv registry logout` commands
 - Update `pkg/registry/factory.go` with `resolveTokenSource()` integration
 - Thread `tokenSource` through `NewCachedAPIRegistryProvider` → `NewAPIRegistryProvider` → `NewClient`
 - Skip API validation probe when `tokenSource` is non-nil
 - Detect 401/403 during validation and provide actionable error messages
 - Update `get-registry` output to show auth status
+- Extend `GET /api/v1beta/registry` response with `auth_status` and `auth_type` fields
+- Return structured `registry_auth_required` JSON error from `thv serve` when auth is needed
 - Derive secret keys from registry URL hash to prevent token clobbering
 
 ### Phase 2: Bearer Token Authentication (Future)
 
-- Add `bearerTokenSource` implementing `TokenSource`
+- Import `pkg/auth/remote.BearerTokenSource` (existing) as the `oauth2.TokenSource` for bearer auth
 - Extend config with `bearer` type:
   ```yaml
   registry_auth:
@@ -683,6 +759,21 @@ not functional" error.
 - **Client ID Metadata Documents:** MCP 2025-11-25 recommends this as
   the preferred client registration mechanism. Would eliminate the need
   for manual `--client-id` configuration.
+- **Studio-initiated auth via `thv serve` API:** An async
+  `POST /api/v1beta/registry/{name}/auth/initiate` endpoint that starts
+  the browser OAuth flow in a background goroutine, with Studio polling
+  `GET /api/v1beta/registry/{name}/auth/status` for completion. This
+  avoids requiring users to open a terminal to run `thv registry login`.
+  Deferred because it requires careful design around concurrency
+  (idempotent — no multiple browser windows), rate limiting, CORS
+  protection, and the 120-second timeout. A synchronous browser flow
+  triggered from an API handler is rejected: it blocks the HTTP request,
+  creates a phishing/DoS vector (any local process could trigger browser
+  popups), and conflicts with the server's headless deployment model.
+- **Config validation at load time:** Validate issuer URL scheme and
+  optionally re-verify OIDC discovery when config is loaded from disk
+  (not just when set via CLI command). This closes the gap where MDM or
+  manual file editing bypasses `set-registry-auth` validation.
 
 ### Dependencies
 
@@ -691,8 +782,9 @@ not functional" error.
 
 ## Documentation
 
-- Update CLI help text for `thv config` subcommands
+- Update CLI help text for `thv config` subcommands and `thv registry login/logout`
 - Add registry authentication guide to user documentation
+- Document MDM/enterprise deployment patterns (pre-loaded config)
 - Document identity provider setup requirements (public client, PKCE,
   callback URL `http://127.0.0.1:8666/callback`)
 
@@ -727,6 +819,7 @@ not functional" error.
 | 2026-02-20 | @ChrisJBurns | Draft | Initial submission based on design doc |
 | 2026-03-02 | @ChrisJBurns | Revised | Address review feedback: fix sequence diagram, resolve callback port question, add secrets degradation behavior, document get-registry output, clarify callback timeout, remove ClientSecret field |
 | 2026-03-02 | Expert review panel | Revised | Address expert panel findings: remove use_pkce toggle (PKCE mandatory), document thv serve limitation, fix audience/resource terminology, add 401 error handling, derive secret keys from registry URL, add config file permissions, document refresh token rotation, add HTTPS issuer enforcement, document RemoteRegistryProvider limitation, add MCP spec alignment note |
+| 2026-03-03 | Expert review panel | Revised | Address PR review comments: switch to `oauth2.TokenSource` (drop custom interface), clarify `pkg/registry/auth/` separation rationale, add `thv registry login/logout` commands, add auth status API for `thv serve`/Studio, add structured `registry_auth_required` errors, add Studio async auth flow to future considerations, document MDM/enterprise pre-loaded config support |
 
 ### Implementation Tracking
 
