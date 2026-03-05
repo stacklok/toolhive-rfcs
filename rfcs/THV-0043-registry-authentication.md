@@ -1424,8 +1424,10 @@ Example:
 var registryLogoutCmd = &cobra.Command{
     Use:   "logout",
     Short: "Remove cached registry credentials",
-    Long: `Remove cached OAuth tokens from the secrets manager and clear the
-registry_auth section from configuration. The registry URL itself is preserved.
+    Long: `Remove cached OAuth tokens from the secrets manager. The auth
+configuration (issuer, client_id, scopes, audience) is preserved so you can
+re-authenticate with 'thv registry login'. To remove auth config entirely,
+use 'thv config unset-registry-auth'.
 
 Example:
   thv registry logout`,
@@ -1540,16 +1542,20 @@ func registryLogoutCmdFunc(_ *cobra.Command, _ []string) error {
         }
     }
 
-    // Clear the registry_auth section from config (using the same UpdateConfig
-    // pattern as usageMetricsCmdFunc in config.go).
+    // Clear only the token reference — preserve issuer, client_id, scopes,
+    // audience so the user can re-authenticate with `thv registry login`
+    // without reconfiguring. To remove auth config entirely, use
+    // `thv config unset-registry-auth`.
     if err := config.UpdateConfig(func(c *config.Config) {
-        c.RegistryAuth = nil
+        if c.RegistryAuth != nil && c.RegistryAuth.OAuth != nil {
+            c.RegistryAuth.OAuth.CachedRefreshTokenRef = ""
+        }
     }); err != nil {
         return fmt.Errorf("failed to update config: %w", err)
     }
 
     registry.ResetDefaultProvider()
-    fmt.Println("Registry credentials cleared.")
+    fmt.Println("Registry credentials cleared. Run 'thv registry login' to re-authenticate.")
     return nil
 }
 
