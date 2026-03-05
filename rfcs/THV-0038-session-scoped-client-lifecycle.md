@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: @yrobla, @jerm-dro
 - **Created**: 2026-02-04
-- **Last Updated**: 2026-02-16
+- **Last Updated**: 2026-03-05
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3062](https://github.com/stacklok/toolhive/issues/3062)
 
@@ -130,7 +130,7 @@ These architectural problems have cascading effects:
 - **Multi-Session Client Sharing**: Clients remain session-scoped and are not shared across sessions
 - **Lazy Capability Discovery**: Capability discovery remains eager and static (i.e., done once at session creation, current behavior)
 - **Client Versioning**: Handling MCP protocol version negotiation is out of scope
-- **Transparent Horizontal Scaling**: Session-scoped MCP clients are held in Go process memory and cannot be serialized to Redis/Valkey. While session metadata can be stored in pluggable backends ([Issue #2417](https://github.com/stacklok/toolhive/issues/2417)), the MCP client objects themselves are in-process only. **Horizontal scaling of vMCP instances requires sticky sessions** (session affinity at load balancer). Transparent failover across instances is out of scope (clients must be recreated on instance switch, acceptable one-time cost).
+- **Sticky-session-free horizontal scaling**: Full horizontal scale-out — where any vMCP pod handles any session without sticky-session routing — is addressed by [THV-XXXX: Horizontal Scaling for vMCP and Proxy Runner](https://github.com/stacklok/toolhive-rfcs/pull/47). This RFC lays the architectural foundation (the `MultiSession` interface, the two-layer storage model, the pluggable `transportsession.Storage` interface, and the per-backend metadata schema) that makes THV-XXXX possible. This RFC does **not** implement: the Redis `Storage` backend, replica fields in operator CRDs, or the session-aware routing logic required to reconstruct a session on a different vMCP pod. MCP client objects remain in-process only; reconstructing a session on a different pod incurs a one-time re-initialization cost per re-route (the runtime layer is rebuilt from persisted metadata).
 
 ## Proposed Solution
 
@@ -571,12 +571,12 @@ type Session interface {
 **Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). This RFC builds on the existing pluggable session storage architecture ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)) which provides `Storage` interface and `Manager` for Redis/Valkey support.
 
 **Dual-layer architecture** (detailed in section "Session Architecture and Serializability"):
-- **Metadata layer** (serializable): Session ID, timestamps, identity reference - stored via `transportsession.Manager` + `Storage` interface (supports `LocalStorage` today, `RedisStorage` in future)
-- **Runtime layer** (in-memory only): MCP client objects, routing table, capabilities - cannot be serialized due to TCP connections and goroutines
+- **Metadata layer** (serializable): Session ID, timestamps, identity subject, and per-backend metadata (workload ID, backend-assigned `Mcp-Session-Id`, proxyrunner pod URL) — stored via `transportsession.Manager` + `Storage` interface (supports `LocalStorage` today, `RedisStorage` in future)
+- **Runtime layer** (in-memory only): MCP client objects, routing table, capabilities — cannot be serialized due to TCP connections and goroutines
 
 **Lifecycle management**: Sessions are stored via `transportsession.Manager.AddSession()` and expire based on configured TTL. Proper cleanup requires calling `session.Close()` to release backend client connections before removing from storage. The existing `Storage.DeleteExpired()` implementation only removes metadata without calling `Close()`, which would leak connections. This RFC updates the storage layer to call `Close()` before deletion, ensuring complete resource cleanup (see Implementation Plan Phase 3).
 
-**Horizontal scaling**: Session metadata can be in Redis/Valkey, but MCP clients are in-process only. Horizontal scaling requires sticky sessions (session affinity at load balancer) to ensure requests route to the instance holding the client objects. Without sticky sessions, clients must be recreated on instance switch (acceptable one-time cost per [Issue #2417](https://github.com/stacklok/toolhive/issues/2417)).
+**Horizontal scaling**: Sticky sessions (session affinity at the load balancer) are preferred for performance because they keep backend clients warm. When a Redis-backed `Storage` is configured, a request routed to a different vMCP pod can reconstruct the session runtime from the persisted metadata layer at a one-time cost per re-route. The per-backend metadata (proxyrunner URL + backend session ID) is what makes this reconstruction safe rather than disruptive — the new pod resumes the existing backend session rather than starting a new one. See [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) for the full horizontal scaling design and the routing algorithm (cases 1–4) that governs this flow.
 
 **SessionFactory Interface** - Creates fully-formed sessions:
 
@@ -697,10 +697,11 @@ The default session implementation stores:
 - Routing table mapping tool/resource names to backend workload IDs
 - Discovered capabilities (tools, resources, prompts)
 - Pre-initialized backend clients map (keyed by workload ID)
-- **Backend session IDs map** (keyed by workload ID) - explicit `[vMCP_session_id] -> [backend_session_ids]` mapping
+- **Backend session IDs map** (keyed by workload ID) - explicit `{backendID -> backend_session_id}` mapping
   - Stored separately from client objects for observability and lifecycle management
   - Captured during client initialization when backends return `Mcp-Session-Id` headers
   - Used for: logging, metrics, health checks, debugging, and explicit session cleanup
+  - **Persisted to the metadata layer**: these IDs are written to `transportsession.Session.SetData()` as part of a structured JSON payload (alongside the proxyrunner URL for each backend). This is required by [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) so that a different vMCP pod can reconstruct the session and resume using the correct backend sessions, rather than re-initializing from scratch and breaking stateful backends.
   - Updated when clients are re-initialized (e.g., after backend session expiration)
 - RWMutex for thread-safe access (read lock for queries/calls, write lock for Close)
 - `singleflight.Group` (or per-backend locks) to coordinate concurrent re-initialization of backend sessions without stalling the whole session
@@ -770,8 +771,10 @@ Sessions are split into two layers with different lifecycles:
 
 | Layer | Contents | Storage | Lifetime |
 |-------|----------|---------|----------|
-| **Metadata** | vMCP session ID, timestamps, identity reference, backend IDs list | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
-| **Runtime** | MCP client objects, backend session IDs map (`backendID -> sessionID`), routing table, capabilities, closed flag | In-process memory only | Lives only while vMCP instance is running |
+| **Metadata** | vMCP session ID, timestamps, identity subject; per-backend: workload ID, backend-assigned session ID (`Mcp-Session-Id`), proxyrunner pod URL | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
+| **Runtime** | MCP client objects, routing table (tool→backendID), capabilities, closed flag | In-process memory only | Lives only while vMCP instance is running |
+
+> **Why backend session IDs belong in the metadata layer**: The backend-assigned `Mcp-Session-Id` and proxyrunner pod URL are serializable identifiers, not live connection state. Persisting them is what enables a different vMCP pod to reconstruct the runtime layer safely: it can re-establish a connection to the exact proxyrunner pod using the stored URL and resume the existing backend session using the stored session ID, rather than discarding the backend session and starting over. This is the key design contract that [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) §4.2 builds on.
 
 **How it works**:
 - The behavior-oriented `Session` embeds `transportsession.Session` (metadata layer) and owns MCP clients (runtime layer)
@@ -790,6 +793,12 @@ Without sticky sessions (graceful degradation):
 - **Clients must be recreated** (connection initialization overhead: TCP + TLS + MCP handshake, varies with network conditions)
 - Subsequent requests to same instance reuse recreated clients
 - Trade-off: horizontal scaling flexibility vs temporary performance impact on instance switch
+
+> **Future: Additional metadata for horizontal scaling** *(not implemented in this RFC; see [THV-XXXX: Horizontal Scaling for vMCP and Proxy Runner](https://github.com/stacklok/toolhive-rfcs/pull/47))*
+> The metadata layer stores additional per-backend data that goes beyond single-instance operation needs: for each backend, the session persists the proxyrunner pod URL and the backend-assigned `Mcp-Session-Id`. This data is not used in the current single-replica deployment, but it is the foundation for future horizontal scaling: a different vMCP instance can use these stored identifiers to reconnect to the exact proxyrunner and resume the existing backend session rather than re-initializing from scratch and breaking stateful backends.
+
+> **Future challenge: Session storage across multiple vMCP replicas** *(not addressed in this RFC; see [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47))*
+> When multiple vMCP replicas are deployed, each instance holds session runtime state (backend connections, routing table) in local memory only. A request reaching a replica that did not initialize a given session cannot reuse its backend connections — it would have to reconstruct the runtime from the persisted metadata, incurring re-initialization cost. Solving this properly — with Redis-backed shared session storage, session-aware routing at the load balancer level, and replica configuration exposed in CRDs (`VirtualMCPServer.spec.replicas`) — is the subject of [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) and is out of scope for this RFC.
 
 **Implementation detail**: See Phase 1 in Implementation Plan for how `defaultSession` struct composes `transportsession.Session` (metadata) with runtime state (clients map, routing table).
 
@@ -1395,7 +1404,7 @@ When `SessionFactory.MakeSession()` runs:
 1. Create and initialize one MCP client per backend **in parallel** (with bounded concurrency, per-backend timeouts)
 2. Capture backend session IDs from clients (via `client.SessionID()`) for observability
 3. Pass clients to aggregator to discover capabilities from all backends
-4. Create `transportsession.Session` for metadata layer (ID, timestamps)
+4. Create `transportsession.Session` for metadata layer (ID, timestamps, identity subject). Once clients are initialized and backend session IDs captured, write the per-backend metadata (workload ID, backend-assigned `Mcp-Session-Id`, proxyrunner pod URL) to the session's `Data` field as a structured JSON payload. This write happens inside `SessionFactory.MakeSession()` after all clients are initialized, so the metadata layer is always complete before the session is stored.
 5. Return behavior-oriented session that embeds transport session + owns clients map + backend session IDs map
 
 **Testing**:
@@ -1634,6 +1643,8 @@ A comprehensive test suite to validate multi-client session behavior would be va
   - [toolhive#3517](https://github.com/stacklok/toolhive/pull/3517) - Optimizer-in-vMCP implementation (motivates Session interface design)
   - [toolhive#3312](https://github.com/stacklok/toolhive/pull/3312) - Optimizer-in-vMCP changes to server.go
   - [toolhive#3642](https://github.com/stacklok/toolhive/pull/3642) - Discussion on session capability refresh (simplified by Session encapsulation)
+- **Companion RFC**:
+  - [THV-XXXX: Horizontal Scaling for vMCP and Proxy Runner](https://github.com/stacklok/toolhive-rfcs/pull/47) — Builds directly on the `MultiSession` interface and two-layer storage model defined here. Implements Redis-backed `transportsession.Storage`, replica fields in operator CRDs (`VirtualMCPServer.spec.replicas`, `MCPServer.spec.replicas`), and session-aware routing at both the vMCP and proxyrunner layers. The per-backend metadata defined in this RFC (backend session IDs, proxyrunner URLs) is the data THV-XXXX stores in Redis to enable session reconstruction on a different vMCP pod.
 
 ---
 
@@ -1670,6 +1681,7 @@ This decorator pattern allows the optimizer to be added without modifying core s
 | 2026-02-09 | @jerm-dro, Copilot | Under Review | Addressed PR #38 comments |
 | 2026-02-12 | @jerm-dro, @ChrisJBurns | Under Review | Major revisions: Integrated with existing transportsession.Manager architecture, added dual-layer storage model, addressed security concerns (session hijacking, credential exposure, resource exhaustion), clarified error handling (removed InitError pattern), added parallel client initialization, simplified SessionManager design |
 | 2026-02-16 | @yrobla, Claude Sonnet 4.5 | Under Review | Multi-client session clarifications: Added explicit multi-client session model section, documented session routing mechanism via Mcp-Session-Id header, added mid-session backend failure handling with automatic recovery and circuit breaker, addressed backend MCP server session expiration with optional keepalive (best effort), added "Alternatives Considered" section explaining why not relying on backend session management, added future enhancement for MCP-level multi-client conformance test suite, clarified single endpoint serves multiple isolated sessions per MCP Streamable HTTP spec |
+| 2026-03-05 | amendment | Under Review | Alignment with THV-XXXX (Horizontal Scaling): updated non-goal for transparent scaling to reference companion RFC; expanded metadata layer to include per-backend session IDs and proxyrunner URLs; softened "sticky sessions required" language to "preferred, not required with Redis"; updated dual-layer table and deployment implications to match THV-XXXX reconstruction approach; updated Phase 1 implementation plan to specify what metadata is persisted; added THV-XXXX to References |
 
 ### Implementation Tracking
 
