@@ -1,4 +1,4 @@
-# RFC-00XX: Support Embedded Auth Server alongside AWS STS token exchange
+# RFC-0050: Support Embedded Auth Server alongside AWS STS token exchange
 
 - **Status**: Draft
 - **Author(s)**: @tgrunnagle
