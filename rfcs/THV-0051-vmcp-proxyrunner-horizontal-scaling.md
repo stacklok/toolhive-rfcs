@@ -1,9 +1,9 @@
-# THV-XXXX: Manual Horizontal Scaling for vMCP and Proxy Runner
+# THV-0051: Manual Horizontal Scaling for vMCP and Proxy Runner
 
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
 - **Created**: 2026-03-04
-- **Last Updated**: 2026-03-04
+- **Last Updated**: 2026-03-07
 - **Target Repository**: toolhive
 - **Related Issues**:
   - [toolhive#3986](https://github.com/stacklok/toolhive/pull/3986) - Enable sticky sessions on operator-created Services
@@ -111,17 +111,18 @@ This approach is a useful stopgap but is not a foundation for intentional horizo
 
 MCP servers that use `stdio` transport are inherently stateful: the MCP protocol conversation is a single long-lived stdin/stdout stream between the proxyrunner and the container. This state cannot be shared or transferred between proxyrunner instances — the stream lives or dies with the process.
 
-Even for `SSE` and `streamable-http` transports, where the backend MCP server speaks HTTP, individual backend connections carry session-specific negotiated state (e.g., the `Mcp-Session-Id` assigned by the backend server and known only to the proxyrunner that initialized the session). This means that *the proxyrunner is always the authoritative router for its sessions* — even with external storage, requests cannot be forwarded from one proxyrunner to another without re-initializing the backend session.
+**A `stdio` backend couples itself to a specific proxyrunner process**: the proxyrunner is the only process attached to the MCP server container's stdin/stdout, and that attachment is exclusive and non-transferable. This coupling is why proxyrunners cannot be made fully fungible (stateless, interchangeable replicas where any replica can handle any request) as long as `stdio` transport is supported. Removing or isolating `stdio` support would be a prerequisite for a fully fungible proxyrunner design; that is a larger architectural change out of scope for this RFC.
+
+Even for `SSE` and `streamable-http` transports, where the backend MCP server speaks HTTP, individual backend connections carry session-specific negotiated state (e.g., the `Mcp-Session-Id` assigned by the backend server and known only to the proxyrunner that initialized the session).
 
 This is a structural constraint of the MCP protocol, not a ToolHive implementation choice, and it shapes the solution described in this RFC.
 
-**A `stdio` backend couples itself to a specific proxyrunner process**: the proxyrunner is the only process attached to the MCP server container's stdin/stdout, and that attachment is exclusive and non-transferable. This coupling is why proxyrunners cannot be made fully fungible (stateless, interchangeable replicas where any replica can handle any request) as long as `stdio` transport is supported. Removing or isolating `stdio` support would be a prerequisite for a fully fungible proxyrunner design; that is a larger architectural change out of scope for this RFC.
 
 ---
 
 ## 2. Problems
 
-The fundamental problem is that **all requests within an MCP session must be handled by the same process**, at every layer of the stack. Today, with single-replica deployments at each layer, this is automatic. With multiple replicas, it is not.
+The fundamental problem is that **all requests within an MCP session must be handled by the same process**, at every layer of the stack. Today, with single-replica deployments at each layer, this is automatic. With multiple replicas, it is not. In reality, the only hard constraint is that the underlying MCPServer backend receives all requests for its initialized sessions.
 
 ### 2.1 vMCP: Session-to-Pod Affinity
 
@@ -176,12 +177,12 @@ For `SSE` and `streamable-http`, the session exists as a logical identifier (`Mc
   - `MCPServer.spec.replicas` — number of proxyrunner Deployment pods (capped at 1 for `stdio` transport).
   - `MCPServer.spec.backendReplicas` — number of pods in the shared MCP server StatefulSet. There is exactly **one StatefulSet per `MCPServer`**, shared by all proxyrunner replicas (see §3.2).
 - **Operator reconciler changes**: The operator must respect and preserve the new replica fields rather than hardcoding 1. The reconciler must stop overwriting manually-set replica counts.
-- **Horizontal scale-out of `vmcp`**: Multiple vMCP replicas should be able to serve any request, regardless of which replica initialized the session. vMCP reads session routing metadata from shared storage to determine the correct proxyrunner, then proxies the request there.
+- **Horizontal scale-out of `vmcp`**: Multiple vMCP replicas should be able to serve any request, regardless of which replica initialized the session. vMCP reads session routing metadata from shared storage to determine which sub-sessions to use for each underlying `MCPServer`.
 - **Horizontal scale-out of `thv-proxyrunner`**: A single `MCPServer` is backed by multiple proxyrunner replicas sharing one StatefulSet. Session metadata in shared storage allows any replica to look up which backend pod a given session belongs to.
 - **Transport coverage**: `SSE` and `streamable-http` transports at both layers.
 - **Manual scale-out without session disruption**: Changing replica counts in either CRD must not disrupt existing sessions. New requests may be routed to new replicas; existing sessions continue to route via the pod that initialized them.
-- **Safe vMCP scale-in**: When a vMCP replica is removed, sessions previously handled by it can be served by remaining replicas using session metadata from Redis. vMCP scale-in is safe because the session runtime can be reconstructed from persisted metadata.
-- **Proxyrunner scale-in (non-`stdio`)**: For `sse` and `streamable-http` transports, removing a proxyrunner replica is an in-scope operation. Sessions on the removed pod are re-hydrated on other pods when they receive a request. `stdio`-transport proxyrunner scale-in is out of scope (the stdin/stdout attachment cannot be transferred).
+- **Safe vMCP scale-in**: When a vMCP replica is removed, sessions previously handled by it can be served by remaining replicas using session metadata from Redis. vMCP scale-in is safe because the session runtime can be reconstructed from persisted metadata. Another in-scope dimension of scale-in safety is allowing a grace period for inflight requests on finishing pods to be completed.
+- **Proxyrunner scale-in (non-`stdio`)**: For `sse` and `streamable-http` transports, removing a proxyrunner replica is an in-scope operation. Sessions on the removed pod are re-hydrated on other pods when they receive a request. `stdio`-transport proxyrunner scale-in is out of scope (the stdin/stdout attachment cannot be transferred. Another in-scope dimension of scale-in safety is allowing a grace period for inflight requests on finishing pods to be completed.
 - **Enabling future auto-scaling**: The session storage mechanism is the prerequisite for HPAs and KEDA-based auto-scaling. This RFC does not define auto-scaling policy, but the design must not preclude it.
 
 ### 3.2 Out of Scope
@@ -191,7 +192,6 @@ For `SSE` and `streamable-http`, the session exists as a logical identifier (`Mc
 - **One StatefulSet per MCPServer (shared)**: The design maintains exactly one StatefulSet per `MCPServer`. All proxyrunner replicas for a given `MCPServer` share that single StatefulSet, converging on the same spec via server-side apply. Each proxyrunner replica routes its sessions to specific pods within the shared StatefulSet. Note: a 1:1 ratio (one StatefulSet per proxyrunner replica) could be a future direction if enabling `stdio` horizontal scaling were desired, since each proxyrunner would then have its own dedicated backend.
 - **Moving MCP server deployment out of the proxyrunner**: The proxyrunner remains responsible for creating, managing, and proxying to the MCP server StatefulSet. Changing this responsibility boundary (e.g., having vMCP manage backends directly) is desirable long-term but is more work and out of scope. Discussed in detail [here](https://github.com/stacklok/toolhive-rfcs/blob/main/rfcs/THV-0003-toolhive-kubernetes-architecture-improvement.md).
 - **Auto-scaling policy**: How to trigger scale-out (HPA metrics, KEDA event sources, custom metrics) is deferred to a follow-on RFC. This RFC makes auto-scaling possible; it does not specify when or how to do it.
-- **Graceful proxyrunner drain**: Waiting for sessions to expire before removing a proxyrunner pod is a future work item. Session loss on pod removal is accepted behavior for this RFC.
 - **Backend StatefulSet scale-in**: Removing pods from the `MCPServer` StatefulSet (reducing `spec.backendReplicas`) is always disruptive — the backend session state lives in the removed process and cannot be reconstructed. Graceful drain of backend pods is out of scope for this RFC.
 - **Session Hijack Prevention at MCPServer**: This capability will continue to work within vMCP, but it will not also be added to MCPServer.
 
@@ -286,7 +286,7 @@ Value: {
 
 #### vMCP Routing
 
-A vMCP session spans multiple backends; each backend has its own underlying connection and `backend_session_id`. When vMCP receives a request, it first identifies the target backend from the routing table (which tool/resource/prompt → which `MCPServer`), then finds the correct proxyrunner replica for that backend.
+A vMCP session spans multiple backends; each backend has its own underlying connection and `backend_session_id`. When vMCP receives a request, it first identifies the target backend from the routing table (which tool/resource/prompt → which `MCPServer`), then sends the request with `Mcp-Session-Id=$backend_session_id` to the k8s service for the `MCPServer`.
 
 1. **No `Mcp-Session-Id`** (new session / `initialize`): Initialize connections to all backends in the `MCPGroup`. Record the session in Redis with a `backends` array containing each backend's proxyrunner pod URL and assigned `backend_session_id`. Proceed normally.
 2. **Known `Mcp-Session-Id`** (session in local storage): Reuse the initialized clients with sub-session IDs already bound.
@@ -297,7 +297,7 @@ Cases 3 handles the "request hits wrong vMCP pod" scenario without re-initializi
 
 #### proxyrunner Routing
 
-The proxyrunner's sole routing concern is: given a session ID, which backend pod handles it? vMCP is responsible for ensuring each request arrives at the correct proxyrunner replica. With shared storage:
+The proxyrunner's sole routing concern is: given a session ID, which backend pod handles it? vMCP is responsible for ensuring each request has a valid session id. With shared storage:
 
 1. **Known session** (exists in local storage): Route to the backend pod (existing behavior).
 2. **Unknown session** (not in local storage): Look up in Redis.
@@ -350,15 +350,6 @@ spec:
 When `provider` is omitted or set to `memory`, existing local-storage behavior is preserved.
 
 
-### 4.6 Architectural Note: Why the Proxyrunner Layer Exists
-
-With vMCP taking responsibility for routing each request to the correct proxyrunner replica, it may appear that the proxyrunner is an unnecessary layer. It still provides meaningful value:
-
-1. **stdio protocol translation**: The proxyrunner translates `stdio`-based MCP server communication to SSE/streamable-http for network transport. This translation is unavoidable for `stdio` backends — there is no way to eliminate this layer for them.
-2. **Auth standardization**: The proxyrunner enforces authentication and authorization at the backend boundary, providing a consistent security layer regardless of how the backend MCP server handles auth.
-
-For `sse` and `streamable-http` backends, the proxyrunner is a thinner value-add, and it could in theory be conditionally removed for those transports — making those backends directly addressable by vMCP. That is a larger, riskier architectural change deferred to future work.
-
 ---
 
 ## 5. Requirements
@@ -377,13 +368,13 @@ The following requirements define the success criteria for this RFC.
 
 ### 5.2 proxyrunner Requirements
 
-- **R-PR-1**: The proxyrunner routes all requests within a session to the backend pod that initialized the session. There is no inter-proxyrunner request forwarding.
+- **R-PR-1**: The proxyrunner routes all requests within a session to the backend pod that initialized the session.
 - **R-PR-2**: The proxyrunner writes session metadata (session ID, backend pod name, backend pod URL) to the shared session store when a new backend session is initialized.
 - **R-PR-3**: The proxyrunner reads session metadata from the shared session store on a cache miss (session not in local memory) and routes accordingly.
 - **R-PR-4**: The number of backend StatefulSet replicas (MCPServer pods) per proxyrunner is configurable in the `MCPServer` CRD spec. The proxyrunner uses session-aware routing to distribute sessions across its backends.
 - **R-PR-5**: Multiple proxyrunner replicas serve a single `MCPServer`. vMCP is responsible for routing each session's requests to the correct proxyrunner replica.
 - **R-PR-6**: When Redis is not configured, the proxyrunner operates with local in-memory storage and single-replica semantics (no behavioral regression).
-- **R-VMCP-7**: proxyrunner has a limit on the number of in-memory sessions. Once hit, LRU caching removes the least active session from the in-memory state.
+- **R-PR-7**: proxyrunner has a limit on the number of in-memory sessions. Once hit, LRU caching removes the least active session from the in-memory state.
 
 ### 5.3 Operator Requirements
 
@@ -392,12 +383,15 @@ The following requirements define the success criteria for this RFC.
 - **R-OP-3**: The operator adds explicit replica fields to both CRDs: `VirtualMCPServer.spec.replicas` (vMCP pod count), `MCPServer.spec.replicas` (proxyrunner pod count, capped at 1 for `stdio` transport), and `MCPServer.spec.backendReplicas` (StatefulSet pod count). The reconciler must respect these fields and must not overwrite them. There is exactly one StatefulSet per `MCPServer`; `spec.backendReplicas` controls the pod count within that StatefulSet.
 - **R-OP-4**: if a user decides not to specify any replicas in the CRDs, whatever they set it to manually using kubectl scale --replicas=3 rs/foo or even if they use something like HPA, the Operator should not overwrite that field as we are not explicitly telling it to reconcile it.
 
+
 ### 5.4 Deployment Requirements
 
 - **R-DEP-1**: A single Redis instance (or Redis Sentinel / Cluster configuration) can be shared between vMCP session storage and proxyrunner session storage, as long as key prefixes are distinct.
 - **R-DEP-2**: Redis is an optional dependency. ToolHive must remain deployable without Redis, with single-replica semantics.
 - **R-DEP-3**: Manual scale-out of vMCP or proxyrunner (e.g., `kubectl scale deployment`) must not cause session disruption for active sessions.
 - **R-DEP-4**: Scale-in of backend StatefulSet pods (`spec.backendReplicas` decrease) is inherently disruptive — the backend session state lives in the removed process and cannot be reconstructed on another pod. Documentation must clearly state this. Graceful drain of backend pods is out of scope for this RFC. Proxyrunner scale-in (non-`stdio`) is an accepted, in-scope operation where no session loss is the expected outcome.
+- **R-DEP-5**: scaling in either the vMCP or the proxyrunner should not cause requests to fail. There should be a graceful shutdown of the finishing pods so inflight requests can be completed.
+- **R-DEP-6**: Redis must eventually garbage collect unused sessions. A long TTL that is refreshed when sessions are used is a viable solution here.
 
 ### 5.5 Security Requirements
 
