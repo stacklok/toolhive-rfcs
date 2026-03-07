@@ -20,17 +20,15 @@ The current composite tools system (`pkg/vmcp/composer/`) uses a declarative YAM
 - **Awkward data transformation**: Go templates are designed for text rendering, not data manipulation. Extracting a field from a JSON object, building a new map, or doing string formatting requires fighting the template syntax. Only three custom functions exist (`json`, `quote`, `fromJson`).
 - **No dynamic workflows**: The step graph is fully static. You cannot decide at runtime how many steps to execute or which tools to call based on intermediate results.
 - **`skip_remaining` is incomplete**: The elicitation `skip_remaining` action is documented but does not actually skip remaining steps (noted in code comments).
-- **V2 session incompatibility**: Composite tools are explicitly disabled in `SessionManagementV2` (`server.go:341-347`), limiting their availability as the system evolves.
 - **High implementation complexity for limited expressiveness**: The composer package is ~3,500 lines of Go across the DAG executor, template expander, output constructor, elicitation handler, state store, and validation — yet the resulting user-facing expressiveness is quite constrained.
 
 Users who need workflows beyond "call A then B then C" are stuck, and the declarative model cannot be extended to cover these cases without effectively reinventing a programming language inside YAML.
 
 ## Goals
 
-- Provide a scripting model for vMCP tool workflows that supports iteration, conditional branching, dynamic tool dispatch, and data transformation
+- Provide a scripting model for vMCP tool workflows that supports iteration, conditional branching, dynamic tool dispatch, parallel execution, and data transformation
 - Maintain the security properties of the existing system: sandboxed execution, resource limits, no arbitrary I/O
 - Run as a parallel system alongside existing composite tools during migration
-- Work with both V1 and V2 session management
 - Preserve the existing CRD and CLI config surface area (users still define tools in YAML/CRDs, but the workflow body is a script instead of a step list)
 - Keep the builtin API small and auditable
 
@@ -722,9 +720,8 @@ Both systems can coexist in the same vMCP instance — a server can have both co
 ### Migration Path
 
 1. **Phase 1**: Ship scripted tools as a parallel system. Both composite and scripted tools work.
-2. **Phase 2**: Document migration guide showing how to convert composite tool YAML to Starlark scripts. Provide an automated conversion tool for simple cases (linear step chains).
-3. **Phase 3**: Deprecate composite tools. Log a warning when `compositeTools` config is used.
-4. **Phase 4**: Remove composite tools code.
+2. **Phase 2**: Deprecate composite tools. Log a warning when `compositeTools` config is used.
+3. **Phase 3**: Remove composite tools code.
 
 ### Forward Compatibility
 
@@ -755,14 +752,7 @@ The Starlark engine is designed to be extensible:
 - Telemetry instrumentation (trace spans per builtin call)
 - E2E tests with real backend tool calls
 
-### Phase 3: Migration tooling and deprecation
-
-- Automated composite-to-starlark conversion tool for simple workflows
-- Migration guide documentation
-- Deprecation warnings for `compositeTools` config
-- Operator controller for `VirtualMCPScriptedToolDefinition` (validation, status reporting)
-
-### Phase 4: Cleanup
+### Phase 3: Cleanup
 
 - Remove `pkg/vmcp/composer/` package
 - Remove `VirtualMCPCompositeToolDefinition` CRD
@@ -783,7 +773,6 @@ The Starlark engine is designed to be extensible:
 - **End-to-end tests**: Scripted tool invocation via MCP client → vMCP → real backends
 - **Security tests**: Execution step limit enforcement, timeout enforcement, script size limits, `load()` path traversal prevention
 - **Performance tests**: Compare script execution overhead vs current DAG executor for equivalent workflows
-- **Fuzz tests**: Random Starlark programs to verify engine stability and limit enforcement
 
 ## Documentation
 
@@ -792,6 +781,7 @@ The Starlark engine is designed to be extensible:
 - Migration guide: Converting composite tools YAML to Starlark scripts
 - CRD reference: `VirtualMCPScriptedToolDefinition` spec
 - CLI documentation: Updated `task docs` output
+- Docs website: Update toolhive-docs with scripted tools user guide and builtin reference
 
 ## Open Questions
 
@@ -799,11 +789,7 @@ The Starlark engine is designed to be extensible:
 
 2. **Should we support a `scriptFile` reference to files on disk (CLI mode)?** This makes local development easier but adds a file-reading code path that needs security review. The alternative is inline scripts only for CLI and ConfigMap-backed scripts for K8s.
 
-3. **Should execution step limits be per-tool-call or per-script?** Per-script is simpler but a script calling many tools via `parallel` may legitimately need more steps. Per-tool-call is more granular but harder to configure.
-
-4. **What is the naming convention if we eventually deprecate the "composite" terminology?** Should these be "scripted tools", "workflow tools", "custom tools", or something else?
-
-5. **Should we expose `json.encode()` / `json.decode()` from the starlark-go json module, or provide custom builtins?** The starlark-go module is well-tested but uses Starlark-native types. Custom builtins could provide a more ergonomic API.
+3. ~~**What is the naming convention if we eventually deprecate the "composite" terminology?**~~ **Resolved**: Scripted and composite tools can be used interchangeably. The terms refer to the same concept — the implementation mechanism (declarative YAML vs Starlark script) is an implementation detail, not a user-facing distinction.
 
 ## References
 
