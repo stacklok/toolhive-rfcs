@@ -30,6 +30,7 @@ Users who need workflows beyond "call A then B then C" are stuck, and the declar
 - Run as a parallel system alongside existing composite tools during migration
 - Preserve the existing CRD and CLI config surface area (users still define tools in YAML/CRDs, but the workflow body is a script instead of a step list)
 - Keep the builtin API small and auditable
+- **Long-term**: Enable agents to dynamically compose and submit Starlark scripts to vMCP for execution, allowing agents to build their own multi-step workflows at runtime. This is out of scope for this RFC and would need its own design (trust boundaries, submission API, per-agent sandboxing limits), but the choice of Starlark as a sandboxed scripting language makes this feasible in a way that a declarative YAML DSL never could.
 
 ## Non-Goals
 
