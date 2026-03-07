@@ -156,6 +156,214 @@ The Starlark engine is a new package (`pkg/vmcp/starlark/`) that:
 
 It reuses existing infrastructure: the router for tool dispatch, the backend client for MCP calls, the elicitation handler for user interaction, and the audit logger for observability.
 
+### Examples
+
+> **Dict vs struct access in Starlark**
+>
+> The examples below use two access patterns:
+> - **`foo["bar"]`** (dict indexing) — used for tool results. Backend tool output is a Go `map[string]any` converted to a Starlark dict. Accessing a missing key raises an error; use `foo.get("bar", default)` for optional fields.
+> - **`foo.bar`** (attribute access) — used for builtin return values. `try_call_tool` and `elicit` return Starlark structs with fixed fields (`.ok`, `.error`, `.output`, `.action`, `.content`). These are not dicts — you cannot index them with `["bar"]`.
+>
+> Rule of thumb: data from backends is a dict, data from builtins is a struct.
+
+#### Working with structured data from tool results
+
+When a backend tool returns structured content (via MCP's `structuredContent` field), the engine converts it to a native Starlark dict. Fields are accessed directly:
+
+```python
+def run(params):
+    # call_tool returns a dict when the backend provides structuredContent
+    user = call_tool("get_user", {"id": params["user_id"]})
+
+    # Access nested fields directly — no parsing needed
+    full_name = user["first_name"] + " " + user["last_name"]
+    email = user["contact"]["email"]
+
+    # Filter, transform, build new structures
+    active_roles = [r for r in user["roles"] if r["status"] == "active"]
+    role_names = [r["name"] for r in active_roles]
+
+    return {
+        "name": full_name,
+        "email": email,
+        "active_roles": role_names,
+        "is_admin": "admin" in role_names,
+    }
+```
+
+#### Returning structured data
+
+A script's return value (a dict) becomes the MCP `CallToolResult` sent to the client. vMCP sets the result's `structuredContent` to the returned dict and also generates a text representation in the `content` array for clients that don't support structured content:
+
+```python
+def run(params):
+    orders = call_tool("list_orders", {"customer_id": params["customer_id"]})
+
+    total = 0
+    for order in orders["items"]:
+        total += order["amount"]
+
+    # This dict becomes structuredContent in the MCP response.
+    # vMCP also generates a text content item with a JSON serialization
+    # for backward compatibility with clients that only read content[].
+    return {
+        "customer_id": params["customer_id"],
+        "order_count": len(orders["items"]),
+        "total_amount": total,
+        "currency": orders["currency"],
+    }
+```
+
+The MCP client receives:
+
+```json
+{
+    "structuredContent": {
+        "customer_id": "cust_123",
+        "order_count": 3,
+        "total_amount": 450.00,
+        "currency": "USD"
+    },
+    "content": [
+        {
+            "type": "text",
+            "text": "{\"customer_id\": \"cust_123\", \"order_count\": 3, ...}"
+        }
+    ]
+}
+```
+
+#### Handling JSON-as-string from legacy MCP servers
+
+Older MCP servers that predate structured content support return tool results as a JSON string inside a `content[0].text` field. The engine surfaces this as a dict with a single `"text"` key. Use `json.decode()` to parse it:
+
+```python
+load("json.star", "json")
+
+def run(params):
+    # Legacy server returns: content: [{type: "text", text: '{"temp": 72, "unit": "F"}'}]
+    # The engine converts this to: {"text": '{"temp": 72, "unit": "F"}'}
+    raw = call_tool("legacy_weather", {"city": params["city"]})
+
+    # Parse the JSON string into a usable dict
+    weather = json.decode(raw["text"])
+
+    return {
+        "city": params["city"],
+        "temperature": weather["temp"],
+        "unit": weather["unit"],
+    }
+```
+
+#### Fan-out with parallel
+
+Call the same tool for each item in a list concurrently using the `parallel` builtin:
+
+```python
+def run(params):
+    # Build a list of zero-argument callables, one per city.
+    # Each lambda captures its own copy of `city` via the default argument.
+    lookups = [
+        lambda city=city: call_tool("weather_lookup", {"city": city})
+        for city in params["cities"]
+    ]
+
+    # Execute all lookups concurrently (up to 10 in parallel).
+    # Results are returned in the same order as the input list.
+    results = parallel(lookups)
+
+    # Post-process: find cities with extreme heat
+    alerts = []
+    for i, city in enumerate(params["cities"]):
+        if results[i]["temperature"] > 35:
+            alerts.append(city)
+
+    if alerts:
+        call_tool("send_alert", {
+            "message": "Extreme heat in: " + ", ".join(alerts),
+            "severity": "high",
+        })
+
+    return {"results": results, "alerts": alerts}
+```
+
+#### Error handling patterns
+
+A single workflow showing `call_tool` (halt on error), `try_call_tool` (handle errors), and `retry` (transient failures):
+
+```python
+def run(params):
+    # 1. call_tool: halt on error (the default, safe path).
+    #    If get_account fails, the entire workflow stops and the
+    #    client receives a failed CallToolResult with the error.
+    account = call_tool("get_account", {"id": params["account_id"]})
+
+    # 2. try_call_tool: optional enrichment that may fail.
+    #    We don't want a missing credit score to block the workflow.
+    credit = try_call_tool("get_credit_score", {"ssn": account["ssn"]})
+    credit_score = credit.output["score"] if credit.ok else None
+
+    # 3. retry: call an external API that has transient failures.
+    #    Retries up to 3 times with exponential backoff starting at 2s.
+    risk = retry(
+        lambda: call_tool("risk_assessment", {
+            "account": account,
+            "credit_score": credit_score,
+        }),
+        max_attempts=3,
+        delay="2s",
+    )
+
+    return {
+        "account_id": params["account_id"],
+        "risk_level": risk["level"],
+        "credit_available": credit.ok,
+        "credit_score": credit_score,
+    }
+```
+
+#### Elicitation (human-in-the-loop)
+
+Prompt the user for a decision mid-workflow using the MCP elicitation protocol:
+
+```python
+def run(params):
+    analysis = call_tool("analyze_transaction", {
+        "transaction_id": params["transaction_id"],
+    })
+
+    if analysis["risk_score"] > 80:
+        # Ask the user whether to proceed. elicit() never halts —
+        # it returns the user's decision as a struct.
+        decision = elicit(
+            "High-risk transaction detected (score: %d). Approve?" % analysis["risk_score"],
+            schema={
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Reason for decision"},
+                },
+            },
+        )
+
+        if decision.action == "decline":
+            call_tool("flag_transaction", {
+                "transaction_id": params["transaction_id"],
+                "reason": decision.content.get("reason", "Declined by reviewer"),
+            })
+            return {"status": "declined", "reason": decision.content.get("reason", "")}
+
+        if decision.action == "cancel":
+            return {"status": "cancelled"}
+
+        # decision.action == "accept" — fall through to processing
+
+    result = call_tool("process_transaction", {
+        "transaction_id": params["transaction_id"],
+    })
+
+    return {"status": "processed", "result": result}
+```
+
 ### Detailed Design
 
 #### Configuration Model
