@@ -396,3 +396,254 @@ The following requirements define the success criteria for this RFC.
 ### 5.5 Security Requirements
 
 - **R-SEC-1**: vMCP's session hijack prevention mechanism continues to function. A session initialized on one vMCP pod cannot be hijacked by a request hitting another vMCP pod.
+
+---
+
+## 6. Required Changes
+
+This section catalogs the concrete code changes needed to implement the design described above, organized by component and mapped back to the requirements in §5.
+
+### 6.1 CRD and Operator Changes
+
+#### RC-1: Add replica and session storage fields to `MCPServer` CRD
+
+**File**: `cmd/thv-operator/api/v1alpha1/mcpserver_types.go`
+
+Add three new fields to `MCPServerSpec`:
+
+- `Replicas *int32` — proxyrunner Deployment pod count. When nil, the operator omits `spec.replicas` from the Deployment, allowing external scaling (kubectl scale, HPA) to set the value freely. The reconciler caps this at 1 for `stdio` transport.
+- `BackendReplicas *int32` — StatefulSet pod count for the MCP server backend. When nil, omitted from the StatefulSet spec (same defer-to-external behavior). Passed to the proxyrunner via RunConfig so it can apply the value during server-side apply.
+- `SessionStorage *SessionStorageConfig` — optional Redis connection configuration for externalizing session state. Uses a new shared type (`SessionStorageConfig`) with `provider` (memory|redis) and a `redis` sub-struct containing `address`, `db`, `keyPrefix`, and `passwordRef` (SecretKeyRef).
+
+**Current state**: No replica or session storage fields exist. Replicas are hardcoded to 1 in `deploymentForMCPServer()`. The `ReadyReplicas` status field already exists.
+
+**Satisfies**: R-OP-3, R-PR-6, R-DEP-2
+
+#### RC-2: Add replica and session storage fields to `VirtualMCPServer` CRD
+
+**File**: `cmd/thv-operator/api/v1alpha1/virtualmcpserver_types.go`
+
+Add two new fields to `VirtualMCPServerSpec`:
+
+- `Replicas *int32` — vMCP Deployment pod count. When nil, the operator omits `spec.replicas` from the Deployment, allowing external scaling to set the value freely.
+- `SessionStorage *SessionStorageConfig` — same shared type as in RC-1. Optional Redis connection configuration for externalizing vMCP session state.
+
+**Current state**: No replica or session storage fields exist. Replicas are hardcoded to 1 in `deploymentForVirtualMCPServer()`.
+
+**Satisfies**: R-OP-3, R-VMCP-4, R-DEP-2
+
+#### RC-3: Update `MCPServer` reconciler to respect replica fields
+
+**File**: `cmd/thv-operator/controllers/mcpserver_controller.go`
+
+Two changes in `deploymentForMCPServer()` and the reconcile loop:
+
+- **Deployment creation**: When `spec.replicas` is non-nil, use that value for `Spec.Replicas` instead of hardcoded `int32(1)`. When nil, omit `Spec.Replicas` from the Deployment spec entirely (Kubernetes defaults to 1, but external tooling like HPA can set it freely without being overwritten).
+- **Stdio cap enforcement**: The existing logic (~line 392) that caps `stdio` Deployments to 1 replica remains. If `spec.replicas > 1` and `spec.transport == "stdio"`, the reconciler should reject or cap it with a status condition explaining why.
+- **BackendReplicas passthrough**: Add `spec.backendReplicas` to the proxyrunner's RunConfig (serialized into the ConfigMap). The proxyrunner reads this value and uses it in its server-side apply of the StatefulSet instead of hardcoded 1.
+- **Session storage validation**: If `spec.replicas > 1` and `spec.sessionStorage` is not configured (or set to `memory`), the reconciler should reject the configuration with a status condition warning that multi-replica deployments require external session storage to avoid silent session failures.
+
+**Current state**: `deploymentForMCPServer()` hardcodes `replicas := int32(1)`. The update path already preserves `Spec.Replicas` (does not overwrite on reconcile). Stdio cap enforcement already exists. RunConfig has no `backendReplicas` field.
+
+**Satisfies**: R-OP-3, R-OP-4, R-DEP-3
+
+#### RC-4: Update `VirtualMCPServer` reconciler to respect replica field
+
+**File**: `cmd/thv-operator/controllers/virtualmcpserver_deployment.go`
+
+- **Deployment creation**: When `spec.replicas` is non-nil, use that value for `Spec.Replicas` instead of hardcoded `int32(1)`. When nil, omit `Spec.Replicas` entirely.
+- The update path already preserves `Spec.Replicas` (does not overwrite on reconcile) — no change needed there.
+- **Session storage validation**: If `spec.replicas > 1` and `spec.sessionStorage` is not configured (or set to `memory`), the reconciler should reject the configuration with a status condition warning that multi-replica deployments require external session storage to avoid silent session failures.
+
+**Current state**: `deploymentForVirtualMCPServer()` hardcodes `replicas := int32(1)`.
+
+**Satisfies**: R-OP-3, R-OP-4, R-VMCP-5
+
+#### RC-5: Inject Redis configuration into proxyrunner and vMCP pods
+
+**Files**: `cmd/thv-operator/controllers/mcpserver_controller.go`, `cmd/thv-operator/controllers/virtualmcpserver_deployment.go`
+
+When `spec.sessionStorage` is configured with `provider: redis`, the operator must inject the Redis connection details into the pod:
+
+- **Address, DB, keyPrefix**: Added to the RunConfig (proxyrunner) or vmcp config ConfigMap (vMCP) so they are available at startup.
+- **Password**: Injected as an environment variable sourced from the `passwordRef` SecretKeyRef (e.g., `THV_SESSION_REDIS_PASSWORD`). This follows the established pattern used for OIDC client secrets and token exchange secrets.
+
+When `sessionStorage` is not set or `provider` is `memory`, no Redis-related config is injected.
+
+**Current state**: No session storage config injection exists. The env-var-from-SecretKeyRef pattern is already used for OIDC and auth server credentials. A comment in `buildEnvVarsForVmcp` explicitly notes this extension point: _"Other secrets (Redis passwords, service account credentials) may be added here in the future."_
+
+**Satisfies**: R-OP-1, R-DEP-1, R-DEP-2
+
+### 6.2 Transport Session Layer Changes
+
+#### RC-6: Implement Redis `Storage` backend for `pkg/transport/session`
+
+**File**: New file `pkg/transport/session/storage_redis.go`
+
+Implement the `Storage` interface backed by Redis:
+
+- `Store`: Serialize the session to JSON (using the existing `serializeSession` function already prepared in `serialization.go`) and write to Redis with the configured key prefix and TTL. Each `Store` call sets (or resets) the key's TTL, so actively-used sessions are kept alive.
+- `Load`: Read from Redis, deserialize via `deserializeSession`, and return the `Session`. Returns `ErrSessionNotFound` when the key does not exist.
+- `Delete`: Remove the key from Redis.
+- `DeleteExpired`: No-op — Redis TTLs handle expiry natively.
+- `Close`: Close the Redis client connection.
+
+The constructor accepts the Redis connection config (address, password, DB, key prefix) and returns a `Storage` interface. The serialization layer persists only the metadata fields (ID, type, timestamps, metadata map) — not runtime state like live HTTP connections or message channels. This is consistent with the two-layer model described in the RFC: the metadata layer is serializable; the runtime layer is node-local.
+
+**TTL refresh for garbage collection**: Today, `session.Manager.Get()` calls `Touch()` on the session, which updates `UpdatedAt`. After touching, the manager must call `Storage.Store()` to persist the updated timestamp back to Redis — this resets the key's TTL. Sessions that are never accessed will naturally expire via Redis TTL, providing garbage collection without an explicit cleanup loop. The TTL value should match the session TTL configured on the manager.
+
+**Current state**: Only `LocalStorage` (in-process `sync.Map`) exists. `serialization.go` contains `serializeSession`/`deserializeSession` functions marked as unused, explicitly tagged for Phase 4 Redis/Valkey support.
+
+**Satisfies**: R-PR-2, R-PR-3, R-PR-6, R-VMCP-2, R-VMCP-4, R-DEP-6
+
+#### RC-7: Wire storage backend selection into `session.Manager`
+
+**File**: `pkg/transport/session/manager.go`
+
+Add a constructor or factory function that selects the `Storage` backend based on configuration:
+
+- When Redis config is provided: create `RedisStorage` (from RC-6) and pass it to `NewManagerWithStorage`.
+- When no Redis config is provided: use `NewLocalStorage()` (existing default behavior via `NewManager`).
+
+`NewManagerWithStorage(ttl, factory, storage)` already exists as the extension point — this change wires it into the startup path for both vMCP and proxyrunner based on the injected session storage configuration.
+
+**Current state**: `NewManager(ttl, factory)` always creates `NewLocalStorage()`. `NewManagerWithStorage` exists but is never called in production code.
+
+**Satisfies**: R-PR-6, R-VMCP-4, R-DEP-2
+
+### 6.3 vMCP Changes
+
+#### RC-8: Persist vMCP session metadata to Redis on session creation
+
+**File**: `pkg/vmcp/session/factory.go`
+
+In `defaultMultiSessionFactory.makeSession()`, after backend initialization and routing table construction, the factory already writes metadata keys (`MetadataKeyBackendIDs`, `MetadataKeyTokenHash`, `MetadataKeyTokenSalt`) to the embedded `transportsession.Session`. This metadata is what gets persisted when the `session.Manager` calls `Storage.Store()`.
+
+The change: ensure the `backends` array described in §4.2 is fully represented in the session metadata. Specifically, each backend's `workload_id` and `backend_session_id` must be written as serializable metadata so that Redis contains enough information for another vMCP pod to reconstruct the session routing (RC-9).
+
+Today, `MetadataKeyBackendIDs` stores connected backend IDs, and `backendSessions` (workload ID → backend session ID) is held in the `defaultMultiSession` struct but is not written to the metadata map. The `backend_session_id` values must be added to the metadata layer.
+
+**Current state**: `backendSessions map[string]string` is a field on `defaultMultiSession` but is not persisted to the metadata map. Only `MetadataKeyBackendIDs` (a comma-separated list of connected workload IDs) is written.
+
+**Satisfies**: R-VMCP-2, R-VMCP-3
+
+#### RC-9: Reconstruct vMCP sessions from Redis on cache miss
+
+**Files**: `pkg/vmcp/server/sessionmanager/session_manager.go`, `pkg/vmcp/session/factory.go`
+
+When a vMCP pod receives a request with an `Mcp-Session-Id` that is not in its local `session.Manager`, it must attempt to load the session from Redis and reconstruct the runtime layer. This is case 3 from §4.3 (vMCP routing).
+
+Add a `RestoreSession` method to the `MultiSessionFactory` interface (implemented on `defaultMultiSessionFactory`). Unlike `MakeSession` which performs full initialization (sends `initialize` to all backends), `RestoreSession` accepts the persisted session metadata and reconstructs the runtime layer:
+
+1. `session.Manager.Get(id)` returns not-found from local storage.
+2. Load the session record from Redis via the `Storage` interface. The record contains the `backends` array (workload IDs and backend session IDs) plus hijack-prevention metadata (token hash, token salt).
+3. Call `factory.RestoreSession(ctx, sessionID, metadata)` which:
+   - Re-creates backend HTTP connections by calling the `backendConnector` for each backend in the array, passing the existing `backend_session_id` so the proxyrunner knows this is a resumed session (not a new `initialize`).
+   - Rebuilds the routing table from the newly-fetched backend capabilities.
+   - Re-applies the `HijackPreventionDecorator` using the persisted token hash/salt.
+4. Store the reconstructed `MultiSession` in the local `session.Manager` for subsequent requests.
+
+This is a one-time cost per session per pod — after reconstruction, subsequent requests use the local in-memory session.
+
+**Current state**: `session.Manager.Get()` only checks local storage. There is no fallback to Redis or any reconstruction logic. The factory's `MakeSession` always performs full initialization (sends `initialize` to all backends). No `RestoreSession` method exists.
+
+**Satisfies**: R-VMCP-1, R-VMCP-5, R-VMCP-6
+
+#### RC-10: Add LRU eviction to vMCP in-memory session cache
+
+**File**: `pkg/vmcp/server/sessionmanager/session_manager.go`
+
+Add a configurable upper bound on the number of `MultiSession` objects held in local memory. When the limit is reached, the least-recently-used session is evicted from the local `session.Manager` (its backend connections are closed). The session metadata remains in Redis, so a future request for the evicted session triggers reconstruction via `factory.RestoreSession` (RC-9).
+
+This prevents unbounded memory growth when a vMCP pod handles many sessions over time — especially important when sessions are reconstructed from Redis after scale-in events route traffic from removed pods.
+
+**Current state**: No eviction policy exists. All sessions remain in memory until TTL expiry.
+
+**Satisfies**: R-VMCP-7
+
+#### RC-16: Update Redis metadata when backend sessions expire within a vMCP session
+
+**Files**: `pkg/vmcp/session/default_session.go`, `pkg/vmcp/server/sessionmanager/session_manager.go`
+
+When an individual backend session within a `MultiSession` expires or is lost (e.g., the proxyrunner returns an error indicating the backend session is no longer valid, or the backend connection is closed), the vMCP must update the session's `backends` array in Redis to reflect the change. Without this, another vMCP pod reconstructing the session via `factory.RestoreSession` (RC-9) would attempt to reconnect to a backend session that no longer exists, causing unnecessary errors and latency.
+
+This means backend removal/expiry must trigger a write-back of the updated metadata to the `session.Manager` (which persists to Redis via `Storage.Store()`). The `backendSessions` map and `MetadataKeyBackendIDs` must both be updated atomically with the local state change.
+
+**Current state**: Backend session failures are handled locally (the connection is removed or the call returns an error), but no metadata is updated. Since sessions are only held in-memory today, there is no external state to synchronize.
+
+**Satisfies**: R-VMCP-1, R-VMCP-2
+
+### 6.4 Proxyrunner Changes
+
+#### RC-11: Make StatefulSet replica count configurable in proxyrunner
+
+**File**: `pkg/container/kubernetes/client.go`
+
+In `DeployWorkload()`, the StatefulSet is created via server-side apply with `WithReplicas(1)` hardcoded. Change this to read the `backendReplicas` value from the RunConfig (passed through from the CRD via RC-3). When the value is nil/absent, omit `WithReplicas` from the apply configuration so that the proxyrunner does not own the `replicas` field — allowing external tooling (HPA, kubectl scale) to manage it without being overwritten on the next server-side apply cycle.
+
+All proxyrunner replicas for a given `MCPServer` share the same StatefulSet and use the same field manager (`toolhive-container-manager`), so they converge on the same desired replica count without conflict.
+
+**Current state**: `WithReplicas(1)` is hardcoded. The proxyrunner has no mechanism to receive a desired backend replica count.
+
+**Satisfies**: R-OP-3 (backend replicas), R-PR-4
+
+#### RC-12: Add session-aware routing to backend pods in proxyrunner
+
+**Files**: `pkg/transport/proxy/streamable/streamable_proxy.go`, `pkg/transport/proxy/httpsse/http_proxy.go`, `pkg/transport/proxy/transparent/transparent_proxy.go`
+
+Today, each proxy type forwards all requests to a single `targetURI` (the headless service DNS name). With multiple StatefulSet pods, the proxy must route to the specific pod that owns the session.
+
+Changes:
+
+- **On session initialization** (`initialize` request or first SSE connection): The proxyrunner selects a backend pod (e.g., round-robin or least-connections across StatefulSet pods) and records the mapping `session_id → backend_pod + backend_url` in Redis (per the record format in §4.2). The `backend_url` uses the StatefulSet pod's stable DNS name (e.g., `http://<name>-<ordinal>.<headless-svc>.<ns>.svc.cluster.local:<port>`).
+- **On subsequent requests**: Look up the session in local memory first. On cache miss, query Redis for the `backend_url`. Route the request to that specific pod URL instead of the headless service.
+- **On session not found** (neither local nor Redis): Return `400 Bad Request`.
+
+This requires the proxy layer to support per-request target URL override rather than always using the fixed `targetURI`. The transparent proxy (`httputil.ReverseProxy`) can achieve this by setting the `Director` function to rewrite the target per-request based on session lookup. The SSE and streamable proxies need analogous routing logic.
+
+**Current state**: All three proxy types route to a single `targetURI` set at startup. No per-session routing exists. Session IDs are tracked only for client correlation (SSE) or request/response matching (streamable), not for backend pod selection.
+
+**Satisfies**: R-PR-1, R-PR-2, R-PR-3, R-PR-4
+
+#### RC-13: Add LRU eviction to proxyrunner in-memory session cache
+
+**Files**: `pkg/transport/proxy/streamable/streamable_proxy.go`, `pkg/transport/proxy/httpsse/http_proxy.go`
+
+Same pattern as RC-10 but for the proxyrunner layer. Add a configurable upper bound on in-memory sessions. When the limit is reached, the least-recently-used session is evicted from local memory. The session metadata remains in Redis, so a subsequent request for the evicted session triggers a Redis lookup (RC-12) and routes to the correct backend pod.
+
+**Current state**: No eviction policy exists. All sessions remain in memory until TTL expiry.
+
+**Satisfies**: R-PR-7
+
+### 6.5 Operational Changes
+
+#### RC-14: Graceful shutdown for vMCP and proxyrunner pods
+
+**Files**: `pkg/vmcp/server/server.go`, `cmd/thv-proxyrunner/main.go` (or equivalent entrypoint), operator Deployment specs
+
+When a pod is terminated (scale-in, rolling update), in-flight requests must be allowed to complete rather than being dropped. Two changes:
+
+- **SIGTERM handling**: Both vMCP and proxyrunner must handle SIGTERM by stopping acceptance of new requests and draining in-flight requests before exiting. For vMCP, the `AdmissionQueue` already provides `CloseAndDrain()` which blocks until in-flight operations complete — this mechanism needs to be wired into the shutdown signal handler for each active session. For the proxyrunner, a similar drain of active proxy connections is needed.
+- **`terminationGracePeriodSeconds`**: The operator should set an appropriate value on the pod spec for both vMCP and proxyrunner Deployments (default Kubernetes value is 30s, which may need to be increased for long-running MCP tool calls).
+
+**Current state**: No explicit graceful shutdown handling for scale-in scenarios. The `AdmissionQueue.CloseAndDrain()` exists on `defaultMultiSession` but is only called during explicit session `Close()`, not during pod-level shutdown.
+
+**Satisfies**: R-DEP-5
+
+### 6.6 Security Changes
+
+#### RC-15: Persist hijack-prevention state for cross-pod session validation
+
+**File**: `pkg/vmcp/session/factory.go`, `pkg/vmcp/session/hijack_prevention_decorator.go`
+
+The `HijackPreventionDecorator` binds a session to a token via HMAC-SHA256(secret, salt || token). The `boundTokenHash` and `tokenSalt` are already written to the session metadata map (`MetadataKeyTokenHash`, `MetadataKeyTokenSalt`), so they are persisted to Redis via RC-6/RC-8.
+
+When `factory.RestoreSession` (RC-9) reconstructs a session on a different vMCP pod, it must:
+
+- Read `tokenHash` and `tokenSalt` from the persisted metadata.
+- Re-apply the `HijackPreventionDecorator` with those values so that the same token-binding validation runs on the new pod.
+- The HMAC secret must be consistent across all vMCP replicas. Today, the secret is passed to the factory via `WithHMACSecret`. All replicas of the same `VirtualMCPServer` Deployment share the same pod spec and therefore the same secret — no additional change is needed for secret distribution.
+
+**Current state**: Token hash and salt are already persisted in session metadata. The decorator is applied at session creation but there is no path to re-apply it during session reconstruction. The HMAC secret is already consistent across replicas (same Deployment spec).
+
+**Satisfies**: R-SEC-1
