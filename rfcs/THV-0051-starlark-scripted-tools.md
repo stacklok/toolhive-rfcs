@@ -158,13 +158,13 @@ It reuses existing infrastructure: the router for tool dispatch, the backend cli
 
 ### Examples
 
-> **Dict vs struct access in Starlark**
->
-> The examples below use two access patterns:
-> - **`foo["bar"]`** (dict indexing) — used for tool results. Backend tool output is a Go `map[string]any` converted to a Starlark dict. Accessing a missing key raises an error; use `foo.get("bar", default)` for optional fields.
-> - **`foo.bar`** (attribute access) — used for builtin return values. `try_call_tool` and `elicit` return Starlark structs with fixed fields (`.ok`, `.error`, `.output`, `.action`, `.content`). These are not dicts — you cannot index them with `["bar"]`.
->
-> Rule of thumb: data from backends is a dict, data from builtins is a struct.
+**Dict vs struct access in Starlark**
+
+The examples below use two access patterns:
+ - **`foo["bar"]`** (dict indexing) — used for tool results. Backend tool output is a Go `map[string]any` converted to a Starlark dict. Accessing a missing key raises an error; use `foo.get("bar", default)` for optional fields.
+ - **`foo.bar`** (attribute access) — used for builtin return values. `try_call_tool` and `elicit` return Starlark structs with fixed fields (`.ok`, `.error`, `.output`, `.action`, `.content`). These are not dicts — you cannot index them with `["bar"]`.
+
+ Rule of thumb: data from backends is a dict, data from builtins is a struct.
 
 #### Working with structured data from tool results
 
