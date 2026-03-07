@@ -18,7 +18,6 @@ The current composite tools system (`pkg/vmcp/composer/`) uses a declarative YAM
 - **No iteration**: There is no way to loop over a result set (e.g., "for each item returned by tool A, call tool B"). The DAG model requires steps to be statically declared at definition time.
 - **Limited conditional logic**: The `condition` field evaluates a template to `true`/`false` to skip a step entirely, but there is no if/else branching where different steps execute on different branches.
 - **Awkward data transformation**: Go templates are designed for text rendering, not data manipulation. Extracting a field from a JSON object, building a new map, or doing string formatting requires fighting the template syntax. Only three custom functions exist (`json`, `quote`, `fromJson`).
-- **No dynamic workflows**: The step graph is fully static. You cannot decide at runtime how many steps to execute or which tools to call based on intermediate results.
 - **`skip_remaining` is incomplete**: The elicitation `skip_remaining` action is documented but does not actually skip remaining steps (noted in code comments).
 - **High implementation complexity for limited expressiveness**: The composer package is ~3,500 lines of Go across the DAG executor, template expander, output constructor, elicitation handler, state store, and validation — yet the resulting user-facing expressiveness is quite constrained.
 
@@ -431,7 +430,7 @@ The Go-side `load` handler:
 2. Caches loaded modules to avoid re-parsing
 3. Detects import cycles
 4. Only allows loading `.star` files — no dynamic module names, no absolute paths
-5. Loaded modules cannot access builtins like `call_tool` — they are pure functions only (data transformation, formatting, validation)
+5. Loaded modules have access to the same builtins (`call_tool`, `elicit`, etc.) as the main script, enabling reusable sub-workflows
 
 For Kubernetes, shared libraries are stored in ConfigMaps referenced by the `VirtualMCPServer`:
 
@@ -672,7 +671,7 @@ The existing audit infrastructure (`pkg/vmcp/audit/`) is reused. Scripts can als
 | Memory exhaustion | Execution step limit acts as indirect memory bound; monitor memory usage at the Go level |
 | Tool call amplification | Per-script timeout, future: per-user rate limiting (same TODO as current composer) |
 | Data exfiltration | Backend tools are defined by admins, not scripts. Scripts can only call tools that exist in the routing table. Cedar policies control which tools are available. |
-| Supply chain (shared libs) | Libraries are loaded from admin-controlled paths only. Libraries cannot access builtins (`call_tool` etc.) — they are pure functions. |
+| Supply chain (shared libs) | Libraries are loaded from admin-controlled paths only (no user-supplied paths). Same trust model as the main script — the admin controls both. |
 | Script injection | Scripts are defined by administrators in YAML/CRDs, not by end users. Input parameters are passed as structured data, not string-interpolated into script source. |
 
 ## Alternatives Considered
@@ -785,11 +784,7 @@ The Starlark engine is designed to be extensible:
 
 ## Open Questions
 
-1. **Should libraries have access to a restricted set of builtins?** Currently proposed as pure-function-only (no `call_tool` in loaded modules). This prevents composable sub-workflows but simplifies the security model. Should we allow a `@builtin_access` annotation or similar?
-
-2. **Should we support a `scriptFile` reference to files on disk (CLI mode)?** This makes local development easier but adds a file-reading code path that needs security review. The alternative is inline scripts only for CLI and ConfigMap-backed scripts for K8s.
-
-3. ~~**What is the naming convention if we eventually deprecate the "composite" terminology?**~~ **Resolved**: Scripted and composite tools can be used interchangeably. The terms refer to the same concept — the implementation mechanism (declarative YAML vs Starlark script) is an implementation detail, not a user-facing distinction.
+1. ~~**What is the naming convention if we eventually deprecate the "composite" terminology?**~~ **Resolved**: Scripted and composite tools can be used interchangeably. The terms refer to the same concept — the implementation mechanism (declarative YAML vs Starlark script) is an implementation detail, not a user-facing distinction.
 
 ## References
 
