@@ -1,6 +1,6 @@
-# THV-0051: Manual Horizontal Scaling for vMCP and Proxy Runner
+# THV-0047: Manual Horizontal Scaling for vMCP and Proxy Runner
 
-- **Status**: Draft
+- **Status**: In Review
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
 - **Created**: 2026-03-04
 - **Last Updated**: 2026-03-07
