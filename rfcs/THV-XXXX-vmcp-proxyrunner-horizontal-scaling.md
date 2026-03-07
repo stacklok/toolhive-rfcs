@@ -1,4 +1,4 @@
-# THV-XXXX: Horizontal Scaling for vMCP and Proxy Runner
+# THV-XXXX: Manual Horizontal Scaling for vMCP and Proxy Runner
 
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
@@ -9,6 +9,7 @@
   - [toolhive#3986](https://github.com/stacklok/toolhive/pull/3986) - Enable sticky sessions on operator-created Services
   - [toolhive#3992](https://github.com/stacklok/toolhive/pull/3992) - Add ClusterIP service with SessionAffinity for MCP server backend
   - [THV-0038](https://github.com/stacklok/toolhive-rfcs/blob/main/rfcs/THV-0038-session-scoped-client-lifecycle.md) - Session-Scoped Client Lifecycle for vMCP
+  - [toolhive#1589](https://github.com/stacklok/toolhive/issues/1589) - Scaling stdio within k8s.
 
 ## Summary
 
@@ -83,7 +84,7 @@ The `session.go` documentation in the codebase is explicit about the distributed
 >
 > A `MultiSession` uses a two-layer storage model:
 > - **Runtime layer** (in-process only): backend HTTP connections, routing table, and capability lists. These cannot be serialized and are lost when the process exits. Sessions are therefore node-local.
-> - **Metadata layer** (serializable): identity subject, connected backend IDs, and backend session IDs are written to the embedded `transportsession.Session` so that pluggable `transportsession.Storage` backends (e.g. Redis) can persist them.
+> - **Metadata layer** (serializable): connected backend IDs, and backend session IDs are written to the embedded `transportsession.Session` so that pluggable `transportsession.Storage` backends (e.g. Redis) can persist them.
 
 This two-layer design is the key insight for this RFC: we can persist enough metadata to route any request to the correct pod, even if we cannot migrate the full session runtime.
 
@@ -128,7 +129,8 @@ When `vmcp` runs with more than one replica, an inbound request carrying an `Mcp
 
 1. It cannot look up the routing table (which tool → which proxyrunner)
 2. It cannot reuse the backend HTTP clients associated with the session
-3. It would have to re-initialize the session from scratch — a destructive operation that creates entirely new backend sessions, discards all in-progress state, and requires the client to restart its workflow
+3. It would have to re-initialize the session from scratch — a destructive operation that creates entirely new backend sessions, discards all in-progress state, and requires the client to restart its workflow.
+
 
 This applies equally to SSE and streamable-http sessions.
 
@@ -175,7 +177,7 @@ For `SSE` and `streamable-http`, the session exists as a logical identifier (`Mc
   - `MCPServer.spec.backendReplicas` — number of pods in the shared MCP server StatefulSet. There is exactly **one StatefulSet per `MCPServer`**, shared by all proxyrunner replicas (see §3.2).
 - **Operator reconciler changes**: The operator must respect and preserve the new replica fields rather than hardcoding 1. The reconciler must stop overwriting manually-set replica counts.
 - **Horizontal scale-out of `vmcp`**: Multiple vMCP replicas should be able to serve any request, regardless of which replica initialized the session. vMCP reads session routing metadata from shared storage to determine the correct proxyrunner, then proxies the request there.
-- **Horizontal scale-out of `thv-proxyrunner`**: A single `MCPServer` is backed by multiple proxyrunner replicas sharing one StatefulSet. Each replica handles new sessions independently; existing sessions remain pinned to the replica that initialized them. Session metadata in shared storage allows any replica to look up which backend pod a given session belongs to.
+- **Horizontal scale-out of `thv-proxyrunner`**: A single `MCPServer` is backed by multiple proxyrunner replicas sharing one StatefulSet. Session metadata in shared storage allows any replica to look up which backend pod a given session belongs to.
 - **Transport coverage**: `SSE` and `streamable-http` transports at both layers.
 - **Manual scale-out without session disruption**: Changing replica counts in either CRD must not disrupt existing sessions. New requests may be routed to new replicas; existing sessions continue to route via the pod that initialized them.
 - **Safe vMCP scale-in**: When a vMCP replica is removed, sessions previously handled by it can be served by remaining replicas using session metadata from Redis. vMCP scale-in is safe because the session runtime can be reconstructed from persisted metadata.
@@ -185,11 +187,13 @@ For `SSE` and `streamable-http`, the session exists as a logical identifier (`Mc
 ### 3.2 Out of Scope
 
 - **`stdio` transport scaling**: The proxyrunner's attachment to the MCP container's stdin/stdout is inherently single-process. Horizontal scaling of stdio-backed servers requires re-initializing the container session and is out of scope for this RFC.
+- **Smart Routing at vMCP**: We've previously discussed having vMCP route requests to the same underlying proxyrunner that's previously serviced the session. While this may be useful long term to reduce Redis load and reduce latency, it's not strictly necessary in the short term. vMCP will continue to send requests through k8s Service associated with the proxyrunner.
 - **One StatefulSet per MCPServer (shared)**: The design maintains exactly one StatefulSet per `MCPServer`. All proxyrunner replicas for a given `MCPServer` share that single StatefulSet, converging on the same spec via server-side apply. Each proxyrunner replica routes its sessions to specific pods within the shared StatefulSet. Note: a 1:1 ratio (one StatefulSet per proxyrunner replica) could be a future direction if enabling `stdio` horizontal scaling were desired, since each proxyrunner would then have its own dedicated backend.
-- **Moving MCP server deployment out of the proxyrunner**: The proxyrunner remains responsible for creating, managing, and proxying to the MCP server StatefulSet. Changing this responsibility boundary (e.g., having vMCP manage backends directly) is desirable long-term but is more work and out of scope.
+- **Moving MCP server deployment out of the proxyrunner**: The proxyrunner remains responsible for creating, managing, and proxying to the MCP server StatefulSet. Changing this responsibility boundary (e.g., having vMCP manage backends directly) is desirable long-term but is more work and out of scope. Discussed in detail [here](https://github.com/stacklok/toolhive-rfcs/blob/main/rfcs/THV-0003-toolhive-kubernetes-architecture-improvement.md).
 - **Auto-scaling policy**: How to trigger scale-out (HPA metrics, KEDA event sources, custom metrics) is deferred to a follow-on RFC. This RFC makes auto-scaling possible; it does not specify when or how to do it.
 - **Graceful proxyrunner drain**: Waiting for sessions to expire before removing a proxyrunner pod is a future work item. Session loss on pod removal is accepted behavior for this RFC.
 - **Backend StatefulSet scale-in**: Removing pods from the `MCPServer` StatefulSet (reducing `spec.backendReplicas`) is always disruptive — the backend session state lives in the removed process and cannot be reconstructed. Graceful drain of backend pods is out of scope for this RFC.
+- **Session Hijack Prevention at MCPServer**: This capability will continue to work within vMCP, but it will not also be added to MCPServer.
 
 ### 3.3 Scaling Summary
 
@@ -242,7 +246,7 @@ Two categories of session metadata are externalized. Neither contains sensitive 
 
 #### vMCP Session Record
 
-Written by the vMCP pod when a session is initialized (on `initialize` request). Used by any vMCP replica to route subsequent requests for the same session.
+Written by the vMCP pod when a session is initialized (on `initialize` request). Used by any vMCP replica to enable session reuse across vMCPs. 
 
 A vMCP session spans multiple backends (one per `MCPServer` in the `MCPGroup`). The record therefore carries a `backends` array — one entry per backend connection — alongside top-level identity metadata.
 
@@ -251,39 +255,32 @@ Key:   vmcp:session:{mcp-session-id}
 TTL:   Configurable (default: matches vMCP session TTL)
 Value: {
   "session_id":   "...",            // Mcp-Session-Id assigned to client
-  "subject":      "...",            // identity subject for audit
+  // additional fields for session hijack prevention are not pictured.
   "created_at":   "...",
   "updated_at":   "...",
   "backends": [
     {
       "backend_id":         "...",  // MCPServer workload ID
-      "proxyrunner_url":    "...",  // pod-DNS URL of the owning proxyrunner replica
       "backend_session_id": "..."  // Mcp-Session-Id assigned by the backend server
     }
   ]
 }
 ```
 
-Each `proxyrunner_url` is the pod's internal DNS name (e.g., `http://proxyrunner-pod-0.proxyrunner-svc.namespace.svc.cluster.local:8080`), not the Service ClusterIP — necessary to target a specific replica, not load-balance across them.
-
 #### proxyrunner Session Record
 
-Written by the proxyrunner pod when it initializes a backend session. Serves two purposes: (1) maps a session ID to the backend pod that owns it, enabling routing on a cache miss; (2) stores the identity subject from the originating vMCP session to prevent session hijacking — an attacker who learns a valid `Mcp-Session-Id` cannot use it without also presenting the correct identity.
-
+Written by the proxyrunner pod when it initializes a backend session. Serves one purposes: maps a session ID to the backend pod that owns it, enabling routing on a cache miss; 
 ```
-Key:   proxyrunner:{mcpserver-id}:session:{session-id}
+Key:   proxyrunner:{mcpserver-name}:session:{session-id}
 TTL:   Configurable (default: matches proxyrunner session TTL)
 Value: {
   "session_id":   "...",            // session ID (Mcp-Session-Id)
-  "subject":      "...",            // identity subject from originating vMCP session
   "backend_pod":  "...",            // which StatefulSet pod hosts this session
   "backend_url":  "http://...",     // pod-DNS URL of the backend pod
   "created_at":   "...",
   "updated_at":   "..."
 }
 ```
-
-The `subject` field is validated on every request: the proxyrunner rejects requests where the caller's identity does not match the session's stored subject. This requirement is being implemented as part of the session-scoped work (THV-0038).
 
 ### 4.3 Request Routing at Each Layer
 
@@ -292,8 +289,8 @@ The `subject` field is validated on every request: the proxyrunner rejects reque
 A vMCP session spans multiple backends; each backend has its own underlying connection and `backend_session_id`. When vMCP receives a request, it first identifies the target backend from the routing table (which tool/resource/prompt → which `MCPServer`), then finds the correct proxyrunner replica for that backend.
 
 1. **No `Mcp-Session-Id`** (new session / `initialize`): Initialize connections to all backends in the `MCPGroup`. Record the session in Redis with a `backends` array containing each backend's proxyrunner pod URL and assigned `backend_session_id`. Proceed normally.
-2. **Known `Mcp-Session-Id`** (session in local storage): Identify the target backend from the routing table. Route the request to the proxyrunner replica that owns that backend's session (existing behavior).
-3. **Unknown `Mcp-Session-Id`** (not in local storage, found in Redis): Reconstruct the session runtime from the `backends` array in Redis (re-establish connections to each proxyrunner). Then route as in case 2. This is a one-time cost on first contact after re-route.
+2. **Known `Mcp-Session-Id`** (session in local storage): Reuse the initialized clients with sub-session IDs already bound.
+3. **Unknown `Mcp-Session-Id`** (not in local storage, found in Redis): Reconstruct the session runtime from the `backends` array in Redis. Then route as in case 2. This is a one-time cost on first contact after re-route.
 4. **Unknown `Mcp-Session-Id`** (not in Redis): Return `400 Bad Request` — client must re-initialize.
 
 Cases 3 handles the "request hits wrong vMCP pod" scenario without re-initializing the session from the client's perspective.
@@ -302,12 +299,10 @@ Cases 3 handles the "request hits wrong vMCP pod" scenario without re-initializi
 
 The proxyrunner's sole routing concern is: given a session ID, which backend pod handles it? vMCP is responsible for ensuring each request arrives at the correct proxyrunner replica. With shared storage:
 
-1. **Known session** (exists in local storage): Route to the pinned backend pod (existing behavior).
+1. **Known session** (exists in local storage): Route to the backend pod (existing behavior).
 2. **Unknown session** (not in local storage): Look up in Redis.
    - Found: Route to the `backend_url` from the Redis record.
    - Not found: Return `400 Bad Request`.
-
-Note: **The proxyrunner never forwards requests to another proxyrunner**. If vMCP routes a request to the wrong proxyrunner replica, the proxyrunner rejects it and returns an error. Correctness of vMCP's routing layer is therefore critical.
 
 ### 4.4 Redis Configuration
 
@@ -354,11 +349,6 @@ spec:
 
 When `provider` is omitted or set to `memory`, existing local-storage behavior is preserved.
 
-### 4.5 Pod-Addressable Services
-
-For vMCP to route to a specific proxyrunner pod (not just any pod behind the Service), each proxyrunner Deployment needs a **headless Service** (or pod-level DNS) so that individual pod addresses are resolvable. The proxyrunner stores its own pod DNS name in Redis at startup. vMCP constructs the target URL from this stored address.
-
-This is consistent with the existing pattern: proxyrunner already creates a headless Service for the MCP server StatefulSet (used internally for pod-level routing to the backend).
 
 ### 4.6 Architectural Note: Why the Proxyrunner Layer Exists
 
@@ -377,12 +367,13 @@ The following requirements define the success criteria for this RFC.
 
 ### 5.1 vMCP Requirements
 
-- **R-VMCP-1**: Any incoming MCP request can be handled by any vMCP pod. vMCP reads session routing metadata from the shared session store to locate the correct proxyrunner pod and proxies the request there.
-- **R-VMCP-2**: vMCP writes session metadata to the shared session store when a new session is initialized. The record includes the identity subject and a `backends` array with each backend's workload ID, proxyrunner pod URL, and backend-assigned session ID.
+- **R-VMCP-1**: Any incoming MCP request can be handled by any vMCP pod. vMCP reads session metadata from the shared session store to locate the correct sub-session ID and uses that in the request to the downstream proxyrunner.
+- **R-VMCP-2**: vMCP writes session metadata to the shared session store when a new session is initialized. The record includes the `backends` array with each backend's workload ID and backend-assigned session ID.
 - **R-VMCP-3**: vMCP session metadata TTL in Redis must match or exceed the vMCP session TTL. Redis entries are refreshed on session activity.
 - **R-VMCP-4**: When Redis is not configured, vMCP operates with local in-memory storage and single-replica semantics (no behavioral regression).
-- **R-VMCP-5**: Adding vMCP replicas must not disrupt existing sessions. Existing sessions continue to route through their originating vMCP pod or, if that pod is unavailable, via Redis-based rerouting.
-- **R-VMCP-6**: vMCP routes each request to the proxyrunner pod recorded in the session metadata using its best-effort. Proxyrunner pods are Deployment pods with ephemeral addresses — if the target pod is unreachable, a retry attempt is made to a random pod. Assuming SSE or Streamable HTTP, the session should remain usable. 
+- **R-VMCP-5**: Adding vMCP replicas must not disrupt existing sessions.
+- **R-VMCP-6**: vMCP sends requests to the k8s service for the MCPServer. Assuming SSE or Streamable HTTP, the session should remain usable regardless which proxyrunner receives the request.
+- **R-VMCP-7**: vMCP has a limit on the number of in-memory sessions. Once hit, LRU caching removes the least active session from the in-memory state.
 
 ### 5.2 proxyrunner Requirements
 
@@ -392,13 +383,14 @@ The following requirements define the success criteria for this RFC.
 - **R-PR-4**: The number of backend StatefulSet replicas (MCPServer pods) per proxyrunner is configurable in the `MCPServer` CRD spec. The proxyrunner uses session-aware routing to distribute sessions across its backends.
 - **R-PR-5**: Multiple proxyrunner replicas serve a single `MCPServer`. vMCP is responsible for routing each session's requests to the correct proxyrunner replica.
 - **R-PR-6**: When Redis is not configured, the proxyrunner operates with local in-memory storage and single-replica semantics (no behavioral regression).
+- **R-VMCP-7**: proxyrunner has a limit on the number of in-memory sessions. Once hit, LRU caching removes the least active session from the in-memory state.
 
 ### 5.3 Operator Requirements
 
-- **R-OP-1**: The operator creates a pod-addressable headless Service (or equivalent DNS mechanism) for each proxyrunner Deployment so that individual pods can be targeted by vMCP. Note: proxyrunner replicas are not fungible — `stdio` transport binds a replica to a specific backend container. Fungible proxyrunners (fully stateless, interchangeable) would require eliminating `stdio` support, which is out of scope.
-- **R-OP-2**: When session storage is configured on a `VirtualMCPServer` or `MCPServer`, the operator injects the Redis connection configuration into the vMCP or proxyrunner pods (credentials from Secrets, address/db from CRD spec).
-- **R-OP-3**: Scaling out a `VirtualMCPServer` or proxyrunner `Deployment` replica count must not require changes to other resources (no cascading operator reconciliation for scale events).
-- **R-OP-4**: The operator adds explicit replica fields to both CRDs: `VirtualMCPServer.spec.replicas` (vMCP pod count), `MCPServer.spec.replicas` (proxyrunner pod count, capped at 1 for `stdio` transport), and `MCPServer.spec.backendReplicas` (StatefulSet pod count). The reconciler must respect these fields and must not overwrite them. There is exactly one StatefulSet per `MCPServer`; `spec.backendReplicas` controls the pod count within that StatefulSet.
+- **R-OP-1**: When session storage is configured on a `VirtualMCPServer` or `MCPServer`, the operator injects the Redis connection configuration into the vMCP or proxyrunner pods (credentials from Secrets, address/db from CRD spec).
+- **R-OP-2**: Scaling out a `VirtualMCPServer` or proxyrunner `Deployment` replica count must not require changes to other resources (no cascading operator reconciliation for scale events).
+- **R-OP-3**: The operator adds explicit replica fields to both CRDs: `VirtualMCPServer.spec.replicas` (vMCP pod count), `MCPServer.spec.replicas` (proxyrunner pod count, capped at 1 for `stdio` transport), and `MCPServer.spec.backendReplicas` (StatefulSet pod count). The reconciler must respect these fields and must not overwrite them. There is exactly one StatefulSet per `MCPServer`; `spec.backendReplicas` controls the pod count within that StatefulSet.
+- **R-OP-4**: if a user decides not to specify any replicas in the CRDs, whatever they set it to manually using kubectl scale --replicas=3 rs/foo or even if they use something like HPA, the Operator should not overwrite that field as we are not explicitly telling it to reconcile it.
 
 ### 5.4 Deployment Requirements
 
@@ -409,5 +401,4 @@ The following requirements define the success criteria for this RFC.
 
 ### 5.5 Security Requirements
 
-- **R-SEC-1**: The proxyrunner session record stores the identity subject from the originating vMCP session. The proxyrunner validates the caller's identity against this stored subject on every request, rejecting requests where the identity does not match. This prevents session hijacking by a caller who has observed a valid `Mcp-Session-Id`.
-- **R-SEC-2**: Session hijacking prevention is a hard requirement, not a best-effort check. Any request that fails subject validation must be rejected with an appropriate error (`401 Unauthorized` or `403 Forbidden`) and logged as a security event.
+- **R-SEC-1**: vMCP's session hijack prevention mechanism continues to function. A session initialized on one vMCP pod cannot be hijacked by a request hitting another vMCP pod.
