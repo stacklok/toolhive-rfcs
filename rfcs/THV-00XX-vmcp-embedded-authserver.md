@@ -1,4 +1,4 @@
-# RFC-0002: Embedded Auth Server in vMCP
+# RFC-00XX: Embedded Auth Server in vMCP
 
 - **Status**: Draft
 - **Author(s)**: tgrunnagle
@@ -30,21 +30,21 @@ Even if upstream tokens were somehow obtained, vMCP has no unified, per-request 
 ## Goals
 
 - Enable an embedded AS inside vMCP that acts as the OIDC issuer for incoming clients.
-- Allow the AS to be configured with one or more upstream IDPs (depends on RFC-0001 for multi-upstream support).
+- Allow the AS to be configured with one or more upstream IDPs (depends on RFC-0052 for multi-upstream support).
 - Wire the embedded AS's OAuth/OIDC endpoints at the same origin as the vMCP server so OIDC discovery works as a loopback.
-- Extend the incoming OIDC auth middleware to eagerly load upstream tokens from the AS's storage into `identity.UpstreamTokens` when validating TH-JWTs (depends on RFC-0001).
+- Extend the incoming OIDC auth middleware to eagerly load upstream tokens from the AS's storage into `identity.UpstreamTokens` when validating TH-JWTs (depends on RFC-0052).
 - Add Kubernetes CRD support via `VirtualMCPServerSpec.AuthServerConfig *ExternalAuthConfigRef` referencing an `MCPExternalAuthConfig` of type `embeddedAuthServer`.
 - Add corresponding `Config.AuthServer *AuthServerConfig` in `pkg/vmcp/config/config.go` for the YAML/CLI path.
 - Enforce cross-cutting validation rules so misconfigured `issuer`, `audience`, and `upstream_inject` provider references fail fast at startup and at operator reconciliation.
-- Maintain byte-for-byte Mode A (no AS) backward compatibility.
+- Maintain byte-for-byte backward compatibility.
 
 ## Non-Goals
 
 - **Outgoing auth upstream token injection** (`upstream_inject` strategy): Using the upstream tokens loaded into `identity.UpstreamTokens` to authenticate outgoing backend requests is deferred to a follow-up RFC. This RFC wires the plumbing; the strategy consuming it comes later.
 - **Hot-reload of AS configuration**: AS config changes require a pod restart. Rolling updates are the Kubernetes mechanism for this.
-- **Multi-upstream IDP support**: Multi-provider accumulation is defined by RFC-0001. This RFC depends on RFC-0001 and does not re-specify that behavior.
+- **Multi-upstream IDP support**: Multi-provider accumulation is defined by RFC-0052. This RFC depends on RFC-0052 and does not re-specify that behavior.
 - **CLI-path upstream token swap**: The `pkg/auth/upstreamswap` middleware (used by the proxy runner) is unaffected by this RFC.
-- **Step-up auth signaling**: Defined in UC-06 and deferred to a separate RFC.
+- **Step-up auth signaling**: Deferred to a separate RFC.
 
 ## Proposed Solution
 
@@ -124,7 +124,7 @@ type VirtualMCPServerSpec struct {
     // must exist in the same namespace.
     // When set, vMCP operates in Mode B: the embedded AS acts as the OIDC issuer for
     // incoming clients and accumulates upstream IDP tokens during authorization.
-    // IncomingAuth.OIDCConfig.Inline.Issuer must match the AS's configured issuer (V-04).
+    // IncomingAuth.OIDCConfig.Inline.Issuer must match the AS's configured issuer.
     // +optional
     AuthServerConfig *ExternalAuthConfigRef `json:"authServerConfig,omitempty"`
 }
@@ -158,14 +158,26 @@ The deployment controller for `VirtualMCPServer` gains auth server validation du
 2. Verify the resolved config is of type `embeddedAuthServer` (surface as status condition `AuthServerConfigValid` if not).
 3. Extract the AS `Issuer` from the resolved `EmbeddedAuthServerConfig`.
 4. Verify `spec.incomingAuth.oidcConfig.inline.issuer` matches the AS issuer (V-04). Surface as status condition.
-5. Verify `spec.incomingAuth.oidcConfig.inline.audience` is in the AS's `allowedAudiences` (V-07). Surface as status condition.
-6. Pass the resolved `EmbeddedAuthServerConfig` to the converter, which translates it to `authserver.RunConfig` for the vMCP pod's YAML config.
+5. Pass the resolved `EmbeddedAuthServerConfig` to the converter, which translates it to `authserver.RunConfig` for the vMCP pod's YAML config. The converter derives `allowedAudiences` from `spec.incomingAuth.oidcConfig.inline.audience` (see CRD-to-Config Conversion section). Verify that audience is non-empty as a defense-in-depth check.
 
 Invalid configurations produce a `Failed` phase with a descriptive condition message, preventing deployment until corrected.
 
 #### CRD-to-Config Conversion (`cmd/thv-operator/pkg/vmcpconfig/converter.go`)
 
 The converter gains a new resolution step: when `spec.authServerConfig` is set, it resolves the referenced `MCPExternalAuthConfig`, extracts the `EmbeddedAuthServerConfig`, converts it to `authserver.RunConfig`, and populates `config.AuthServer.RunConfig`. This follows the same pattern as existing OIDC and outgoing auth resolution.
+
+**`allowedAudiences` is not a field on `EmbeddedAuthServerConfig` in the CRD.** The `MCPExternalAuthConfig` spec intentionally omits `allowedAudiences` because the correct value is not known at the time the `MCPExternalAuthConfig` is authored — it depends on the `VirtualMCPServer` that will reference it. Instead, the converter derives the `allowedAudiences` value from the referencing `VirtualMCPServer`:
+
+```go
+// In converter: derive AllowedAudiences from the VirtualMCPServer's incoming auth audience
+if vmcp.Spec.IncomingAuth != nil &&
+    vmcp.Spec.IncomingAuth.OIDCConfig != nil &&
+    vmcp.Spec.IncomingAuth.OIDCConfig.Inline != nil {
+    runConfig.AllowedAudiences = []string{vmcp.Spec.IncomingAuth.OIDCConfig.Inline.Audience}
+}
+```
+
+This means that in the Kubernetes path, V-07 (audience consistency) is structurally satisfied by construction — the converter sets `allowedAudiences` to exactly the audience the OIDC middleware will validate against. The reconciler still checks this post-conversion for defense-in-depth (e.g., if the audience field is empty). In the YAML path, `allowedAudiences` remains an explicit field in `authserver.RunConfig` and V-07 is an active startup-time check.
 
 #### Server Wiring (`cmd/vmcp/app/commands.go`)
 
@@ -192,7 +204,7 @@ if authServer != nil {
 serverCfg.AuthServerHandler = authServerHandler
 ```
 
-Note: Unlike what UC-05 §3.1 proposed, `discoverBackends` does **not** receive an `upstreamTokenSource` parameter. Upstream tokens are accessed by outgoing auth strategies via `identity.UpstreamTokens` (populated by the OIDC auth middleware after TH-JWT validation). The `UpstreamTokenSource` abstraction is not used in the vMCP outgoing auth path.
+Note: Upstream tokens are accessed by outgoing auth strategies via `identity.UpstreamTokens` (populated by the OIDC auth middleware after TH-JWT validation).
 
 #### HTTP Route Mounting (`pkg/vmcp/server/server.go`)
 
@@ -257,7 +269,7 @@ To prevent the OIDC middleware from blocking on a private loopback IP, `Incoming
 
 #### Identity.UpstreamTokens Population
 
-This mechanism is defined by RFC-0001 and is a dependency of this RFC. In summary:
+This mechanism is defined by RFC-0052 and is a dependency of this RFC. In summary:
 
 1. A client authenticates through the AS, which issues a TH-JWT containing a `tsid` (token session ID) claim.
 2. The client presents the TH-JWT to vMCP's MCP endpoint.
@@ -265,8 +277,6 @@ This mechanism is defined by RFC-0001 and is a dependency of this RFC. In summar
 4. After successful validation, the middleware extracts the `tsid` claim and calls `storage.GetUpstreamTokensAllProviders(ctx, tsid)`.
 5. The result — a `map[string]*storage.UpstreamTokens` keyed by provider name — is stored in `identity.UpstreamTokens`.
 6. Downstream components (outgoing auth strategies, composite tool workflows) access upstream tokens via `identity.UpstreamTokens["provider-name"]`.
-
-This replaces the `UpstreamTokenSource` adapter pattern from UC-05. Strategies do not need a reference to the AS's token storage; they read from the identity that the middleware already populated.
 
 **Nil behavior in Mode A**: When `AuthServer` is nil, the TH-JWT path never executes (incoming JWTs come from an external IDP and carry no `tsid`). `identity.UpstreamTokens` remains nil. Outgoing strategies that require upstream tokens will fail with a descriptive error (see validation rules below); strategies that do not require them are unaffected.
 
@@ -282,7 +292,7 @@ The `pkg/vmcp/config` validator gains cross-cutting validation for auth server i
 | V-04 | AS `issuer` ≠ `incomingAuth.oidcConfig.inline.issuer` | Error | Startup (static), Operator reconciler | OIDC middleware validates the JWT `iss` claim against the configured issuer. Mismatch causes 100% token rejection at runtime. |
 | V-05 | AS config fails internal validation | Error | Startup (static) | `NewEmbeddedAuthServer` resolves `RunConfig → Config` and calls `Config.Validate()`. Invalid configs surface at startup. |
 | V-06 | `upstream_inject` provider name is empty | Error | Startup (static) | Structural validation. |
-| V-07 | `incomingAuth.oidcConfig.inline.audience` not in AS `allowedAudiences` | Error | Startup (static), Operator reconciler | The AS cannot issue tokens with the expected audience, or the middleware rejects them. Either way, 100% failure. |
+| V-07 | `incomingAuth.oidcConfig.inline.audience` not in AS `allowedAudiences` | Error | Startup (YAML path only); K8s path satisfied by construction | In the K8s path, the converter derives `allowedAudiences` from `incomingAuth.oidcConfig.inline.audience`, so they are always consistent. In the YAML path, they are explicit and must match. |
 
 Implementation — new `validateAuthServerIntegration(cfg *Config) error` called from `Validate()`:
 
@@ -399,6 +409,8 @@ spec:
   type: embeddedAuthServer
   embeddedAuthServer:
     issuer: "http://vmcp-service.my-namespace.svc.cluster.local:4483"
+    # allowedAudiences is NOT configured here — it is derived by the operator
+    # converter from the referencing VirtualMCPServer's IncomingAuth.OIDCConfig.Audience.
     upstreamProviders:
       - name: corporate-idp
         type: oidc
@@ -524,9 +536,9 @@ UC-05 §3.1 proposed passing an `UpstreamTokenSource` interface from the AS to `
 
 **Pros**: Lazy token lookup (only fetches when needed); clean separation between AS and strategy.
 
-**Cons**: Requires passing a dependency through several layers. Makes unit testing harder (mock the interface vs. populate the identity). Inconsistent with how RFC-0001 populates `identity.UpstreamTokens` for the auth middleware layer.
+**Cons**: Requires passing a dependency through several layers. Makes unit testing harder (mock the interface vs. populate the identity). Inconsistent with how RFC-0052 populates `identity.UpstreamTokens` for the auth middleware layer.
 
-**Why not chosen**: RFC-0001 already establishes the pattern of loading upstream tokens into `identity.UpstreamTokens` at auth middleware time. Using `identity.UpstreamTokens` in outgoing strategies is consistent with this pattern and avoids adding a new interface dependency to the strategy factory. The token lookup cost (one Redis/memory read per request) is incurred at auth time regardless of which strategies are used, so lazy lookup provides no practical performance benefit.
+**Why not chosen**: RFC-0052 already establishes the pattern of loading upstream tokens into `identity.UpstreamTokens` at auth middleware time. Using `identity.UpstreamTokens` in outgoing strategies is consistent with this pattern and avoids adding a new interface dependency to the strategy factory. The token lookup cost (one Redis/memory read per request) is incurred at auth time regardless of which strategies are used, so lazy lookup provides no practical performance benefit.
 
 ### Alternative 2: Embed AS config directly in VirtualMCPServerSpec
 
@@ -562,7 +574,7 @@ Mode A (no AS) behavior is preserved exactly:
 
 ### Forward Compatibility
 
-- The `AuthServer` config field is extensible: `AuthServerConfig` wraps `authserver.RunConfig`, which already supports multiple upstreams (after RFC-0001), multiple storage backends, and configurable token lifespans.
+- The `AuthServer` config field is extensible: `AuthServerConfig` wraps `authserver.RunConfig`, which already supports multiple upstreams (after RFC-0052), multiple storage backends, and configurable token lifespans.
 - The `upstream_inject` strategy, the principal consumer of `identity.UpstreamTokens`, is intentionally deferred to allow the middleware and identity contract to be validated before building outgoing strategies on top.
 - When the outgoing auth RFC lands, it adds a new strategy to the existing `OutgoingAuthRegistry` without changing this RFC's components.
 
@@ -600,16 +612,34 @@ Mode A (no AS) behavior is preserved exactly:
 
 ### Dependencies
 
-- **RFC-0001** (multi-upstream IDP): Required for `identity.UpstreamTokens` population by the OIDC auth middleware. The AS wiring (Phases 1–2) can be developed in parallel with RFC-0001, but integration testing of the full flow requires both.
+- **RFC-0052** (multi-upstream IDP): Required for `identity.UpstreamTokens` population by the OIDC auth middleware. The AS wiring (Phases 1–2) can be developed in parallel with RFC-0052, but integration testing of the full flow requires both.
 - `pkg/authserver/runner.EmbeddedAuthServer`: Already implemented for the proxy runner. No new AS implementation work needed.
 
 ## Testing Strategy
 
-- **Unit tests** (`pkg/vmcp/config/`): Table-driven tests for each validation rule (V-01..V-07), covering both error and non-error cases. Tests for nil-safe behavior (Mode A: all validators pass when `AuthServer` is nil).
-- **Unit tests** (`cmd/thv-operator/api/v1alpha1/`): Tests for `validateAuthServerConfig` (empty name rejected); tests for the type-enforcement logic in the reconciler.
-- **Integration tests** (`pkg/vmcp/server/`): Test that AS routes are mounted when `AuthServerHandler` is set and absent when nil. Test that `/.well-known/oauth-protected-resource` continues to be served correctly in both modes.
-- **E2E tests** (Chainsaw): Create `MCPExternalAuthConfig` of type `embeddedAuthServer` + `VirtualMCPServer` pointing to it. Verify `AuthServerConfigValid` condition. Verify `/.well-known/openid-configuration` endpoint is reachable at the vMCP service URL. Verify a full AS auth flow (authorization code → TH-JWT).
-- **Negative E2E tests**: `MCPExternalAuthConfig` of wrong type → `AuthServerConfigValid` condition `False`. Issuer mismatch → `AuthServerConfigValid` condition `False` with descriptive message.
+### Unit Tests
+
+**`pkg/vmcp/config/` — Validator**: Table-driven Ginkgo `DescribeTable` tests for `validateAuthServerIntegration`, one `Entry` per validation rule (V-01..V-07). Separate entries covering nil `AuthServer` (Mode A passes all checks) and a valid Mode B config.
+
+**`cmd/thv-operator/api/v1alpha1/` — CRD Validation**: Tests for `validateAuthServerConfig` covering empty `name` rejection and nil-pointer safety.
+
+**`pkg/vmcp/server/` — Route Mounting**: HTTP handler tests (using `httptest.NewRecorder`) verifying:
+- Mode A: `/.well-known/openid-configuration` and `/oauth/` return 404; `/.well-known/oauth-protected-resource` returns the correct RFC 9728 response.
+- Mode B: AS routes are served by the `AuthServerHandler`; `/.well-known/oauth-protected-resource` continues to be served; unauthenticated requests to the MCP catch-all return 401.
+
+### E2E Tests
+
+In `test/e2e/`, using the Ginkgo + Gomega style (`Describe`/`Context`/`It`, `By()`, `Eventually()`):
+
+**`test/e2e/vmcp_authserver_test.go`** — positive cases:
+- Mode B: Start vMCP with an embedded AS config. Verify `/.well-known/openid-configuration` returns a valid OIDC discovery document with the correct `issuer` and a non-empty `jwks_uri`.
+- Mode B: Verify that unauthenticated requests to the MCP endpoint return 401 (the auth middleware is still active).
+- Mode A: Start vMCP without an AS config. Verify `/.well-known/openid-configuration` returns 404.
+
+**`test/e2e/vmcp_authserver_test.go`** — negative/validation cases:
+- Issuer mismatch (`authServer.runConfig.issuer` ≠ `incomingAuth.oidc.issuer`) → vMCP process exits with a non-zero code and stderr containing the V-04 error message.
+- `upstream_inject` backend with no `authServer` → process exits with the V-01 error message.
+- `upstream_inject` referencing an unknown provider → process exits with the V-02 error message.
 
 ## Documentation
 
@@ -618,22 +648,18 @@ Mode A (no AS) behavior is preserved exactly:
 - Add vMCP auth server guide to `docs/`: configuration walkthrough, example YAML, troubleshooting the self-referencing OIDC discovery.
 - Update generated CRD documentation (`task docs`).
 
-## Open Questions
+## Decisions
 
-1. **Issuer URL in Kubernetes**: The AS issuer must be reachable as an OIDC discovery endpoint by the OIDC middleware (which runs inside the same pod). Should the operator auto-compute the issuer URL from the vMCP Service name and namespace, or require the operator to set it explicitly? Auto-computation is convenient but fragile (service name changes). Explicit is verbose but unambiguous.
+The following design questions were resolved during RFC review:
 
-2. **AllowedAudiences auto-population**: Should the operator automatically populate `allowedAudiences` in `RunConfig` with the vMCP service URL (to match the `IncomingAuth.OIDCConfig.Audience`)? This would eliminate a common misconfiguration but reduces explicitness.
+1. **Issuer URL in Kubernetes** — **Explicit only.** The operator requires the issuer to be set explicitly in `MCPExternalAuthConfig.embeddedAuthServer.issuer`. The reconciler validates that `spec.incomingAuth.oidcConfig.inline.issuer` matches the configured value (V-04) and surfaces a descriptive error if they differ, but it does not attempt to derive or auto-populate the issuer.
 
-3. **Redis TLS enforcement**: The `RedisStorageConfig` does not currently expose TLS configuration (the operator relies on the cluster service mesh). Should TLS be explicitly required (or at least configurable) in the CRD for production Mode B deployments?
+2. **Redis TLS enforcement** — **Service mesh only.** `RedisStorageConfig` does not expose TLS fields in the CRD. Encryption in transit is the responsibility of the cluster service mesh (e.g., Istio, Linkerd). This keeps the CRD surface minimal and consistent with existing Redis usage in the operator.
 
-4. **Redirect URI**: The AS's upstream provider `redirectUri` must point to the vMCP server's `/oauth/callback` endpoint. In Kubernetes, this requires the external hostname of the vMCP ingress, which the operator may not know. Should the operator attempt to auto-populate `redirectUri` from the `VirtualMCPServer.Status.URL`? Or is this always operator-supplied?
+3. **Redirect URI** — **Always operator-supplied.** The `redirectUri` field in `UpstreamProviderConfig` must be set explicitly by the operator. The operator knows their ingress hostname and the OAuth client registration; the reconciler does not attempt to derive or auto-populate this value.
 
 ## References
 
-- [UC-05: Optional Auth Server design](../vmcp-authserver-design/uc-05-optional-authserver.md)
-- [RFC-0001: Multi-Upstream IDP Support in the Embedded Auth Server](0001-multi-upstream-idp-authserver.md)
-- [pkg/authserver/runner: EmbeddedAuthServer implementation](../../pkg/authserver/runner/)
-- [Proxy runner AS integration pattern](../../pkg/runner/runner.go) (reference implementation)
 - [RFC 8414: OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414)
 - [RFC 9728: OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
 
