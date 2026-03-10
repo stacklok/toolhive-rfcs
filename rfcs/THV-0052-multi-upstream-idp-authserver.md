@@ -1,4 +1,4 @@
-# RFC-00XX: Multi-Upstream IDP Support in the Embedded Auth Server
+# RFC-0052: Multi-Upstream IDP Support in the Embedded Auth Server
 
 - **Status**: Draft
 - **Author(s)**: tgrunnagle
