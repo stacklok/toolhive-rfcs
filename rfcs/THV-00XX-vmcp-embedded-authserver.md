@@ -490,7 +490,7 @@ The embedded AS mediates both auth boundaries:
 - **Incoming**: Clients authenticate through the AS (upstream IDP → TH-JWT). The OIDC middleware validates TH-JWTs.
 - **Outgoing**: Upstream tokens accumulated during the AS auth flow are loaded into `identity.UpstreamTokens` and consumed by outgoing auth strategies (in a follow-up RFC).
 
-Authorization (Cedar policies) is unchanged. The identity's `sub` and `claims` fields are set from the TH-JWT; Cedar policies referencing them continue to work.
+Authorization (Cedar policies) is unchanged. The identity's `sub` and `claims` fields are set from the TH-JWT, where those values are derived from the **first configured upstream IDP** (the "front-door" provider). When a corporate IDP is in use, it should be listed first in `upstreamProviders` so that it becomes the canonical identity source; Cedar policies referencing `sub` or `claims` evaluate against that provider's identity.
 
 ### Data Security
 
@@ -530,9 +530,9 @@ Authorization (Cedar policies) is unchanged. The identity's `sub` and `claims` f
 
 ## Alternatives Considered
 
-### Alternative 1: UpstreamTokenSource Adapter (UC-05 Original Design)
+### Alternative 1: UpstreamTokenSource Adapter
 
-UC-05 §3.1 proposed passing an `UpstreamTokenSource` interface from the AS to `discoverBackends`, which would pass it to the outgoing auth strategy factory. Strategies would call `upstreamTokenSource.GetUpstreamTokens(ctx, tsid, providerName)` at request time.
+Pass an `UpstreamTokenSource` interface from the AS to `discoverBackends`, which would pass it to the outgoing auth strategy factory. Strategies would call `upstreamTokenSource.GetUpstreamTokens(ctx, tsid, providerName)` at request time.
 
 **Pros**: Lazy token lookup (only fetches when needed); clean separation between AS and strategy.
 
@@ -608,7 +608,7 @@ Mode A (no AS) behavior is preserved exactly:
 - Cross-resource validation: type check, V-04, V-07.
 - New status condition `AuthServerConfigValid`.
 - CRD-to-config converter updates.
-- E2E test: Chainsaw test that creates `MCPExternalAuthConfig` + `VirtualMCPServer`, verifies deployment and `AuthServerConfigValid` condition.
+- E2E test: Ginkgo/Gomega test (in `test/e2e/`) that creates `MCPExternalAuthConfig` + `VirtualMCPServer`, verifies deployment and the `AuthServerConfigValid` condition using `Eventually`.
 
 ### Dependencies
 
