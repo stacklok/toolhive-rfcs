@@ -1,4 +1,4 @@
-# RFC-00XX: Embedded Auth Server in vMCP
+# RFC-0053: Embedded Auth Server in vMCP
 
 - **Status**: Draft
 - **Author(s)**: tgrunnagle
