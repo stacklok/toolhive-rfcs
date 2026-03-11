@@ -1,4 +1,4 @@
-# RFC-00XX: vMCP Upstream Inject Outgoing Auth Strategy
+# RFC-0054: vMCP Upstream Inject Outgoing Auth Strategy
 
 - **Status**: Draft
 - **Author(s)**: tgrunnagle
