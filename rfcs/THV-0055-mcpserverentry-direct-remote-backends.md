@@ -310,77 +310,30 @@ spec:
 
 #### CRD Type Definitions
 
-```go
-// MCPServerEntry declares a remote MCP server endpoint as a backend for
-// VirtualMCPServer. Unlike MCPServer (which deploys container workloads)
-// or MCPRemoteProxy (which deploys proxy pods), MCPServerEntry is a
-// pure configuration resource that deploys no infrastructure.
-//
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=mcpentry
-// +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.spec.remoteURL`
-// +kubebuilder:printcolumn:name="Transport",type=string,JSONPath=`.spec.transport`
-// +kubebuilder:printcolumn:name="Group",type=string,JSONPath=`.spec.groupRef`
-// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
-// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
-type MCPServerEntry struct {
-    metav1.TypeMeta   `json:",inline"`
-    metav1.ObjectMeta `json:"metadata,omitempty"`
+The `MCPServerEntry` CRD type is defined in
+`cmd/thv-operator/api/v1alpha1/mcpserverentry_types.go`. It follows the
+standard kubebuilder pattern with `Spec` and `Status` subresources.
 
-    Spec   MCPServerEntrySpec   `json:"spec,omitempty"`
-    Status MCPServerEntryStatus `json:"status,omitempty"`
-}
+The resource uses the short name `mcpentry` and exposes print columns for
+URL, Transport, Group, Ready status, and Age.
 
-type MCPServerEntrySpec struct {
-    // RemoteURL is the URL of the remote MCP server.
-    // Must use HTTPS unless the toolhive.stacklok.dev/allow-insecure
-    // annotation is set to "true" (for development only).
-    // +kubebuilder:validation:Required
-    // +kubebuilder:validation:Pattern=`^https?://`
-    RemoteURL string `json:"remoteURL"`
+**Spec fields:**
 
-    // Transport specifies the MCP transport protocol.
-    // +kubebuilder:validation:Required
-    // +kubebuilder:validation:Enum=streamable-http;sse
-    Transport string `json:"transport"`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `remoteURL` | string | Yes | URL of the remote MCP server. Must match `^https?://`. HTTPS enforced unless `toolhive.stacklok.dev/allow-insecure` annotation is set. |
+| `transport` | enum | Yes | MCP transport protocol: `streamable-http` or `sse`. |
+| `groupRef` | string | Yes | Name of the MCPGroup this entry belongs to (min length: 1). |
+| `externalAuthConfigRef` | object | No | Reference to an MCPExternalAuthConfig in the same namespace. Omit for unauthenticated endpoints. |
+| `headerForward` | object | No | Header forwarding configuration. Reuses existing `HeaderForwardConfig` type from MCPRemoteProxy. |
+| `caBundleRef` | object | No | Reference to a Secret containing a custom CA certificate bundle for TLS verification. |
 
-    // GroupRef is the name of the MCPGroup this entry belongs to.
-    // Required because an MCPServerEntry without a group cannot be
-    // discovered by any VirtualMCPServer.
-    // +kubebuilder:validation:Required
-    // +kubebuilder:validation:MinLength=1
-    GroupRef string `json:"groupRef"`
+**Status fields:**
 
-    // ExternalAuthConfigRef references an MCPExternalAuthConfig in the
-    // same namespace for authenticating to the remote server.
-    // Omit for unauthenticated public endpoints.
-    // +optional
-    ExternalAuthConfigRef *ExternalAuthConfigRef `json:"externalAuthConfigRef,omitempty"`
-
-    // HeaderForward configures additional headers to inject into
-    // requests forwarded to the remote server.
-    // +optional
-    HeaderForward *HeaderForwardConfig `json:"headerForward,omitempty"`
-
-    // CABundleRef references a ConfigMap or Secret containing a custom
-    // CA certificate bundle for TLS verification of the remote server.
-    // Useful for remote servers with private/internal CA certificates.
-    // +optional
-    CABundleRef *SecretKeyRef `json:"caBundleRef,omitempty"`
-}
-
-type MCPServerEntryStatus struct {
-    // Conditions represent the latest available observations of the
-    // MCPServerEntry's state.
-    // +optional
-    Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-    // ObservedGeneration is the most recent generation observed.
-    // +optional
-    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-}
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `conditions` | []Condition | Standard Kubernetes conditions (see table below). |
+| `observedGeneration` | int64 | Most recent generation observed by the controller. |
 
 **Condition types:**
 
@@ -437,99 +390,25 @@ status:
   Validation-only controller
 
 The MCPServerEntry controller is intentionally simple. It performs
-**validation only** and creates **no infrastructure**:
+**validation only** and creates **no infrastructure**.
 
-```go
-func (r *MCPServerEntryReconciler) Reconcile(
-    ctx context.Context, req ctrl.Request,
-) (ctrl.Result, error) {
-    var entry mcpv1alpha1.MCPServerEntry
-    if err := r.Get(ctx, req.NamespacedName, &entry); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
+The reconciliation logic:
 
-    statusManager := NewStatusManager(&entry)
+1. Fetches the MCPServerEntry resource (ignores not-found for deletions).
+2. Validates that the referenced MCPGroup exists in the same namespace.
+   Sets `GroupRefValid` condition accordingly.
+3. If `externalAuthConfigRef` is set, validates that the referenced
+   MCPExternalAuthConfig exists. Sets `AuthConfigValid` condition.
+4. Validates the HTTPS requirement: if `remoteURL` does not use HTTPS,
+   the controller checks for the `toolhive.stacklok.dev/allow-insecure`
+   annotation. Without it, the `Ready` condition is set to false with
+   reason `InsecureURL`.
+5. If all validations pass, sets `Ready` to true with reason
+   `ValidationSucceeded`.
 
-    // Validate groupRef exists
-    var group mcpv1alpha1.MCPGroup
-    if err := r.Get(ctx, client.ObjectKey{
-        Namespace: entry.Namespace,
-        Name:      entry.Spec.GroupRef,
-    }, &group); err != nil {
-        if apierrors.IsNotFound(err) {
-            statusManager.SetCondition("GroupRefValid", "GroupNotFound",
-                fmt.Sprintf("MCPGroup %q not found", entry.Spec.GroupRef),
-                metav1.ConditionFalse)
-            statusManager.SetCondition("Ready", "ValidationFailed",
-                "Referenced MCPGroup does not exist", metav1.ConditionFalse)
-            return r.updateStatus(ctx, &entry, statusManager)
-        }
-        return ctrl.Result{}, err
-    }
-    statusManager.SetCondition("GroupRefValid", "GroupExists",
-        fmt.Sprintf("MCPGroup %q exists", entry.Spec.GroupRef),
-        metav1.ConditionTrue)
-
-    // Validate externalAuthConfigRef if set
-    if entry.Spec.ExternalAuthConfigRef != nil {
-        var authConfig mcpv1alpha1.MCPExternalAuthConfig
-        if err := r.Get(ctx, client.ObjectKey{
-            Namespace: entry.Namespace,
-            Name:      entry.Spec.ExternalAuthConfigRef.Name,
-        }, &authConfig); err != nil {
-            if apierrors.IsNotFound(err) {
-                statusManager.SetCondition("AuthConfigValid",
-                    "AuthConfigNotFound",
-                    fmt.Sprintf("MCPExternalAuthConfig %q not found",
-                        entry.Spec.ExternalAuthConfigRef.Name),
-                    metav1.ConditionFalse)
-                statusManager.SetCondition("Ready", "ValidationFailed",
-                    "Referenced auth config does not exist",
-                    metav1.ConditionFalse)
-                return r.updateStatus(ctx, &entry, statusManager)
-            }
-            return ctrl.Result{}, err
-        }
-        statusManager.SetCondition("AuthConfigValid", "AuthConfigExists",
-            fmt.Sprintf("MCPExternalAuthConfig %q exists",
-                entry.Spec.ExternalAuthConfigRef.Name),
-            metav1.ConditionTrue)
-    }
-
-    // Validate HTTPS requirement
-    if !strings.HasPrefix(entry.Spec.RemoteURL, "https://") {
-        if entry.Annotations["toolhive.stacklok.dev/allow-insecure"] != "true" {
-            statusManager.SetCondition("Ready", "InsecureURL",
-                "remoteURL must use HTTPS (set annotation "+
-                    "toolhive.stacklok.dev/allow-insecure=true to override)",
-                metav1.ConditionFalse)
-            return r.updateStatus(ctx, &entry, statusManager)
-        }
-    }
-
-    statusManager.SetCondition("Ready", "ValidationSucceeded",
-        "MCPServerEntry is valid and ready for discovery",
-        metav1.ConditionTrue)
-
-    return r.updateStatus(ctx, &entry, statusManager)
-}
-
-func (r *MCPServerEntryReconciler) SetupWithManager(
-    mgr ctrl.Manager,
-) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&mcpv1alpha1.MCPServerEntry{}).
-        Watches(&mcpv1alpha1.MCPGroup{},
-            handler.EnqueueRequestsFromMapFunc(
-                r.findEntriesForGroup,
-            )).
-        Watches(&mcpv1alpha1.MCPExternalAuthConfig{},
-            handler.EnqueueRequestsFromMapFunc(
-                r.findEntriesForAuthConfig,
-            )).
-        Complete(r)
-}
-```
+The controller watches MCPGroup and MCPExternalAuthConfig resources via
+`EnqueueRequestsFromMapFunc` handlers, so that changes to referenced
+resources trigger re-validation of affected MCPServerEntry resources.
 
 No finalizers are needed because MCPServerEntry creates no infrastructure
 to clean up.
@@ -589,143 +468,35 @@ backends:
 
 ##### vMCP: Backend Type and Discovery
 
-**New backend type:**
+A new `BackendTypeEntry` constant (`"entry"`) is added to
+`pkg/vmcp/types.go` alongside the existing `BackendTypeContainer` and
+`BackendTypeProxy`.
 
-```go
-// In pkg/vmcp/types.go
-const (
-    BackendTypeContainer BackendType = "container"
-    BackendTypeProxy     BackendType = "proxy"
-    BackendTypeEntry     BackendType = "entry"  // New
-)
-```
+The `ListWorkloadsInGroup()` function in `pkg/vmcp/workloads/k8s.go` is
+extended to discover MCPServerEntry resources in addition to MCPServer
+resources. For each MCPServerEntry in the group, vMCP:
 
-**Discovery updates:**
-
-```go
-// In pkg/vmcp/workloads/k8s.go
-func (m *K8sWorkloadManager) ListWorkloadsInGroup(
-    ctx context.Context, groupName string,
-) ([]Backend, error) {
-    var backends []Backend
-
-    // Existing: discover MCPServer resources
-    mcpServers, err := m.discoverMCPServers(ctx, groupName)
-    if err != nil {
-        return nil, fmt.Errorf("discovering MCPServers: %w", err)
-    }
-    backends = append(backends, mcpServers...)
-
-    // New: discover MCPServerEntry resources
-    entries, err := m.discoverMCPServerEntries(ctx, groupName)
-    if err != nil {
-        return nil, fmt.Errorf("discovering MCPServerEntries: %w", err)
-    }
-    backends = append(backends, entries...)
-
-    return backends, nil
-}
-
-func (m *K8sWorkloadManager) discoverMCPServerEntries(
-    ctx context.Context, groupName string,
-) ([]Backend, error) {
-    var entryList mcpv1alpha1.MCPServerEntryList
-    if err := m.client.List(ctx, &entryList,
-        client.InNamespace(m.namespace),
-        client.MatchingFields{"spec.groupRef": groupName},
-    ); err != nil {
-        return nil, err
-    }
-
-    var backends []Backend
-    for _, entry := range entryList.Items {
-        backend := Backend{
-            ID:        fmt.Sprintf("%s/%s", entry.Namespace, entry.Name),
-            Name:      entry.Name,
-            BaseURL:   entry.Spec.RemoteURL,
-            Transport: entry.Spec.Transport,
-            Type:      BackendTypeEntry,
-        }
-
-        // Resolve auth if configured
-        if entry.Spec.ExternalAuthConfigRef != nil {
-            authConfig, err := m.resolveAuthConfig(ctx,
-                entry.Namespace,
-                entry.Spec.ExternalAuthConfigRef.Name,
-            )
-            if err != nil {
-                return nil, fmt.Errorf(
-                    "resolving auth for entry %s: %w",
-                    entry.Name, err,
-                )
-            }
-            backend.AuthConfig = authConfig
-        }
-
-        // Resolve header forward config if set
-        if entry.Spec.HeaderForward != nil {
-            backend.HeaderForward = m.resolveHeaderForward(
-                ctx, entry.Namespace, entry.Spec.HeaderForward,
-            )
-        }
-
-        // Resolve CA bundle if set
-        if entry.Spec.CABundleRef != nil {
-            caBundle, err := m.resolveCABundle(ctx,
-                entry.Namespace, entry.Spec.CABundleRef,
-            )
-            if err != nil {
-                return nil, fmt.Errorf(
-                    "resolving CA bundle for entry %s: %w",
-                    entry.Name, err,
-                )
-            }
-            backend.CABundle = caBundle
-        }
-
-        backends = append(backends, backend)
-    }
-
-    return backends, nil
-}
-```
+1. Lists MCPServerEntry resources filtered by `spec.groupRef`.
+2. Converts each entry to an internal `Backend` struct using the entry's
+   `remoteURL`, `transport`, and name.
+3. Resolves `externalAuthConfigRef` if set (using existing auth resolution
+   logic).
+4. Resolves `headerForward` configuration if set.
+5. Resolves `caBundleRef` if set (fetching the CA certificate from the
+   referenced Secret).
+6. Appends the resulting backends alongside MCPServer-sourced backends.
 
 ##### vMCP: HTTP Client for External TLS
 
 Backends of type `entry` connect to external URLs over HTTPS. The vMCP
-HTTP client must be updated to:
+HTTP client in `pkg/vmcp/client/client.go` must be updated to:
 
 1. Use the system CA certificate pool by default (for public CAs).
 2. Optionally append a custom CA bundle from `caBundleRef` (for private
-   CAs).
-3. Apply the resolved `externalAuthConfigRef` credentials directly to
+   CAs) to the system pool.
+3. Enforce a minimum TLS version of 1.2.
+4. Apply the resolved `externalAuthConfigRef` credentials directly to
    outgoing requests.
-
-```go
-// In pkg/vmcp/client/client.go
-func (c *Client) createTransportForEntry(
-    backend *Backend,
-) (*http.Transport, error) {
-    tlsConfig := &tls.Config{
-        MinVersion: tls.VersionTLS12,
-    }
-
-    if backend.CABundle != nil {
-        pool, err := x509.SystemCertPool()
-        if err != nil {
-            pool = x509.NewCertPool()
-        }
-        if !pool.AppendCertsFromPEM(backend.CABundle) {
-            return nil, fmt.Errorf("failed to parse CA bundle")
-        }
-        tlsConfig.RootCAs = pool
-    }
-
-    return &http.Transport{
-        TLSClientConfig: tlsConfig,
-    }, nil
-}
-```
 
 ##### vMCP: Dynamic Mode Reconciler Update
 
@@ -733,67 +504,26 @@ For dynamic mode (`outgoingAuth.source: discovered`), the reconciler
 infrastructure from THV-0014 must be extended to watch MCPServerEntry
 resources.
 
+**New files:**
+- `pkg/vmcp/k8s/mcpserverentry_watcher.go` - MCPServerEntry reconciler
+
 **Files to modify:**
 - `pkg/vmcp/k8s/manager.go` - Register MCPServerEntry watcher
-- `pkg/vmcp/k8s/mcpserverentry_watcher.go` (new) - MCPServerEntry
-  reconciler
 
-```go
-type MCPServerEntryWatcher struct {
-    client   client.Client
-    registry vmcp.DynamicRegistry
-    groupRef string
-}
+The `MCPServerEntryWatcher` follows the same reconciler pattern as the
+existing `MCPServerWatcher` from THV-0014. It holds a reference to the
+`DynamicRegistry` and the target `groupRef`. On reconciliation:
 
-func (w *MCPServerEntryWatcher) Reconcile(
-    ctx context.Context, req ctrl.Request,
-) (ctrl.Result, error) {
-    backendID := req.NamespacedName.String()
+1. If the resource is deleted (not found), it removes the backend from the
+   registry by namespaced name.
+2. If the entry's `groupRef` doesn't match the watcher's group, it removes
+   the backend (handles group reassignment).
+3. Otherwise, it converts the MCPServerEntry to a `Backend` struct
+   (resolving auth, headers, CA bundle) and upserts it into the registry.
 
-    var entry mcpv1alpha1.MCPServerEntry
-    if err := w.client.Get(ctx, req.NamespacedName, &entry); err != nil {
-        if apierrors.IsNotFound(err) {
-            w.registry.Remove(backendID)
-            return ctrl.Result{}, nil
-        }
-        return ctrl.Result{}, err
-    }
-
-    if entry.Spec.GroupRef != w.groupRef {
-        // Not in our group, remove if previously tracked
-        w.registry.Remove(backendID)
-        return ctrl.Result{}, nil
-    }
-
-    backend, err := w.convertToBackend(ctx, &entry)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
-    backend.ID = backendID
-
-    if err := w.registry.Upsert(backend); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    return ctrl.Result{}, nil
-}
-
-func (w *MCPServerEntryWatcher) SetupWithManager(
-    mgr ctrl.Manager,
-) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&mcpv1alpha1.MCPServerEntry{}).
-        Watches(&mcpv1alpha1.MCPExternalAuthConfig{},
-            handler.EnqueueRequestsFromMapFunc(
-                w.findEntriesForAuthConfig,
-            )).
-        Watches(&corev1.Secret{},
-            handler.EnqueueRequestsFromMapFunc(
-                w.findEntriesForSecret,
-            )).
-        Complete(w)
-}
-```
+The watcher also watches MCPExternalAuthConfig and Secret resources via
+`EnqueueRequestsFromMapFunc` handlers, so changes to referenced auth
+configs or secrets trigger re-reconciliation of affected entries.
 
 ##### vMCP: Static Config Parser Update
 
