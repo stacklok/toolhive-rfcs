@@ -1,4 +1,4 @@
-# RFC-XXXX: MCPServerEntry CRD for Direct Remote MCP Server Backends
+# RFC-0055: MCPServerEntry CRD for Direct Remote MCP Server Backends
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@jaosorior)
