@@ -383,12 +383,6 @@ status:
 
 ##### Operator: New CRD and Controller
 
-**New files:**
-- `cmd/thv-operator/api/v1alpha1/mcpserverentry_types.go` - CRD type
-  definitions
-- `cmd/thv-operator/controllers/mcpserverentry_controller.go` -
-  Validation-only controller
-
 The MCPServerEntry controller is intentionally simple. It performs
 **validation only** and creates **no infrastructure**.
 
@@ -418,10 +412,6 @@ to clean up.
 The MCPGroup controller must be updated to watch MCPServerEntry resources
 in addition to MCPServer resources, so that `status.servers` and
 `status.serverCount` reflect both types of backends in the group.
-
-**Files to modify:**
-- `cmd/thv-operator/controllers/mcpgroup_controller.go` - Add watch for
-  MCPServerEntry, update status aggregation
 
 ##### Operator: VirtualMCPServer Controller Update
 
@@ -459,12 +449,6 @@ backends:
       type: token_exchange
       # ...
 ```
-
-**Files to modify:**
-- `cmd/thv-operator/controllers/virtualmcpserver_controller.go` - Discover
-  MCPServerEntry resources in group
-- `cmd/thv-operator/controllers/virtualmcpserver_vmcpconfig.go` - Include
-  entry backends in ConfigMap generation
 
 ##### vMCP: Backend Type and Discovery
 
@@ -504,12 +488,6 @@ For dynamic mode (`outgoingAuth.source: discovered`), the reconciler
 infrastructure from THV-0014 must be extended to watch MCPServerEntry
 resources.
 
-**New files:**
-- `pkg/vmcp/k8s/mcpserverentry_watcher.go` - MCPServerEntry reconciler
-
-**Files to modify:**
-- `pkg/vmcp/k8s/manager.go` - Register MCPServerEntry watcher
-
 The `MCPServerEntryWatcher` follows the same reconciler pattern as the
 existing `MCPServerWatcher` from THV-0014. It holds a reference to the
 `DynamicRegistry` and the target `groupRef`. On reconciliation:
@@ -530,9 +508,6 @@ configs or secrets trigger re-reconciliation of affected entries.
 The static config parser must be updated to deserialize `type: entry`
 backends from the ConfigMap and create appropriate HTTP clients with
 external TLS support.
-
-**Files to modify:**
-- `pkg/vmcp/config/` - Parse entry-type backends from static config
 
 ## Security Considerations
 
@@ -738,12 +713,9 @@ MCPServerEntry is a purely additive change:
 
 ### Phase 1: CRD and Controller
 
-1. Define `MCPServerEntry` types in
-   `cmd/thv-operator/api/v1alpha1/mcpserverentry_types.go`
-2. Implement validation-only controller in
-   `cmd/thv-operator/controllers/mcpserverentry_controller.go`
-3. Generate CRD manifests (`task operator-generate`,
-   `task operator-manifests`)
+1. Define `MCPServerEntry` CRD types
+2. Implement validation-only controller
+3. Generate CRD manifests
 4. Update MCPGroup controller to watch MCPServerEntry resources
 5. Add unit tests for controller validation logic
 
@@ -759,9 +731,9 @@ MCPServerEntry is a purely additive change:
 
 ### Phase 3: Dynamic Mode Integration
 
-1. Create `MCPServerEntryWatcher` reconciler in `pkg/vmcp/k8s/`
+1. Create MCPServerEntry reconciler for vMCP's dynamic registry
 2. Register watcher in the K8s manager alongside MCPServerWatcher
-3. Update `ListWorkloadsInGroup()` to include MCPServerEntry
+3. Update workload discovery to include MCPServerEntry
 4. Resolve auth configs for entry backends at runtime
 5. Integration tests for dynamic discovery of entry backends
 
