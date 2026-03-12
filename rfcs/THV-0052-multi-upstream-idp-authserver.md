@@ -586,7 +586,7 @@ When token refresh is added, the auth middleware enrichment function is the natu
 
 ### Phase 4: Identity Enrichment and `upstreamswap` Middleware
 
-- Add `UpstreamTokens map[string]string` to the `Identity` struct.
+- Add `UpstreamTokens map[string]string` to the `Identity` struct. Add `UpstreamTokens` to the `Identity` redaction logic.
 - Update the auth middleware to call `GetAllUpstreamTokens` after JWT validation and populate `Identity.UpstreamTokens`.
 - Add `ProviderName` to `upstreamswap.Config`.
 - Update `upstreamswap` middleware to read from `identity.UpstreamTokens[cfg.ProviderName]` instead of calling storage directly.
