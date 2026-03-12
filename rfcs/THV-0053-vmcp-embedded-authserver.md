@@ -227,22 +227,20 @@ Authenticated (auth middleware wraps the handler):
 Implementation:
 
 ```go
-// pkg/vmcp/server/server.go — in Handler()
-addAuthServerHandlers(mux, s.config.AuthServer)
+// pkg/authserver/runner/embeddedauthserver.go
 
-// ...
-
-// addAuthServerHandlers registers the embedded auth server's OAuth/OIDC endpoints
-// on mux. It is a no-op when authServer is nil (Mode A).
-func addAuthServerHandlers(mux *http.ServeMux, authServer *runner.EmbeddedAuthServer) {
-    if authServer == nil {
-        return
-    }
-    h := authServer.Handler()
+// RegisterHandlers mounts the embedded auth server's OAuth/OIDC endpoints on mux.
+func (e *EmbeddedAuthServer) RegisterHandlers(mux *http.ServeMux) {
+    h := e.Handler()
     mux.Handle("/oauth/", h)
     mux.Handle("/.well-known/openid-configuration", h)
     mux.Handle("/.well-known/oauth-authorization-server", h)
     mux.Handle("/.well-known/jwks.json", h)
+}
+
+// pkg/vmcp/server/server.go — in Handler()
+if s.config.AuthServer != nil {
+    s.config.AuthServer.RegisterHandlers(mux)
 }
 ```
 
@@ -459,8 +457,9 @@ spec:
 | `pkg/vmcp/config/config.go` | Add `AuthServer *AuthServerConfig` to `Config`; add `AuthServerConfig` struct |
 | `pkg/vmcp/config/validator.go` | Add `validateAuthServerIntegration`; extend `validateBackendAuthStrategy` for `upstream_inject` V-01/V-06; add `collectAllBackendStrategies`, `hasUpstreamProvider` helpers |
 | `pkg/vmcp/config/zz_generated.deepcopy.go` | Regenerate |
+| `pkg/authserver/runner/embeddedauthserver.go` | Add `RegisterHandlers(mux *http.ServeMux)` method |
 | `cmd/vmcp/app/commands.go` | Conditional AS creation; pass `AuthServer` to server config |
-| `pkg/vmcp/server/server.go` | Add `AuthServer` to server `Config`; mount AS routes via `addAuthServerHandlers`; replace `/.well-known/` catch-all with explicit path registrations |
+| `pkg/vmcp/server/server.go` | Add `AuthServer` to server `Config`; call `RegisterHandlers` to mount AS routes; replace `/.well-known/` catch-all with explicit path registrations |
 | `cmd/thv-operator/api/v1alpha1/mcpserver_types.go` | Remove `ExternalAuthConfigRef` struct definition (moved) |
 | `cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go` | Add `ExternalAuthConfigRef` struct definition (moved from `mcpserver_types.go`) |
 | `cmd/thv-operator/api/v1alpha1/virtualmcpserver_types.go` | Add `AuthServerConfigRef *ExternalAuthConfigRef` to `VirtualMCPServerSpec`; add `validateAuthServerConfig` method |
@@ -622,7 +621,7 @@ Mode A (no AS) behavior is preserved exactly:
 
 **`pkg/vmcp/server/` — Route Mounting**: HTTP handler tests (using `httptest.NewRecorder`) verifying:
 - Mode A: `/.well-known/openid-configuration` and `/oauth/` return 404; `/.well-known/oauth-protected-resource` returns the correct RFC 9728 response.
-- Mode B: AS routes are served by `addAuthServerHandlers`; `/.well-known/oauth-protected-resource` continues to be served; unauthenticated requests to the MCP catch-all return 401.
+- Mode B: AS routes are served by `EmbeddedAuthServer.RegisterHandlers`; `/.well-known/oauth-protected-resource` continues to be served; unauthenticated requests to the MCP catch-all return 401.
 
 ### E2E Tests
 
