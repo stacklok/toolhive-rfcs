@@ -236,7 +236,8 @@ spec:
           key: api-key
 
   # OPTIONAL: Custom CA bundle for private remote servers using
-  # internal/self-signed certificates.
+  # internal/self-signed certificates. References a ConfigMap (not Secret)
+  # because CA certificates are public data.
   caBundleRef:
     name: internal-ca-bundle
     key: ca.crt
@@ -323,10 +324,10 @@ URL, Transport, Group, Ready status, and Age.
 |-------|------|----------|-------------|
 | `remoteURL` | string | Yes | URL of the remote MCP server. Must match `^https?://`. HTTPS enforced unless `toolhive.stacklok.dev/allow-insecure` annotation is set. |
 | `transport` | enum | Yes | MCP transport protocol: `streamable-http` or `sse`. |
-| `groupRef` | string | Yes | Name of the MCPGroup this entry belongs to (min length: 1). |
+| `groupRef` | string | Yes | Name of the MCPGroup this entry belongs to (min length: 1). Uses a plain string (not `LocalObjectReference`) for consistency with `MCPServer.spec.groupRef` and `MCPRemoteProxy.spec.groupRef`. |
 | `externalAuthConfigRef` | object | No | Reference to an MCPExternalAuthConfig in the same namespace. Omit for unauthenticated endpoints. |
 | `headerForward` | object | No | Header forwarding configuration. Reuses existing `HeaderForwardConfig` type from MCPRemoteProxy. |
-| `caBundleRef` | object | No | Reference to a Secret containing a custom CA certificate bundle for TLS verification. |
+| `caBundleRef` | object | No | Reference to a ConfigMap containing a custom CA certificate bundle for TLS verification. ConfigMap is used rather than Secret because CA certificates are public data, consistent with the `kube-root-ca.crt` pattern. |
 
 **Status fields:**
 
@@ -463,8 +464,11 @@ resources. For each MCPServerEntry in the group, vMCP:
 1. Lists MCPServerEntry resources filtered by `spec.groupRef`.
 2. Converts each entry to an internal `Backend` struct using the entry's
    `remoteURL`, `transport`, and name.
-3. Resolves `externalAuthConfigRef` if set (using existing auth resolution
-   logic).
+3. If `externalAuthConfigRef` is set, loads the referenced
+   MCPExternalAuthConfig spec and stores the auth strategy (token exchange
+   endpoint, client credentials reference, audience) in the `Backend`
+   struct. Actual token exchange is deferred to request time because
+   tokens are short-lived and may be per-user.
 4. Resolves `headerForward` configuration if set.
 5. Resolves `caBundleRef` if set (fetching the CA certificate from the
    referenced Secret).
@@ -517,7 +521,7 @@ external TLS support.
 |--------|-------------|------------|
 | Man-in-the-middle on remote connection | Attacker intercepts vMCP-to-remote traffic | HTTPS required by default; custom CA bundles for private CAs |
 | Credential exposure in CRD spec | Auth secrets visible in CRD manifest | Credentials stored in K8s Secrets, referenced via `externalAuthConfigRef` and `headerForward.addHeadersFromSecrets`; never inline in CRD spec |
-| SSRF via remoteURL | Operator configures URL pointing to internal services | Mitigated by RBAC (only authorized users create MCPServerEntry); annotation required for non-HTTPS; NetworkPolicy should restrict vMCP egress |
+| SSRF via remoteURL | Operator configures URL pointing to internal services | Mitigated by RBAC (only authorized users create MCPServerEntry); annotation required for non-HTTPS; NetworkPolicy should restrict vMCP egress. Note: CEL-based IP range blocking (e.g., RFC 1918) is intentionally not applied because MCPServerEntry legitimately targets internal/corporate MCP servers. RBAC is the appropriate control layer since resource creation is restricted to trusted operators. |
 | Auth config confusion (existing issue) | Dual-boundary auth leading to wrong tokens sent to wrong endpoints | Eliminated: MCPServerEntry has exactly one auth boundary with one purpose |
 | Operator probing external URLs | Controller making network requests to untrusted URLs | Eliminated: controller performs validation only, no network probing |
 
@@ -543,7 +547,8 @@ external TLS support.
 - **At rest**: No sensitive data stored in MCPServerEntry spec. Auth
   credentials are in K8s Secrets, referenced indirectly.
 - **CA bundles**: Custom CA certificates referenced via `caBundleRef`,
-  stored in K8s Secrets/ConfigMaps with standard K8s encryption at rest.
+  stored in K8s ConfigMaps. CA certificates are public data and do not
+  require Secret-level protection.
 
 ### Input Validation
 
@@ -563,6 +568,17 @@ external TLS support.
   - **Dynamic mode**: vMCP reads secrets at runtime via K8s API
     (namespace-scoped RBAC).
   - **Static mode**: Operator mounts secrets as environment variables.
+- **CA bundle propagation** differs from credential secrets because CA
+  certificates are multi-line PEM data that must be loaded from the
+  filesystem (Go's `crypto/tls` loads CA bundles via file reads, not
+  environment variables):
+  - **Dynamic mode**: vMCP reads the CA bundle data from the K8s API
+    at runtime (from the ConfigMap referenced by `caBundleRef`).
+  - **Static mode**: The operator mounts the ConfigMap referenced by
+    `caBundleRef` as a **volume** into the vMCP pod at a well-known
+    path (e.g., `/etc/toolhive/ca-bundles/<entry-name>/ca.crt`). The
+    generated backend ConfigMap includes the mount path so vMCP can
+    construct the `tls.Config` at startup.
 - Secret rotation follows existing patterns:
   - **Dynamic mode**: Watch-based propagation, no pod restart needed.
   - **Static mode**: Requires pod restart (Deployment rollout).
@@ -596,8 +612,7 @@ Embed remote server configuration directly in the VirtualMCPServer CRD.
 ```yaml
 kind: VirtualMCPServer
 spec:
-  groupRef:
-    name: engineering-team
+  groupRef: engineering-team
   remoteServerRefs:
     - name: context7
       remoteURL: https://mcp.context7.com/mcp
@@ -724,10 +739,14 @@ MCPServerEntry is a purely additive change:
 1. Update VirtualMCPServer controller to discover MCPServerEntry resources
    in the group
 2. Update ConfigMap generation to include entry-type backends
-3. Update vMCP static config parser to deserialize entry backends
-4. Add `BackendTypeEntry` to vMCP types
-5. Implement external TLS transport creation for entry backends
-6. Integration tests with envtest
+3. Mount CA bundle ConfigMaps as volumes into the vMCP pod for entries
+   that specify `caBundleRef` (at a well-known path such as
+   `/etc/toolhive/ca-bundles/<entry-name>/`)
+4. Update vMCP static config parser to deserialize entry backends
+5. Add `BackendTypeEntry` to vMCP types
+6. Implement external TLS transport creation for entry backends
+   (loading CA bundles from mounted volume paths)
+7. Integration tests with envtest
 
 ### Phase 3: Dynamic Mode Integration
 
@@ -819,8 +838,10 @@ MCPServerEntry is a purely additive change:
    allowing local development workflows.
 
 2. **Should the CRD support custom CA bundles for private remote servers?**
-   Recommendation: Yes, via `caBundleRef` field referencing a Secret or
-   ConfigMap. This is essential for enterprises with internal CAs. The
+   Recommendation: Yes, via `caBundleRef` field referencing a ConfigMap.
+   CA certificates are public data and ConfigMap is the semantically
+   appropriate resource type, consistent with the `kube-root-ca.crt`
+   pattern. This is essential for enterprises with internal CAs. The
    current design includes this field.
 
 3. **Should there be a `disabled` field for temporarily removing an entry
@@ -832,10 +853,18 @@ MCPServerEntry is a purely additive change:
 4. **Should MCPServerEntry support `toolConfigRef` for tool filtering?**
    MCPRemoteProxy supports tool filtering via `toolConfigRef`.
    VirtualMCPServer also has its own tool filtering/override configuration
-   in `spec.aggregation.tools`. For MCPServerEntry, tool filtering should
-   be configured at the VirtualMCPServer level (where it already exists)
-   rather than duplicating it on the entry. Defer unless there is a clear
-   use case for entry-level filtering.
+   in `spec.aggregation.tools`, which supports per-backend filtering via
+   the `workload` field (e.g., `tools: [{workload: "salesforce", filter: [...]}]`).
+   For MCPServerEntry, tool filtering should be configured at the
+   VirtualMCPServer level rather than duplicating it on the entry.
+   **Migration note:** Users migrating from MCPRemoteProxy who rely on
+   `toolConfigRef` for per-backend tool filtering should configure
+   equivalent filtering in `VirtualMCPServer.spec.aggregation.tools`
+   with the `workload` field set to the MCPServerEntry name. If
+   post-implementation feedback reveals that `aggregation.tools` is
+   insufficient for per-backend filtering use cases, `toolConfigRef`
+   can be added to MCPServerEntry in a follow-up without breaking
+   changes.
 
 ## References
 
