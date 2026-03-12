@@ -131,10 +131,10 @@ Add an optional field to `TokenExchangeConfig`:
 type TokenExchangeConfig struct {
     // ... existing fields unchanged ...
 
-    // SubjectProviderName, when set, causes the strategy to use
-    // identity.UpstreamTokens[SubjectProviderName] as the RFC 8693 subject token
-    // instead of identity.Token. Use this when the backend STS trusts an upstream IDP
-    // directly rather than the TH-AS issuer.
+    // SubjectProviderName, when set, causes the bearer token sent to the backend STS
+    // to come from the named upstream identity provider rather than the ToolHive
+    // auth server. Use this when the backend STS trusts an upstream IDP directly
+    // rather than the TH-AS issuer.
     // +optional
     SubjectProviderName string `json:"subjectProviderName,omitempty" yaml:"subjectProviderName,omitempty"`
 }
@@ -438,10 +438,10 @@ Add `subjectProviderName` to the existing `TokenExchangeConfig` CRD struct so Ku
 type TokenExchangeConfig struct {
     // ... existing fields unchanged ...
 
-    // SubjectProviderName, when set, causes the strategy to use
-    // identity.UpstreamTokens[SubjectProviderName] as the RFC 8693 subject token
-    // instead of identity.Token. Use this when the backend STS trusts an upstream IDP
-    // directly rather than the TH-AS issuer.
+    // SubjectProviderName, when set, causes the bearer token sent to the backend STS
+    // to come from the named upstream identity provider rather than the ToolHive
+    // auth server. Use this when the backend STS trusts an upstream IDP directly
+    // rather than the TH-AS issuer.
     // The named provider must be configured in the VirtualMCPServer's embedded auth server.
     // +optional
     SubjectProviderName string `json:"subjectProviderName,omitempty"`
