@@ -571,12 +571,12 @@ type Session interface {
 **Separation of concerns**: The Session interface focuses on domain logic (capabilities, routing, client ownership). This RFC builds on the existing pluggable session storage architecture ([PR #1989](https://github.com/stacklok/toolhive/pull/1989)) which provides `Storage` interface and `Manager` for Redis/Valkey support.
 
 **Dual-layer architecture** (detailed in section "Session Architecture and Serializability"):
-- **Metadata layer** (serializable): Session ID, timestamps, identity subject, and per-backend metadata (workload ID, backend-assigned `Mcp-Session-Id`, proxyrunner pod URL) — stored via `transportsession.Manager` + `Storage` interface (supports `LocalStorage` today, `RedisStorage` in future)
+- **Metadata layer** (serializable): Session ID, timestamps, identity subject, and per-backend metadata (workload ID, backend-assigned `Mcp-Session-Id`) — stored via `transportsession.Manager` + `Storage` interface (supports `LocalStorage` today, `RedisStorage` in future)
 - **Runtime layer** (in-memory only): MCP client objects, routing table, capabilities — cannot be serialized due to TCP connections and goroutines
 
 **Lifecycle management**: Sessions are stored via `transportsession.Manager.AddSession()` and expire based on configured TTL. Proper cleanup requires calling `session.Close()` to release backend client connections before removing from storage. The existing `Storage.DeleteExpired()` implementation only removes metadata without calling `Close()`, which would leak connections. This RFC updates the storage layer to call `Close()` before deletion, ensuring complete resource cleanup (see Implementation Plan Phase 3).
 
-**Horizontal scaling**: Sticky sessions (session affinity at the load balancer) are preferred for performance because they keep backend clients warm. When a Redis-backed `Storage` is configured, a request routed to a different vMCP pod can reconstruct the session runtime from the persisted metadata layer at a one-time cost per re-route. The per-backend metadata (proxyrunner URL + backend session ID) is what makes this reconstruction safe rather than disruptive — the new pod resumes the existing backend session rather than starting a new one. See [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) for the full horizontal scaling design and the routing algorithm (cases 1–4) that governs this flow.
+**Horizontal scaling**: Sticky sessions (session affinity at the load balancer) are preferred for performance because they keep backend clients warm. When a Redis-backed `Storage` is configured, a request routed to a different vMCP pod can reconstruct the session runtime from the persisted metadata layer at a one-time cost per re-route. vMCP routes to any MCP server, so the new pod uses the stored backend session ID to resume the existing backend session rather than starting a new one. See [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) for the full horizontal scaling design and the routing algorithm (cases 1–4) that governs this flow.
 
 **SessionFactory Interface** - Creates fully-formed sessions:
 
@@ -771,10 +771,10 @@ Sessions are split into two layers with different lifecycles:
 
 | Layer | Contents | Storage | Lifetime |
 |-------|----------|---------|----------|
-| **Metadata** | vMCP session ID, timestamps, identity subject; per-backend: workload ID, backend-assigned session ID (`Mcp-Session-Id`), proxyrunner pod URL | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
+| **Metadata** | vMCP session ID, timestamps, identity subject; per-backend: workload ID, backend-assigned session ID (`Mcp-Session-Id`) | Serializable to Redis/Valkey via `Storage` interface | Persists across vMCP restarts, shared across instances |
 | **Runtime** | MCP client objects, routing table (tool→backendID), capabilities, closed flag | In-process memory only | Lives only while vMCP instance is running |
 
-> **Why backend session IDs belong in the metadata layer**: The backend-assigned `Mcp-Session-Id` and proxyrunner pod URL are serializable identifiers, not live connection state. Persisting them is what enables a different vMCP pod to reconstruct the runtime layer safely: it can re-establish a connection to the exact proxyrunner pod using the stored URL and resume the existing backend session using the stored session ID, rather than discarding the backend session and starting over. This is the key design contract that [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) §4.2 builds on.
+> **Why backend session IDs belong in the metadata layer**: The backend-assigned `Mcp-Session-Id` is a serializable identifier, not live connection state. Persisting it enables a different vMCP pod to resume the existing backend session using the stored session ID, rather than discarding it and starting over. vMCP routes to any MCP server, so no pod URL is needed. This is the key design contract that [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) §4.2 builds on.
 
 **How it works**:
 - The behavior-oriented `Session` embeds `transportsession.Session` (metadata layer) and owns MCP clients (runtime layer)
@@ -795,7 +795,7 @@ Without sticky sessions (graceful degradation):
 - Trade-off: horizontal scaling flexibility vs temporary performance impact on instance switch
 
 > **Future: Additional metadata for horizontal scaling** *(not implemented in this RFC; see [THV-XXXX: Horizontal Scaling for vMCP and Proxy Runner](https://github.com/stacklok/toolhive-rfcs/pull/47))*
-> The metadata layer stores additional per-backend data that goes beyond single-instance operation needs: for each backend, the session persists the proxyrunner pod URL and the backend-assigned `Mcp-Session-Id`. This data is not used in the current single-replica deployment, but it is the foundation for future horizontal scaling: a different vMCP instance can use these stored identifiers to reconnect to the exact proxyrunner and resume the existing backend session rather than re-initializing from scratch and breaking stateful backends.
+> The metadata layer stores per-backend data that goes beyond single-instance operation needs: for each backend, the session persists the backend-assigned `Mcp-Session-Id`. This data is not used in the current single-replica deployment, but it is the foundation for future horizontal scaling: a different vMCP instance can use the stored session ID to resume the existing backend session rather than re-initializing from scratch and breaking stateful backends. vMCP routes to any MCP server, so no pod URL is required.
 
 > **Future challenge: Session storage across multiple vMCP replicas** *(not addressed in this RFC; see [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47))*
 > When multiple vMCP replicas are deployed, each instance holds session runtime state (backend connections, routing table) in local memory only. A request reaching a replica that did not initialize a given session cannot reuse its backend connections — it would have to reconstruct the runtime from the persisted metadata, incurring re-initialization cost. Solving this properly — with Redis-backed shared session storage, session-aware routing at the load balancer level, and replica configuration exposed in CRDs (`VirtualMCPServer.spec.replicas`) — is the subject of [THV-XXXX](https://github.com/stacklok/toolhive-rfcs/pull/47) and is out of scope for this RFC.
@@ -1404,7 +1404,7 @@ When `SessionFactory.MakeSession()` runs:
 1. Create and initialize one MCP client per backend **in parallel** (with bounded concurrency, per-backend timeouts)
 2. Capture backend session IDs from clients (via `client.SessionID()`) for observability
 3. Pass clients to aggregator to discover capabilities from all backends
-4. Create `transportsession.Session` for metadata layer (ID, timestamps, identity subject). Once clients are initialized and backend session IDs captured, write the per-backend metadata (workload ID, backend-assigned `Mcp-Session-Id`, proxyrunner pod URL) to the session's `Data` field as a structured JSON payload. This write happens inside `SessionFactory.MakeSession()` after all clients are initialized, so the metadata layer is always complete before the session is stored.
+4. Create `transportsession.Session` for metadata layer (ID, timestamps, identity subject). Once clients are initialized and backend session IDs captured, write the per-backend metadata (workload ID, backend-assigned `Mcp-Session-Id`) to the session's `Data` field as a structured JSON payload. This write happens inside `SessionFactory.MakeSession()` after all clients are initialized, so the metadata layer is always complete before the session is stored.
 5. Return behavior-oriented session that embeds transport session + owns clients map + backend session IDs map
 
 **Testing**:
