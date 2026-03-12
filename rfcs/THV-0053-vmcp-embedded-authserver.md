@@ -33,7 +33,7 @@ Even if upstream tokens were somehow obtained, vMCP has no unified, per-request 
 - Allow the AS to be configured with one or more upstream IDPs (depends on RFC-0052 for multi-upstream support).
 - Wire the embedded AS's OAuth/OIDC endpoints at the same origin as the vMCP server so OIDC discovery works as a loopback.
 - Extend the incoming OIDC auth middleware to eagerly load upstream tokens from the AS's storage into `identity.UpstreamTokens` when validating TH-JWTs (depends on RFC-0052).
-- Add Kubernetes CRD support via `VirtualMCPServerSpec.AuthServerConfig *ExternalAuthConfigRef` referencing an `MCPExternalAuthConfig` of type `embeddedAuthServer`.
+- Add Kubernetes CRD support via `VirtualMCPServerSpec.AuthServerConfigRef *ExternalAuthConfigRef` referencing an `MCPExternalAuthConfig` of type `embeddedAuthServer`.
 - Add corresponding `Config.AuthServer *AuthServerConfig` in `pkg/vmcp/config/config.go` for the YAML/CLI path.
 - Enforce cross-cutting validation rules so misconfigured `issuer`, `audience`, and `upstream_inject` provider references fail fast at startup and at operator reconciliation.
 - Maintain byte-for-byte backward compatibility.
@@ -118,7 +118,7 @@ type AuthServerConfig struct {
 type VirtualMCPServerSpec struct {
     // ... existing fields unchanged ...
 
-    // AuthServerConfig references an MCPExternalAuthConfig resource that configures
+    // AuthServerConfigRef references an MCPExternalAuthConfig resource that configures
     // the embedded OAuth authorization server for this VirtualMCPServer.
     // The referenced MCPExternalAuthConfig must be of type "embeddedAuthServer" and
     // must exist in the same namespace.
@@ -126,7 +126,7 @@ type VirtualMCPServerSpec struct {
     // incoming clients and accumulates upstream IDP tokens during authorization.
     // IncomingAuth.OIDCConfig.Inline.Issuer must match the AS's configured issuer.
     // +optional
-    AuthServerConfig *ExternalAuthConfigRef `json:"authServerConfig,omitempty"`
+    AuthServerConfigRef *ExternalAuthConfigRef `json:"authServerConfigRef,omitempty"`
 }
 ```
 
@@ -136,11 +136,11 @@ Add a new `validateAuthServerConfig` method called from `Validate()`:
 
 ```go
 func (r *VirtualMCPServer) validateAuthServerConfig() error {
-    if r.Spec.AuthServerConfig == nil {
+    if r.Spec.AuthServerConfigRef == nil {
         return nil
     }
-    if r.Spec.AuthServerConfig.Name == "" {
-        return fmt.Errorf("spec.authServerConfig.name is required when authServerConfig is set")
+    if r.Spec.AuthServerConfigRef.Name == "" {
+        return fmt.Errorf("spec.authServerConfigRefRef.name is required when authServerConfigRef is set")
     }
     // Runtime cross-resource validation (type check, issuer consistency) is
     // performed by the operator reconciler which can resolve the referenced CRD.
@@ -154,7 +154,7 @@ Cross-resource validation (verifying the referenced `MCPExternalAuthConfig` is o
 
 The deployment controller for `VirtualMCPServer` gains auth server validation during reconciliation:
 
-1. If `spec.authServerConfig` is set, resolve the referenced `MCPExternalAuthConfig`.
+1. If `spec.authServerConfigRef` is set, resolve the referenced `MCPExternalAuthConfig`.
 2. Verify the resolved config is of type `embeddedAuthServer` (surface as status condition `AuthServerConfigValid` if not).
 3. Extract the AS `Issuer` from the resolved `EmbeddedAuthServerConfig`.
 4. Verify `spec.incomingAuth.oidcConfig.inline.issuer` matches the AS issuer (V-04). Surface as status condition.
@@ -164,7 +164,7 @@ Invalid configurations produce a `Failed` phase with a descriptive condition mes
 
 #### CRD-to-Config Conversion (`cmd/thv-operator/pkg/vmcpconfig/converter.go`)
 
-The converter gains a new resolution step: when `spec.authServerConfig` is set, it resolves the referenced `MCPExternalAuthConfig`, extracts the `EmbeddedAuthServerConfig`, converts it to `authserver.RunConfig`, and populates `config.AuthServer.RunConfig`. This follows the same pattern as existing OIDC and outgoing auth resolution.
+The converter gains a new resolution step: when `spec.authServerConfigRef` is set, it resolves the referenced `MCPExternalAuthConfig`, extracts the `EmbeddedAuthServerConfig`, converts it to `authserver.RunConfig`, and populates `config.AuthServer.RunConfig`. This follows the same pattern as existing OIDC and outgoing auth resolution.
 
 **`allowedAudiences` is not a field on `EmbeddedAuthServerConfig` in the CRD.** The `MCPExternalAuthConfig` spec intentionally omits `allowedAudiences` because the correct value is not known at the time the `MCPExternalAuthConfig` is authored — it depends on the `VirtualMCPServer` that will reference it. Instead, the converter derives the `allowedAudiences` value from the referencing `VirtualMCPServer`:
 
@@ -196,12 +196,8 @@ if cfg.AuthServer != nil {
     defer authServer.Close()
 }
 
-// Step 2: Pass AS handler to server config (nil if no AS)
-var authServerHandler http.Handler
-if authServer != nil {
-    authServerHandler = authServer.Handler()
-}
-serverCfg.AuthServerHandler = authServerHandler
+// Step 2: Pass AS to server config (nil if no AS)
+serverCfg.AuthServer = authServer
 ```
 
 Note: Upstream tokens are accessed by outgoing auth strategies via `identity.UpstreamTokens` (populated by the OIDC auth middleware after TH-JWT validation).
@@ -232,28 +228,29 @@ Implementation:
 
 ```go
 // pkg/vmcp/server/server.go — in Handler()
+addAuthServerHandlers(mux, s.config.AuthServer)
 
-// Auth server endpoints (conditional, unauthenticated)
-if s.config.AuthServerHandler != nil {
-    mux.Handle("/oauth/", s.config.AuthServerHandler)
-    mux.Handle("/.well-known/openid-configuration", s.config.AuthServerHandler)
-    mux.Handle("/.well-known/oauth-authorization-server", s.config.AuthServerHandler)
-    mux.Handle("/.well-known/jwks.json", s.config.AuthServerHandler)
-}
+// ...
 
-// RFC 9728 Protected Resource Metadata — explicit path (replaces catch-all)
-if wellKnownHandler := auth.NewWellKnownHandler(s.config.AuthInfoHandler); wellKnownHandler != nil {
-    mux.Handle("/.well-known/oauth-protected-resource", wellKnownHandler)
-    mux.Handle("/.well-known/oauth-protected-resource/", wellKnownHandler)
+// addAuthServerHandlers registers the embedded auth server's OAuth/OIDC endpoints
+// on mux. It is a no-op when authServer is nil (Mode A).
+func addAuthServerHandlers(mux *http.ServeMux, authServer *runner.EmbeddedAuthServer) {
+    if authServer == nil {
+        return
+    }
+    h := authServer.Handler()
+    mux.Handle("/oauth/", h)
+    mux.Handle("/.well-known/openid-configuration", h)
+    mux.Handle("/.well-known/oauth-authorization-server", h)
+    mux.Handle("/.well-known/jwks.json", h)
 }
 ```
 
 The server `Config` struct gains:
 
 ```go
-// AuthServerHandler is the HTTP handler for the embedded auth server's
-// OAuth/OIDC endpoints. nil when no auth server is configured (Mode A).
-AuthServerHandler http.Handler
+// AuthServer is the embedded auth server. nil when no auth server is configured (Mode A).
+AuthServer *runner.EmbeddedAuthServer
 ```
 
 #### Self-Referencing OIDC Discovery
@@ -376,7 +373,7 @@ func (v *DefaultValidator) validateAuthServerIntegration(cfg *Config) error {
 # Mode B: vMCP with embedded auth server (YAML path)
 authServer:
   runConfig:
-    issuer: "http://vmcp-service.my-namespace.svc.cluster.local:4483"
+    issuer: "https://vmcp.example.com"
     upstreams:
       - name: corporate-idp
         type: oidc
@@ -385,7 +382,7 @@ authServer:
           client_id: "vmcp-prod"
           client_secret_env_var: "CORP_IDP_CLIENT_SECRET"
     allowed_audiences:
-      - "http://vmcp-service.my-namespace.svc.cluster.local:4483"
+      - "https://vmcp.example.com"
     storage:
       type: memory  # use redis for production
 
@@ -441,7 +438,7 @@ metadata:
   name: my-vmcp
   namespace: my-namespace
 spec:
-  authServerConfig:
+  authServerConfigRef:
     name: vmcp-auth-server       # must be type embeddedAuthServer (validated by reconciler)
   incomingAuth:
     type: oidc
@@ -462,12 +459,12 @@ spec:
 | `pkg/vmcp/config/config.go` | Add `AuthServer *AuthServerConfig` to `Config`; add `AuthServerConfig` struct |
 | `pkg/vmcp/config/validator.go` | Add `validateAuthServerIntegration`; extend `validateBackendAuthStrategy` for `upstream_inject` V-01/V-06; add `collectAllBackendStrategies`, `hasUpstreamProvider` helpers |
 | `pkg/vmcp/config/zz_generated.deepcopy.go` | Regenerate |
-| `cmd/vmcp/app/commands.go` | Conditional AS creation; pass `AuthServerHandler` to server config |
-| `pkg/vmcp/server/server.go` | Add `AuthServerHandler` to server `Config`; mount AS routes conditionally; replace `/.well-known/` catch-all with explicit path registrations |
+| `cmd/vmcp/app/commands.go` | Conditional AS creation; pass `AuthServer` to server config |
+| `pkg/vmcp/server/server.go` | Add `AuthServer` to server `Config`; mount AS routes via `addAuthServerHandlers`; replace `/.well-known/` catch-all with explicit path registrations |
 | `cmd/thv-operator/api/v1alpha1/mcpserver_types.go` | Remove `ExternalAuthConfigRef` struct definition (moved) |
 | `cmd/thv-operator/api/v1alpha1/mcpexternalauthconfig_types.go` | Add `ExternalAuthConfigRef` struct definition (moved from `mcpserver_types.go`) |
-| `cmd/thv-operator/api/v1alpha1/virtualmcpserver_types.go` | Add `AuthServerConfig *ExternalAuthConfigRef` to `VirtualMCPServerSpec`; add `validateAuthServerConfig` method |
-| `cmd/thv-operator/pkg/vmcpconfig/converter.go` | Resolve `spec.authServerConfig` ref → `AuthServerConfig.RunConfig` during CRD conversion |
+| `cmd/thv-operator/api/v1alpha1/virtualmcpserver_types.go` | Add `AuthServerConfigRef *ExternalAuthConfigRef` to `VirtualMCPServerSpec`; add `validateAuthServerConfig` method |
+| `cmd/thv-operator/pkg/vmcpconfig/converter.go` | Resolve `spec.authServerConfigRef` ref → `AuthServerConfig.RunConfig` during CRD conversion |
 | `cmd/thv-operator/controllers/virtualmcpserver_controller.go` | Add auth server cross-resource validation (type check, issuer/audience consistency) |
 
 ## Security Considerations
@@ -566,8 +563,8 @@ Create a new CRD specifically for vMCP auth server configuration, separate from 
 
 Mode A (no AS) behavior is preserved exactly:
 - `Config.AuthServer` is `omitempty` and optional — existing configs that do not include it continue to work without changes.
-- `VirtualMCPServerSpec.AuthServerConfig` is optional — existing `VirtualMCPServer` resources continue to work without changes.
-- All code paths gated on `cfg.AuthServer != nil` or `s.config.AuthServerHandler != nil` are not entered when AS is absent.
+- `VirtualMCPServerSpec.AuthServerConfigRef` is optional — existing `VirtualMCPServer` resources continue to work without changes.
+- All code paths gated on `cfg.AuthServer != nil` or `s.config.AuthServer != nil` are not entered when AS is absent.
 - The change from `mux.Handle("/.well-known/", ...)` catch-all to explicit `/.well-known/oauth-protected-resource` registration is non-breaking: the only path currently served by that catch-all handler is `oauth-protected-resource`; all other `/.well-known/` paths return 404 in both old and new code.
 
 **Moving `ExternalAuthConfigRef`**: This is a struct definition move within the same Go package (`v1alpha1`). The struct is exported; all existing references by package-qualified name (e.g., `v1alpha1.ExternalAuthConfigRef`) are unaffected. No API surface changes.
@@ -583,7 +580,7 @@ Mode A (no AS) behavior is preserved exactly:
 ### Phase 1: Foundation (no runtime behavior change)
 
 - Move `ExternalAuthConfigRef` from `mcpserver_types.go` to `mcpexternalauthconfig_types.go`.
-- Add `AuthServerConfig *ExternalAuthConfigRef` to `VirtualMCPServerSpec`.
+- Add `AuthServerConfigRef *ExternalAuthConfigRef` to `VirtualMCPServerSpec`.
 - Add `validateAuthServerConfig()` structural validation in `VirtualMCPServer.Validate()`.
 - Add `AuthServer *AuthServerConfig` to `pkg/vmcp/config/config.go`.
 - Regenerate `zz_generated.deepcopy.go`.
@@ -592,7 +589,7 @@ Mode A (no AS) behavior is preserved exactly:
 ### Phase 2: Server wiring
 
 - Conditional AS creation in `cmd/vmcp/app/commands.go`.
-- Add `AuthServerHandler` to server `Config` in `pkg/vmcp/server/server.go`.
+- Add `AuthServer` to server `Config` in `pkg/vmcp/server/server.go`.
 - Mount AS HTTP routes conditionally; replace `/.well-known/` catch-all.
 - End-to-end smoke test: start vMCP with Mode B config, confirm `/.well-known/openid-configuration` returns AS metadata.
 
@@ -604,7 +601,7 @@ Mode A (no AS) behavior is preserved exactly:
 
 ### Phase 4: Operator reconciler
 
-- Resolve `spec.authServerConfig` ref in the `VirtualMCPServer` controller.
+- Resolve `spec.authServerConfigRef` ref in the `VirtualMCPServer` controller.
 - Cross-resource validation: type check, V-04, V-07.
 - New status condition `AuthServerConfigValid`.
 - CRD-to-config converter updates.
@@ -625,7 +622,7 @@ Mode A (no AS) behavior is preserved exactly:
 
 **`pkg/vmcp/server/` — Route Mounting**: HTTP handler tests (using `httptest.NewRecorder`) verifying:
 - Mode A: `/.well-known/openid-configuration` and `/oauth/` return 404; `/.well-known/oauth-protected-resource` returns the correct RFC 9728 response.
-- Mode B: AS routes are served by the `AuthServerHandler`; `/.well-known/oauth-protected-resource` continues to be served; unauthenticated requests to the MCP catch-all return 401.
+- Mode B: AS routes are served by `addAuthServerHandlers`; `/.well-known/oauth-protected-resource` continues to be served; unauthenticated requests to the MCP catch-all return 401.
 
 ### E2E Tests
 
@@ -643,7 +640,7 @@ In `test/e2e/`, using the Ginkgo + Gomega style (`Describe`/`Context`/`It`, `By(
 
 ## Documentation
 
-- Update `docs/arch/09-operator-architecture.md`: new `VirtualMCPServerSpec.AuthServerConfig` field and operator reconciliation steps.
+- Update `docs/arch/09-operator-architecture.md`: new `VirtualMCPServerSpec.AuthServerConfigRef` field and operator reconciliation steps.
 - Update `docs/arch/02-core-concepts.md`: Mode A / Mode B distinction for vMCP auth.
 - Add vMCP auth server guide to `docs/`: configuration walkthrough, example YAML, troubleshooting the self-referencing OIDC discovery.
 - Update generated CRD documentation (`task docs`).
