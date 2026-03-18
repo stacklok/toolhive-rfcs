@@ -1,7 +1,7 @@
 # RFC-0057: Rate Limiting for MCP Servers
 
 - **Status**: Draft
-- **Author(s)**: Jeremy Drouillard (@JAYD3V)
+- **Author(s)**: Jeremy Drouillard (@jerm-dro)
 - **Created**: 2026-03-18
 - **Last Updated**: 2026-03-18
 - **Target Repository**: toolhive
@@ -181,7 +181,7 @@ When a request is rate-limited, the middleware returns an MCP-appropriate error 
 
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
-| 2026-03-18 | @JAYD3V | Draft | Initial submission |
+| 2026-03-18 | @jerm-dro | Draft | Initial submission |
 
 ### Implementation Tracking
 
