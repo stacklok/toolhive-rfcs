@@ -1,4 +1,4 @@
-# RFC-XXXX: Rate Limiting for MCP Servers
+# RFC-0057: Rate Limiting for MCP Servers
 
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@JAYD3V)
