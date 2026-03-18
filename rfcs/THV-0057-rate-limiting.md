@@ -9,14 +9,15 @@
 
 ## Summary
 
-Add configurable rate limiting to ToolHive's proxy layer, supporting per-user and global limits at both the server and individual tool level. Rate limits are configured declaratively on `MCPServer` and `VirtualMCPServer` resources and enforced by a new middleware in the proxy chain, with Redis as the shared counter backend.
+Enable rate limiting for `MCPServer` and `VirtualMCPServer`, supporting per-user and global limits at both the server and individual operation level. Rate limits are configured declaratively on the resource spec and enforced by a new middleware in the middleware chain, with Redis as the shared counter backend.
 
 ## Problem Statement
 
-ToolHive currently has no mechanism to limit the rate of requests flowing through its proxy layer. This creates two distinct risks for operators:
+ToolHive currently has no mechanism to limit the rate of requests flowing through its proxy layer. This creates several risks for operators:
 
 1. **Noisy-neighbor problem**: A single authenticated user can consume unbounded resources, degrading the experience for all other users of a shared MCP server.
 2. **Downstream overload**: Aggregate traffic spikes — even when no single user is misbehaving — can overwhelm the upstream MCP server or the external services it depends on (APIs with their own rate limits, databases, etc.).
+3. **Agent data exfiltration**: AI agents can invoke tools in tight loops to export large volumes of data. Without per-tool or per-user limits, there is no mechanism to cap this behavior.
 
 These risks grow as ToolHive deployments move from single-user local setups to shared, multi-user Kubernetes environments. Without rate limiting, operators have no knob to turn between "fully open" and "take the server offline."
 
@@ -40,7 +41,7 @@ These risks grow as ToolHive deployments move from single-user local setups to s
 
 ### High-Level Design
 
-Rate limiting is implemented as a new middleware in ToolHive's proxy chain. When a request arrives, the middleware checks the applicable limits (global, per-user, per-operation) and either allows the request to proceed or returns an appropriate error response.
+Rate limiting is implemented as a new middleware in ToolHive's middleware chain. When a request arrives, the middleware checks the applicable limits (global, per-user, per-operation) and either allows the request to proceed or returns an appropriate error response.
 
 ```mermaid
 flowchart LR
