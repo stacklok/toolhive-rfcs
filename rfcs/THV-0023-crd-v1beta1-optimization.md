@@ -16,26 +16,19 @@
 
 This RFC proposes improvements to ToolHive's Kubernetes CRDs for v1beta1:
 
-1. **Extract shared OIDC and telemetry config into reusable CRDs** — following
-   the pattern established by `MCPExternalAuthConfig`
-2. **Remove deprecated fields** — `port`, `targetPort`, `toolsFilter`,
-   `clientSecret`, `thvCABundlePath`
+1. **Extract shared OIDC and telemetry config into reusable CRDs** — following the pattern established by `MCPExternalAuthConfig`
+2. **Remove deprecated fields** — `port`, `targetPort`, `toolsFilter`, `clientSecret`, `thvCABundlePath`
 3. **Consolidate MCPRegistry status** — single phase derived from conditions
-4. **Add CEL validation to existing unions** — `OIDCConfigRef` and
-   `AuthzConfigRef` currently have no admission-time validation
+4. **Add CEL validation to existing unions** — `OIDCConfigRef` and `AuthzConfigRef` currently have no admission-time validation
 5. **Unify CRD types with application config types** — reduce conversion bugs
 
-These changes are a **breaking v1alpha1 → v1beta1 migration** with no
-conversion webhooks. Migration tooling will be provided.
+These changes are a **breaking v1alpha1 → v1beta1 migration** with no conversion webhooks. Migration tooling will be provided.
 
 ## Problem Statement
 
 ### Configuration Duplication
 
-OIDC and telemetry configurations are defined inline in multiple CRDs
-(MCPServer, MCPRemoteProxy, VirtualMCPServer). Platform teams managing 10+
-MCPServer resources with the same OIDC provider must duplicate the full config
-in each resource. A single issuer URL change requires updating every resource.
+OIDC and telemetry configurations are defined inline in multiple CRDs (MCPServer, MCPRemoteProxy, VirtualMCPServer). Platform teams managing 10+ MCPServer resources with the same OIDC provider must duplicate the full config in each resource. A single issuer URL change requires updating every resource.
 
 ```yaml
 # Server A — must fully specify OIDC config
@@ -62,12 +55,7 @@ spec:
 
 ### Missing Admission-Time Validation
 
-`OIDCConfigRef` uses a `type` discriminator field (`kubernetes`, `configMap`,
-`inline`) but has **no CEL validation rules** — nothing prevents setting both
-`configMap` and `inline` simultaneously. Validation only happens at controller
-reconciliation time, producing confusing error conditions instead of immediate
-API rejection. Compare with `MCPExternalAuthConfig` which already has CEL rules
-(`mcpexternalauthconfig_types.go:44-49`).
+`OIDCConfigRef` uses a `type` discriminator field (`kubernetes`, `configMap`, `inline`) but has **no CEL validation rules** — nothing prevents setting both `configMap` and `inline` simultaneously. Validation only happens at controller reconciliation time, producing confusing error conditions instead of immediate API rejection. Compare with `MCPExternalAuthConfig` which already has CEL rules (`mcpexternalauthconfig_types.go:44-49`).
 
 ### Deprecated Fields
 
@@ -89,14 +77,11 @@ MCPRegistry has three separate phase enums:
 - `Status.SyncStatus.Phase` (`SyncPhase`: Syncing/Complete/Failed)
 - `Status.APIStatus.Phase` (`APIPhase`: NotStarted/Deploying/Ready/Unhealthy/Error)
 
-A `DeriveOverallPhase()` method (`mcpregistry_types.go:713`) computes the
-top-level phase from the others. This should be replaced with standard
-Kubernetes conditions.
+A `DeriveOverallPhase()` method (`mcpregistry_types.go:713`) computes the top-level phase from the others. This should be replaced with standard Kubernetes conditions.
 
 ### Type Divergence Between CRD and Application Config
 
-The CRD type `OpenTelemetryConfig` and the application type `telemetry.Config`
-have different shapes:
+The CRD type `OpenTelemetryConfig` and the application type `telemetry.Config` have different shapes:
 
 | Aspect | `telemetry.Config` (app) | CRD `OpenTelemetryConfig` |
 |---|---|---|
@@ -105,8 +90,7 @@ have different shapes:
 | Tracing enabled | `TracingEnabled bool` | `Tracing.Enabled bool` |
 | Sampling rate | Top-level `SamplingRate` | Nested `Tracing.SamplingRate` |
 
-This requires manual conversion code that has historically produced silent bugs
-([PR #3118](https://github.com/stacklok/toolhive/pull/3118)).
+This requires manual conversion code that has historically produced silent bugs ([PR #3118](https://github.com/stacklok/toolhive/pull/3118)).
 
 ## Goals
 
@@ -122,13 +106,9 @@ This requires manual conversion code that has historically produced silent bugs
 - **Conversion webhooks**: v1alpha1 → v1beta1 is a breaking change
 - **Automatic migration**: Manual with tooling assistance
 - **Changes to MCPGroup**: Already simple and effective
-- **Cross-namespace references**: Same-namespace only, consistent with all
-  existing CRDs (see [Security Considerations](#security-considerations))
+- **Cross-namespace references**: Same-namespace only, consistent with all existing CRDs (see [Security Considerations](#security-considerations))
 - **Selector-based configuration scoping**: Explicit references are simpler
-- **MCPRemoteProxy changes**: MCPRemoteProxy is being deprecated by
-  [RFC-0057](RFC-0057-mcpremoteendpoint-unified-remote-backends.md) in favour
-  of MCPRemoteEndpoint. Config references will be added to MCPRemoteEndpoint,
-  not MCPRemoteProxy. MCPRemoteProxy receives no new features.
+- **MCPRemoteProxy changes**: MCPRemoteProxy is being deprecated by [RFC-0057](RFC-0057-mcpremoteendpoint-unified-remote-backends.md) in favour of MCPRemoteEndpoint. Config references will be added to MCPRemoteEndpoint, not MCPRemoteProxy. MCPRemoteProxy receives no new features.
 
 ## Proposed Solution
 
@@ -211,8 +191,7 @@ graph TB
 
 ### New CRD 1: MCPOIDCConfig
 
-Shared OIDC configuration. Supports three source variants via CEL union
-(no `type` discriminator — new CRDs use CEL-only validation).
+Shared OIDC configuration. Supports three source variants via CEL union (no `type` discriminator — new CRDs use CEL-only validation).
 
 **Shareable fields:**
 - `issuer`, `jwksUri`, `introspectionUrl` — identity provider infrastructure
@@ -221,9 +200,7 @@ Shared OIDC configuration. Supports three source variants via CEL union
 - `caBundleRef` — CA bundle for the OIDC issuer
 
 **Per-server fields (at the reference site, NOT in MCPOIDCConfig):**
-- `audience` — MUST be unique per server to prevent token replay attacks.
-  Defaults to `{kind}/{namespace}/{name}` (e.g., `MCPServer/default/github-mcp`)
-  if not specified, ensuring uniqueness automatically.
+- `audience` — MUST be unique per server to prevent token replay attacks. Defaults to `{kind}/{namespace}/{name}` (e.g., `MCPServer/default/github-mcp`) if not specified, ensuring uniqueness automatically.
 - `scopes` — may vary per server depending on required access
 
 ```yaml
@@ -260,13 +237,11 @@ status:
 type MCPOIDCConfigSpec struct { ... }
 ```
 
-**Note on existing CRDs:** `MCPExternalAuthConfig` retains its existing `type`
-discriminator field for backward compatibility. New CRDs use CEL-only unions.
+**Note on existing CRDs:** `MCPExternalAuthConfig` retains its existing `type` discriminator field for backward compatibility. New CRDs use CEL-only unions.
 
 ### New CRD 2: MCPTelemetryConfig
 
-Shared observability configuration. Uses the canonical `telemetry.Config` type
-from `pkg/telemetry/config.go` directly — no separate CRD-specific type.
+Shared observability configuration. Uses the canonical `telemetry.Config` type from `pkg/telemetry/config.go` directly — no separate CRD-specific type.
 
 **Shareable fields:**
 - `endpoint` — collector endpoint
@@ -310,12 +285,8 @@ status:
       status: "True"
 ```
 
-**Why `sensitiveHeaders` instead of inline `Authorization: "Bearer ..."`:**
-The existing codebase pattern (`MCPExternalAuthConfig.HeaderInjectionConfig`,
-`HeaderForwardConfig.AddHeadersFromSecret`) consistently uses `SecretKeyRef`
-for sensitive values. Storing a bearer token as a plaintext string in the CRD
-spec would violate this established pattern and expose credentials in etcd
-and `kubectl get -o yaml` output.
+**Why `sensitiveHeaders` instead of inline `Authorization: "Bearer ..."`:** The existing codebase pattern (`MCPExternalAuthConfig.HeaderInjectionConfig`,
+`HeaderForwardConfig.AddHeadersFromSecret`) consistently uses `SecretKeyRef` for sensitive values. Storing a bearer token as a plaintext string in the CRD spec would violate this established pattern and expose credentials in etcd and `kubectl get -o yaml` output.
 
 ### Workload CRD Updates: Reference-Based Configuration
 
@@ -352,23 +323,13 @@ spec:
     name: my-group
 ```
 
-**Inline config remains supported** for simple deployments. Workloads can
-specify `oidcConfig.inline: { ... }` or `telemetryConfig.inline: { ... }`
-instead of `ref`. CEL rules enforce that `ref` and `inline` are mutually
-exclusive.
+**Inline config remains supported** for simple deployments. Workloads can specify `oidcConfig.inline: { ... }` or `telemetryConfig.inline: { ... }` instead of `ref`. CEL rules enforce that `ref` and `inline` are mutually exclusive.
 
 ### Authorization Config
 
-Authorization config (Cedar policies) remains inline or ConfigMap-based on
-the workload CRD. A dedicated `MCPAuthzConfig` CRD is **deferred** — the
-existing `AuthzConfigRef` with `configMapRef` already supports shared policies
-via ConfigMap, and Cedar policies are typically small (2-5 lines). If
-post-implementation feedback shows a need for a dedicated CRD, it can be added
-as an additive change.
+Authorization config (Cedar policies) remains inline or ConfigMap-based on the workload CRD. A dedicated `MCPAuthzConfig` CRD is **deferred** — the existing `AuthzConfigRef` with `configMapRef` already supports shared policies via ConfigMap, and Cedar policies are typically small (2-5 lines). If post-implementation feedback shows a need for a dedicated CRD, it can be added as an additive change.
 
-The only change for authz in v1beta1 is adding CEL validation to
-`AuthzConfigRef` to enforce that exactly one of `configMapRef` or `inline` is
-set (matching the pattern added to `OIDCConfigRef`).
+The only change for authz in v1beta1 is adding CEL validation to `AuthzConfigRef` to enforce that exactly one of `configMapRef` or `inline` is set (matching the pattern added to `OIDCConfigRef`).
 
 ### Deprecated Field Removal
 
@@ -409,8 +370,7 @@ status:
     availableReplicas: 2
 ```
 
-Existing fields `LastManualSyncTrigger`, `LastAppliedFilterHash`, and
-`StorageRef` are retained in their current locations.
+Existing fields `LastManualSyncTrigger`, `LastAppliedFilterHash`, and `StorageRef` are retained in their current locations.
 
 ### Controller Reconciliation Patterns
 
@@ -420,55 +380,33 @@ Config CRD controllers follow the established `MCPExternalAuthConfig` pattern
 **Reference tracking:**
 - Controller watches workload CRDs via `EnqueueRequestsFromMapFunc`
 - On workload create/update/delete, maps event to the referenced config
-- `referencingServers` status field is `[]string` (server names) — simple,
-  matching the existing pattern (not structured `WorkloadReference` objects)
+- `referencingServers` status field is `[]string` (server names) — simple, matching the existing pattern (not structured `WorkloadReference` objects)
 
 **Cascade reconciliation:**
-- When config hash changes, the controller writes an annotation on each
-  referencing workload (e.g., `toolhive.stacklok.dev/oidcconfig-hash`)
+- When config hash changes, the controller writes an annotation on each referencing workload (e.g., `toolhive.stacklok.dev/oidcconfig-hash`)
 - The annotation write triggers the workload controller's reconcile loop
 - This is the existing annotation-based pattern, not a pure watch-based approach
 
 **Deletion protection:**
-- Config CRDs use the same finalizer pattern as `MCPExternalAuthConfig`
-  (`mcpexternalauthconfig_controller.go:193-237`): if `referencingServers` is
-  non-empty, the controller blocks finalizer removal and requeus
-- **Known limitation:** If the controller is down, the finalizer blocks
-  deletion indefinitely. The resource enters `Terminating` state. Manual
-  recovery requires editing the resource to remove the finalizer.
-  This is documented in the operator runbook.
+- Config CRDs use the same finalizer pattern as `MCPExternalAuthConfig` (`mcpexternalauthconfig_controller.go:193-237`): if `referencingServers` is non-empty, the controller blocks finalizer removal and requeus
+- **Known limitation:** If the controller is down, the finalizer blocks deletion indefinitely. The resource enters `Terminating` state. Manual recovery requires editing the resource to remove the finalizer. This is documented in the operator runbook.
 
-**Workloads must fail closed:** If a workload references an `oidcConfigRef`
-that does not exist or is not `Ready`, the workload controller MUST NOT deploy
-the workload. Set phase to `Failed` with a clear condition message. This
-prevents auth-bypass windows during migration or misconfiguration.
+**Workloads must fail closed:** If a workload references an `oidcConfigRef` that does not exist or is not `Ready`, the workload controller MUST NOT deploy the workload. Set phase to `Failed` with a clear condition message. This prevents auth-bypass windows during migration or misconfiguration.
 
 ### CRD Type Unification
 
 New CRDs use the same Go types as the application config where feasible.
 
-**Proven pattern:** `VirtualMCPServer` already embeds `config.Config` from
-`pkg/vmcp/config/config.go` directly in its CRD spec
-(`virtualmcpserver_types.go:68`). `VirtualMCPCompositeToolDefinition` uses
-inline embedding of `config.CompositeToolConfig`. Both have working deepcopy
-generation.
+**Proven pattern:** `VirtualMCPServer` already embeds `config.Config` from `pkg/vmcp/config/config.go` directly in its CRD spec
+(`virtualmcpserver_types.go:68`). `VirtualMCPCompositeToolDefinition` uses inline embedding of `config.CompositeToolConfig`. Both have working deepcopy generation.
 
-**For MCPTelemetryConfig:** The CRD spec embeds `telemetry.Config` from
-`pkg/telemetry/config.go` (which already has `+kubebuilder:object:generate=true`
-and generated deepcopy). The one breaking change is `Headers`: the app type
-uses `map[string]string` while the current CRD uses `[]string`. v1beta1
-standardises on `map[string]string`, which is the application-native format.
+**For MCPTelemetryConfig:** The CRD spec embeds `telemetry.Config` from `pkg/telemetry/config.go` (which already has `+kubebuilder:object:generate=true` and generated deepcopy). The one breaking change is `Headers`: the app type uses `map[string]string` while the current CRD uses `[]string`. v1beta1 standardises on `map[string]string`, which is the application-native format.
 
-**CLI-only fields** (`EnvironmentVariables`, `CustomAttributes`) in
-`telemetry.Config` are excluded from the CRD version via a wrapper struct that
-omits them with `json:"-"` tags, or by adding `+kubebuilder:validation:Optional`
-markers and documenting them as no-ops in CRD mode.
+**CLI-only fields** (`EnvironmentVariables`, `CustomAttributes`) in `telemetry.Config` are excluded from the CRD version via a wrapper struct that omits them with `json:"-"` tags, or by adding `+kubebuilder:validation:Optional` markers and documenting them as no-ops in CRD mode.
 
 ### CLI Mode
 
-CRD changes are Kubernetes-only. CLI mode (`thv run`) continues to use inline
-configuration in RunConfig JSON. The portability principle is maintained: a
-workload can be exported from K8s (with dereferenced config) and run via CLI.
+CRD changes are Kubernetes-only. CLI mode (`thv run`) continues to use inline configuration in RunConfig JSON. The portability principle is maintained: a workload can be exported from K8s (with dereferenced config) and run via CLI.
 
 ## Security Considerations
 
@@ -480,28 +418,18 @@ All existing ToolHive CRDs enforce same-namespace references:
 > reasons." — `mcpexternalauthconfig_types.go:689`, `mcpserver_types.go:179`,
 > `mcpremoteproxy_types.go:87`, `toolconfig_types.go:66`
 
-The new config CRDs (`MCPOIDCConfig`, `MCPTelemetryConfig`) follow this
-established policy. References do not include a `namespace` field.
+The new config CRDs (`MCPOIDCConfig`, `MCPTelemetryConfig`) follow this established policy. References do not include a `namespace` field.
 
-**Why not cross-namespace?** Cross-namespace references create privilege
-escalation paths (a compromised namespace can reference another's OIDC config),
-require ClusterRoles (expanding blast radius), and break namespace isolation
-assumptions. For cluster-wide config sharing, use Helm/Kustomize to template
-identical config CRDs per namespace.
+**Why not cross-namespace?** Cross-namespace references create privilege escalation paths (a compromised namespace can reference another's OIDC config), require ClusterRoles (expanding blast radius), and break namespace isolation assumptions. For cluster-wide config sharing, use Helm/Kustomize to template identical config CRDs per namespace.
 
 ### Audience Uniqueness
 
-`audience` at the reference site defaults to `{kind}/{namespace}/{name}` to
-prevent token replay between servers sharing the same OIDC config. If two
-servers in the same group specify the same audience, a token obtained for one
-is valid at the other. The controller SHOULD emit a Warning event when
-duplicate audiences are detected across workloads referencing the same
+`audience` at the reference site defaults to `{kind}/{namespace}/{name}` to prevent token replay between servers sharing the same OIDC config. If two servers in the same group specify the same audience, a token obtained for one is valid at the other. The controller SHOULD emit a Warning event when duplicate audiences are detected across workloads referencing the same
 MCPOIDCConfig.
 
 ### Sensitive Data
 
-- **No plaintext secrets in CRD specs.** Telemetry auth headers use
-  `sensitiveHeaders` with `SecretKeyRef`, not inline string values.
+- **No plaintext secrets in CRD specs.** Telemetry auth headers use `sensitiveHeaders` with `SecretKeyRef`, not inline string values.
 - `clientSecret` removed from `InlineOIDCConfig`; use `clientSecretRef`.
 - Config hashes in status for change detection without exposing values.
 
@@ -509,13 +437,10 @@ MCPOIDCConfig.
 
 Config CRDs enable RBAC separation between platform teams and application teams:
 
-- **Platform team:** Write access to MCPOIDCConfig, MCPTelemetryConfig,
-  MCPExternalAuthConfig, MCPToolConfig
-- **Application team:** Read access to config CRDs, write access to MCPServer
-  and VirtualMCPCompositeToolDefinition
+- **Platform team:** Write access to MCPOIDCConfig, MCPTelemetryConfig, MCPExternalAuthConfig, MCPToolConfig
+- **Application team:** Read access to config CRDs, write access to MCPServer and VirtualMCPCompositeToolDefinition
 
-Concrete RBAC manifests will be provided in the Helm chart and documented in
-the operator guide.
+Concrete RBAC manifests will be provided in the Helm chart and documented in the operator guide.
 
 ### Migration Security
 
@@ -528,8 +453,7 @@ During v1alpha1 → v1beta1 migration, workloads must fail closed:
 5. Delete v1alpha1 resources
 
 If a workload references a config CRD that does not exist, the controller
-MUST NOT deploy the workload (fail-closed, not fail-open). This prevents
-auth-bypass windows during partial migration.
+MUST NOT deploy the workload (fail-closed, not fail-open). This prevents auth-bypass windows during partial migration.
 
 ## Alternatives Considered
 
@@ -540,20 +464,15 @@ Conflict resolution complexity, harder to audit, implicit behaviour.
 
 ### Alternative 2: Namespace Defaults with Override
 
-Special "default" name auto-applies to namespace. **Why not chosen:** Magic
-naming convention, inheritance rules add complexity.
+Special "default" name auto-applies to namespace. **Why not chosen:** Magic naming convention, inheritance rules add complexity.
 
 ### Alternative 3: Keep Config Embedded, Add Conversion Webhooks
 
-Maintain v1alpha1 compatibility. **Why not chosen:** Conversion webhooks add
-operational complexity and don't address underlying type divergence.
+Maintain v1alpha1 compatibility. **Why not chosen:** Conversion webhooks add operational complexity and don't address underlying type divergence.
 
 ### Alternative 4: Dedicated MCPAuthzConfig and MCPAggregationToolConfig CRDs
 
-The original version of this RFC proposed 4 new CRDs. MCPAuthzConfig was
-dropped because the existing `AuthzConfigRef` with `configMapRef` already
-supports shared policies. MCPAggregationToolConfig was dropped because
-aggregation config is inherently per-VirtualMCPServer, not shared.
+The original version of this RFC proposed 4 new CRDs. MCPAuthzConfig was dropped because the existing `AuthzConfigRef` with `configMapRef` already supports shared policies. MCPAggregationToolConfig was dropped because aggregation config is inherently per-VirtualMCPServer, not shared.
 
 ## Compatibility
 
@@ -562,8 +481,7 @@ aggregation config is inherently per-VirtualMCPServer, not shared.
 **This is a breaking change.** v1alpha1 → v1beta1 requires manual updates.
 
 **What breaks:**
-- Inline OIDC/telemetry configs must be extracted to new CRDs or converted
-  to the unified type format
+- Inline OIDC/telemetry configs must be extracted to new CRDs or converted to the unified type format
 - Deprecated fields removed
 - `Headers` type changes from `[]string` to `map[string]string` on telemetry
 
@@ -575,14 +493,12 @@ aggregation config is inherently per-VirtualMCPServer, not shared.
 4. Remove deprecated fields
 5. Delete v1alpha1 resources
 
-A `thv migrate validate` CLI command will check all references are resolvable
-before destructive steps.
+A `thv migrate validate` CLI command will check all references are resolvable before destructive steps.
 
 ### Rollback
 
 If v1beta1 has a critical bug:
-- v1alpha1 CRD schemas can be re-applied (they are additive, not mutually
-  exclusive with v1beta1 at the schema level)
+- v1alpha1 CRD schemas can be re-applied (they are additive, not mutually exclusive with v1beta1 at the schema level)
 - v1alpha1 resources must be recreated from backup
 - Operators SHOULD export v1alpha1 resources before migration
 - The migration validation tool includes an `export` command for backup
@@ -600,8 +516,7 @@ If v1beta1 has a critical bug:
 1. Define MCPOIDCConfig CRD types with CEL union validation
 2. Define MCPTelemetryConfig CRD types using `telemetry.Config` embedding
 3. Add CEL validation to existing `OIDCConfigRef` and `AuthzConfigRef`
-4. Update MCPServer to v1beta1: replace inline configs with `*ConfigRef`,
-   remove deprecated fields
+4. Update MCPServer to v1beta1: replace inline configs with `*ConfigRef`, remove deprecated fields
 5. Update MCPRemoteEndpoint (RFC-0057) to v1beta1: add config refs
 6. Update VirtualMCPServer: retain embedded `config.Config`, add `oidcConfigRef`
 7. Consolidate MCPRegistry status to conditions-based
@@ -611,8 +526,7 @@ If v1beta1 has a critical bug:
 
 1. MCPOIDCConfig controller (ref tracking, finalizers, cascade via annotations)
 2. MCPTelemetryConfig controller (same pattern)
-3. MCPServer controller: resolve config refs, watch config CRDs, add
-   `oidcConfigHash` to status
+3. MCPServer controller: resolve config refs, watch config CRDs, add `oidcConfigHash` to status
 4. MCPRemoteEndpoint controller: resolve config refs
 5. VirtualMCPServer controller: resolve config refs
 6. MCPRegistry controller: updated status reconciliation
@@ -628,11 +542,9 @@ If v1beta1 has a critical bug:
 
 ### Dependencies
 
-- RFC-0057 (MCPRemoteEndpoint) — config refs target MCPRemoteEndpoint, not
-  MCPRemoteProxy
+- RFC-0057 (MCPRemoteEndpoint) — config refs target MCPRemoteEndpoint, not MCPRemoteProxy
 - Kubernetes 1.29+ for GA CEL validation
-- Separate `operator-crds` Helm chart is retained (CRDs installed before
-  controller for upgrade safety)
+- Separate `operator-crds` Helm chart is retained (CRDs installed before controller for upgrade safety)
 
 ## Testing Strategy
 
@@ -664,28 +576,15 @@ If v1beta1 has a critical bug:
 
 ## Open Questions
 
-1. **Config deletion protection mechanism:** The current MCPExternalAuthConfig
-   uses finalizers. Should new config CRDs use the same pattern (with its
-   stuck-resource risk when controller is down) or switch to a validating
-   webhook? **Recommendation:** Keep finalizers for consistency with
-   MCPExternalAuthConfig. Document manual recovery in the runbook.
+1. **Config deletion protection mechanism:** The current MCPExternalAuthConfig uses finalizers. Should new config CRDs use the same pattern (with its stuck-resource risk when controller is down) or switch to a validating webhook? **Recommendation:** Keep finalizers for consistency with MCPExternalAuthConfig. Document manual recovery in the runbook.
 
-2. **Cross-namespace references:** **Resolved: same-namespace only for
-   v1beta1.** Use Helm/Kustomize to template identical configs per namespace.
-   Cross-namespace support can be added in a future RFC with a
-   `ReferenceGrant`-style authorization mechanism.
+2. **Cross-namespace references:** **Resolved: same-namespace only for v1beta1.** Use Helm/Kustomize to template identical configs per namespace. Cross-namespace support can be added in a future RFC with a `ReferenceGrant`-style authorization mechanism.
 
-3. **Default configurations per namespace:** Deferred. Explicit references are
-   simpler. Can be added as an additive change if needed.
+3. **Default configurations per namespace:** Deferred. Explicit references are simpler. Can be added as an additive change if needed.
 
-4. **Migration timeline:** v1alpha1 will be supported for at least 2 minor
-   releases after v1beta1 GA. v1alpha1 receives bug fixes and security patches
-   only, no new features.
+4. **Migration timeline:** v1alpha1 will be supported for at least 2 minor releases after v1beta1 GA. v1alpha1 receives bug fixes and security patches only, no new features.
 
-5. **`referencingServers` status size:** Using `[]string` (matching existing
-   MCPExternalAuthConfig pattern). Each entry is ~20-40 bytes. The 1MB etcd
-   limit means ~25,000+ entries theoretical max. This is sufficient. If usage
-   patterns demand it, can evolve to capped list + count.
+5. **`referencingServers` status size:** Using `[]string` (matching existing MCPExternalAuthConfig pattern). Each entry is ~20-40 bytes. The 1MB etcd limit means ~25,000+ entries theoretical max. This is sufficient. If usage patterns demand it, can evolve to capped list + count.
 
 ## References
 
