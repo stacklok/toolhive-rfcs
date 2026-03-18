@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: @amirejaz
 - **Created**: 2026-03-17
-- **Last Updated**: 2026-03-17
+- **Last Updated**: 2026-03-18
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#4192](https://github.com/stacklok/toolhive/issues/4192)
 
@@ -12,7 +12,7 @@
 Introduce a `ScopedProvider` and `UserProvider` wrapper layer in `pkg/secrets/` that
 isolates system-managed authentication tokens (registry OAuth tokens, workload auth
 tokens, future enterprise login tokens) from user-managed secrets. System tokens are
-stored under a reserved `thv_sys/<scope>/` key prefix and are invisible to user-facing
+stored under a reserved `__thv_<scope>_` key prefix and are invisible to user-facing
 commands. This is a prerequisite for enterprise CLI/Desktop login (where OAuth session
 tokens must be stored securely and in isolation from user workload secrets).
 
@@ -57,6 +57,7 @@ login is implemented.
 - Migrate existing system-managed keys to the scoped namespace on first startup to
   avoid breaking existing installations.
 - Reserve the `auth` scope for future enterprise CLI/Desktop login tokens.
+- Provide an admin escape hatch (`--system` flag) for emergency system token management.
 
 ## Non-Goals
 
@@ -88,7 +89,7 @@ flowchart TD
         ENT["Enterprise login (future)"]
     end
 
-    CLI --> UP["UserProvider\n(filters thv_sys/* keys)"]
+    CLI --> UP["UserProvider\n(filters __thv_* keys)"]
     API --> UP
     MCP --> UP
 
@@ -96,43 +97,48 @@ flowchart TD
     WKL --> SP_WKL["ScopedProvider\n(scope: workloads)"]
     ENT --> SP_AUTH["ScopedProvider\n(scope: auth)"]
 
-    UP --> INNER["Inner Provider\n(EncryptedManager / 1Password)"]
+    UP --> INNER["Inner Provider\n(EncryptedManager)"]
     SP_REG --> INNER
     SP_WKL --> INNER
     SP_AUTH --> INNER
 ```
 
 All wrappers delegate to the same underlying `Provider` (e.g. `EncryptedManager`).
-The key transformation is transparent to callers.
+The key transformation is transparent to callers — they always pass bare names.
 
 ### Detailed Design
 
 #### Key Prefix Format
 
+System-managed keys use a double-underscore-wrapped prefix with the scope encoded
+directly in the key name, avoiding any path separator characters:
+
 ```
-thv_sys/<scope>/<name>
+__thv_<scope>_<name>
 
 Examples:
-  thv_sys/registry/REGISTRY_OAUTH_a1b2c3d4
-  thv_sys/workloads/BEARER_TOKEN_github-app
-  thv_sys/workloads/OAUTH_CLIENT_SECRET_my-server
-  thv_sys/auth/access_token          (future)
-  thv_sys/auth/refresh_token         (future)
+  __thv_registry_REGISTRY_OAUTH_a1b2c3d4
+  __thv_workloads_BEARER_TOKEN_github-app
+  __thv_workloads_OAUTH_CLIENT_SECRET_my-server
+  __thv_auth_access_token          (future)
+  __thv_auth_refresh_token         (future)
 ```
 
-The `thv_sys/` prefix is chosen because:
-- The `/` separator makes collision with user keys structurally impossible (the
-  `ParseSecretParameter` regex `^([^,]+),target=(.+)$` does not restrict slashes,
-  but no existing user keys use this prefix).
-- It is human-readable when inspecting the backing store directly.
-- It is consistent with the `TOOLHIVE_SECRET_` convention for environment vars.
+The `__thv_` prefix is chosen because:
+- **No path separators**: Avoids conflicts with external secret store path parsing
+  (e.g. 1Password uses `/` as a vault path separator).
+- **Convention**: `__` prefix is a widely understood "internal/reserved" signal
+  (analogous to Python dunder methods and C reserved identifiers).
+- **Collision-resistant**: No user key would naturally start with `__thv_` — and
+  `UserProvider` enforces this by rejecting any attempt to create such a key.
+- **Human-readable**: The scope is visible when inspecting the backing store directly.
 
 #### Scope Constants
 
 ```go
 const (
     // SystemKeyPrefix is the top-level prefix for all system-managed keys.
-    SystemKeyPrefix = "thv_sys"
+    SystemKeyPrefix = "__thv_"
 
     // ScopeRegistry is for registry OAuth refresh tokens (thv registry login).
     ScopeRegistry = "registry"
@@ -144,6 +150,9 @@ const (
     // ScopeAuth is reserved for enterprise CLI/Desktop login tokens.
     ScopeAuth = "auth"
 )
+
+// full key format: "__thv_" + scope + "_" + name
+// e.g. scopedKey("registry", "REGISTRY_OAUTH_abc") → "__thv_registry_REGISTRY_OAUTH_abc"
 ```
 
 #### Component Changes
@@ -151,77 +160,126 @@ const (
 **New file: `pkg/secrets/scoped.go`**
 
 `ScopedProvider` — for system callers:
-- `GetSecret/SetSecret/DeleteSecret` transparently prefix the key: `thv_sys/<scope>/<name>`.
+- `GetSecret/SetSecret/DeleteSecret` transparently prefix the key: `__thv_<scope>_<name>`.
+  Callers always pass bare names; the prefix is invisible to them.
 - `ListSecrets` returns only entries in the scope, with prefix stripped (bare names to callers).
-- `Cleanup` performs a prefix-filtered delete — only keys in this scope are removed,
+- `Cleanup` uses `BulkDeleteKeys` (see below) to remove only keys in this scope,
   leaving all other secrets untouched.
 - `Capabilities` delegates to inner.
 
 `UserProvider` — for user-facing callers:
-- `GetSecret/SetSecret/DeleteSecret` reject any name starting with `thv_sys/` and
+- `GetSecret/SetSecret/DeleteSecret` reject any name starting with `__thv_` and
   return `ErrReservedKeyName` without calling the inner provider.
-- `ListSecrets` silently filters out entries whose `Key` starts with `thv_sys/`.
-- `Cleanup` delegates to inner (full user-secret wipe; system secrets cleaned via their own `ScopedProvider`).
+- `ListSecrets` silently filters out entries whose `Key` starts with `__thv_`.
+- `Cleanup` uses `BulkDeleteKeys` to remove only non-system keys (keys not starting
+  with `__thv_`), leaving system tokens untouched.
 - `Capabilities` delegates to inner.
+
+**New methods on `EncryptedManager`**
+
+These methods are not part of the `Provider` interface — they are `EncryptedManager`-
+specific and used only by the migration helper and the bulk cleanup operations:
+
+```go
+// BulkRenameKeys renames multiple keys atomically under a single file lock.
+// For each (oldKey, newKey) pair it stores the new key then deletes the old key
+// in the in-memory map (Store-before-Delete to preserve concurrent reader visibility),
+// then calls updateFile() exactly once. A crash before the write completes leaves
+// the file in the pre-migration state — safe to retry on next startup.
+func (e *EncryptedManager) BulkRenameKeys(renames map[string]string) error
+
+// BulkDeleteKeys deletes multiple keys atomically under a single file lock,
+// then calls updateFile() exactly once.
+func (e *EncryptedManager) BulkDeleteKeys(keys []string) error
+```
+
+**Thread safety guarantee**: Every call to `updateFile()` in `EncryptedManager` is
+inside a `WithFileLock` closure. There are exactly three existing call sites
+(`SetSecret`, `DeleteSecret`, `Cleanup`) and all three are lock-guarded. The new
+`BulkRenameKeys` and `BulkDeleteKeys` methods follow the same pattern.
+`updateFile()` is a private method so no external caller can invoke it outside a lock.
 
 **New factory helpers in `pkg/secrets/factory.go`**
 
 ```go
 // CreateScopedSecretProvider returns a provider for system-managed tokens in the
 // given scope. Does NOT apply the FallbackProvider wrapper — system tokens must
-// not fall back to environment variables.
-// Returns an error if managerType is EnvironmentType.
+// not fall back to environment variables. Returns an error if managerType is
+// EnvironmentType (system tokens cannot be sourced from env vars).
 func CreateScopedSecretProvider(managerType ProviderType, scope string) (Provider, error)
 
 // CreateUserSecretProvider returns a provider for user-managed secrets.
-// Wraps with UserProvider to filter out system-reserved keys.
+// Wraps with UserProvider to filter out and block access to system-reserved keys.
 func CreateUserSecretProvider(managerType ProviderType) (Provider, error)
 ```
 
 **New migration helper: `pkg/secrets/migration.go`**
 
 On first startup after upgrade, scan the backing store for keys matching legacy
-system patterns and rename them to the scoped equivalents. The migration is guarded
-by a config flag to run exactly once.
+system patterns and rename them to the scoped equivalents using `BulkRenameKeys`
+— a single atomic file write for the entire migration.
 
 ```go
 // MigrateSystemKeys scans for legacy unscoped system keys and renames them to
-// their scoped equivalents. Safe to call on every startup — exits early if
-// migration has already run.
-func MigrateSystemKeys(ctx context.Context, provider Provider, configProvider config.Provider) error
+// their scoped equivalents in a single atomic BulkRenameKeys call. Safe to call
+// on every startup — exits early if migration has already run (guarded by a
+// config flag). The Store-before-Delete ordering within BulkRenameKeys ensures
+// concurrent readers always see the value under at least one key during migration.
+func MigrateSystemKeys(ctx context.Context, provider *EncryptedManager, configProvider config.Provider) error
 ```
 
 Legacy key patterns and their target scopes:
 
-| Legacy key pattern | Target scope | Example |
+| Legacy key pattern | Target scope | Example result |
 |---|---|---|
-| `REGISTRY_OAUTH_*` | `registry` | `thv_sys/registry/REGISTRY_OAUTH_a1b2c3` |
-| `OAUTH_CLIENT_SECRET_*` | `workloads` | `thv_sys/workloads/OAUTH_CLIENT_SECRET_foo` |
-| `BEARER_TOKEN_*` | `workloads` | `thv_sys/workloads/BEARER_TOKEN_foo` |
-| `OAUTH_REFRESH_TOKEN_*` | `workloads` | `thv_sys/workloads/OAUTH_REFRESH_TOKEN_foo` |
+| `REGISTRY_OAUTH_*` | `registry` | `__thv_registry_REGISTRY_OAUTH_a1b2c3` |
+| `OAUTH_CLIENT_SECRET_*` | `workloads` | `__thv_workloads_OAUTH_CLIENT_SECRET_foo` |
+| `BEARER_TOKEN_*` | `workloads` | `__thv_workloads_BEARER_TOKEN_foo` |
+| `OAUTH_REFRESH_TOKEN_*` | `workloads` | `__thv_workloads_OAUTH_REFRESH_TOKEN_foo` |
 
-#### Caller Changes
+**Transparency of prefix to on-disk config and state files**: `ScopedProvider` is
+transparent — callers always pass bare names; the prefix is added/stripped at the
+provider boundary. For example, `CachedRefreshTokenRef: "REGISTRY_OAUTH_abc"` stored
+in the config file remains unchanged after migration. The call
+`scopedProvider.GetSecret(ctx, "REGISTRY_OAUTH_abc")` transparently maps to
+`inner.GetSecret(ctx, "__thv_registry_REGISTRY_OAUTH_abc")` — exactly where the
+migrated value lives. No config or state file updates are needed.
 
-| Caller | Change |
+**Admin escape hatch**: For emergency cases (leaked token, orphaned token from a
+failed workload delete), `thv secret list --system` and `thv secret delete --system`
+will be added. These use the `ScopedProvider` directly and are documented as
+advanced/emergency commands, not part of the normal user workflow.
+
+#### Complete Call-Site Categorisation
+
+All call sites that create a secrets provider must be updated to use the correct
+factory function. The complete mapping is:
+
+**User-managed (→ `CreateUserSecretProvider`):**
+
+| Call site | Notes |
 |---|---|
-| `cmd/thv/app/secret.go` `getSecretsManager()` | → `CreateUserSecretProvider` |
-| `pkg/api/v1/secrets.go` `getSecretsManager()` | → `CreateUserSecretProvider` |
-| `pkg/mcp/server/list_secrets.go`, `set_secret.go` | → `CreateUserSecretProvider` |
-| `pkg/runner/runner.go` (workload secret resolution) | → `CreateUserSecretProvider` |
-| `pkg/workloads/manager.go` `validateSecretParameters` | → `CreateUserSecretProvider` |
-| `cmd/thv/app/config_buildenv.go`, `pkg/runner/env.go` | → `CreateUserSecretProvider` |
-| `pkg/auth/secrets/secrets.go` `GetSecretsManager()` | → `CreateScopedSecretProvider(..., ScopeWorkloads)` |
-| `pkg/registry/factory.go` `resolveTokenSource()` | → `CreateScopedSecretProvider(..., ScopeRegistry)` |
-| `pkg/runner/protocol.go` (auth file resolution) | → `CreateScopedSecretProvider(..., ScopeWorkloads)` |
+| `cmd/thv/app/secret.go` `getSecretsManager()` | All 5 secret subcommands |
+| `cmd/thv/app/config_buildauthfile.go` (4 calls) | `BUILD_AUTH_FILE_*` keys are user-initiated via `thv config set-build-auth-file` |
+| `cmd/thv/app/config_buildenv.go:127` | User-defined build env secrets |
+| `cmd/thv/app/header_flags.go:119` | User-defined header secrets |
+| `pkg/runner/protocol.go` `resolveBuildAuthFilesFromSecrets` | Reads user-set `BUILD_AUTH_FILE_*` keys |
+| `pkg/runner/runner.go` | User-defined `RunConfig.Secrets` resolution |
+| `pkg/workloads/manager.go` `validateSecretParameters` | User secret validation |
+| `pkg/api/v1/secrets.go` `getSecretsManager()` | REST API secrets endpoint |
+| `pkg/mcp/server/list_secrets.go` | MCP tool server |
+| `pkg/mcp/server/set_secret.go` | MCP tool server |
 
-#### FallbackProvider Interaction
+**System-managed (→ `CreateScopedSecretProvider`):**
 
-`CreateScopedSecretProvider` explicitly skips the `FallbackProvider` wrapper.
-The rationale: system tokens are written and read by ToolHive internally; they
-should never be sourced from environment variables. The env-fallback prefix
-`TOOLHIVE_SECRET_thv_sys/...` would be unusable and confusing.
+| Call site | Scope | Notes |
+|---|---|---|
+| `pkg/auth/secrets/secrets.go` `GetSecretsManager()` | `ScopeWorkloads` | Covers `ProcessSecret` (which calls `GetSecretsManager()` internally) and all workload auth token storage |
+| `pkg/registry/factory.go` `resolveTokenSource()` | `ScopeRegistry` | Runner path registry auth |
+| `cmd/thv/app/registry_login.go:77` | `ScopeRegistry` | CLI registry login path — stores OAuth refresh tokens |
 
-`CreateUserSecretProvider` continues to apply `FallbackProvider` as today.
+`ProcessSecretWithProvider` takes an injected provider (used in tests) and is
+already covered by updating `GetSecretsManager()`.
 
 ## Security Considerations
 
@@ -232,19 +290,38 @@ should never be sourced from environment variables. The env-fallback prefix
   that visibility.
 - **Accidental deletion**: A user can currently delete a workload's OAuth token by
   name. `UserProvider` blocks this via `ErrReservedKeyName`.
-- **Prefix collision attack**: A user could manually craft a key like
-  `thv_sys/registry/foo` via `thv secret set`. `UserProvider.SetSecret` rejects
-  this at the CLI/API layer.
+- **Prefix collision attack**: A user could try to craft a key like
+  `__thv_registry_foo` via `thv secret set`. `UserProvider.SetSecret` rejects
+  this with `ErrReservedKeyName`.
+
+### No Raw Backing Store Access
+
+`EncryptedManager` is only constructed in `factory.go` and returned as the `Provider`
+interface. No external caller holds a direct `*EncryptedManager` reference after
+construction — all access goes through `ScopedProvider` or `UserProvider` wrapper
+methods. This means every `GetSecret` call goes through the prefix translation layer
+by construction; there is no code path that can read the raw backing store with an
+old flat key name after migration.
 
 ### Data Security
 
 - No new data is transmitted or stored outside the existing backing store.
 - The scope prefix is stored in plaintext as part of the key name (same as today —
   the encrypted provider encrypts values, not key names).
-- The migration reads existing keys and writes scoped replacements, then deletes
-  the originals. The migration is not atomic across both operations — a crash
-  between write and delete leaves the key in both locations, which is safe (the
-  scoped read wins; the legacy key is orphaned and cleaned up on next startup).
+- The migration uses `BulkRenameKeys` which performs a single atomic file write.
+  A crash before the write completes leaves the file in the pre-migration state —
+  safe to retry. A crash after the write but before the config migration flag is
+  set causes the migration to run again on next startup, which is safe because
+  `BulkRenameKeys` is idempotent for already-migrated keys.
+
+### Thread Safety
+
+`BulkRenameKeys` acquires a single `WithFileLock` for the entire operation.
+Every `updateFile()` call in `EncryptedManager` is inside a `WithFileLock` closure
+(confirmed: all three existing call sites are lock-guarded; `updateFile()` is
+private). Within `BulkRenameKeys`, `Store(newKey)` is called before `Delete(oldKey)`
+so concurrent readers via `GetSecret` (which reads from the thread-safe `syncmap.Map`)
+always see the value under at least one key — there is no not-found window.
 
 ### Secrets Management
 
@@ -255,76 +332,63 @@ should never be sourced from environment variables. The env-fallback prefix
 ### Audit and Logging
 
 - The migration logs each key rename at DEBUG level (key name only, never value).
-- `ErrReservedKeyName` errors are surfaced to the user via the normal error path —
-  no special audit logging required.
-
-### Mitigations
-
-- `UserProvider` guard in `Get/Set/Delete` ensures no user-facing surface can
-  reach system keys, even if a future API endpoint accidentally uses the wrong
-  provider instance.
-- Factory functions (`CreateScopedSecretProvider`, `CreateUserSecretProvider`)
-  make it structurally difficult to use the wrong provider type — callers do not
-  construct providers directly.
+- `ErrReservedKeyName` errors are surfaced to the user via the normal error path.
 
 ## Alternatives Considered
 
 ### Alternative 1: Separate storage file for system tokens
 
-Use a second encrypted file (`secrets_auth_encrypted`) exclusively for system
-tokens, leaving the user secrets file unchanged.
+Use a second encrypted file (`secrets_auth_encrypted`) exclusively for system tokens.
 
-- **Pro**: True file-level isolation; even raw file inspection shows no mixing.
-- **Con**: Two files to manage, two keyring passwords, more complex setup wizard.
-- **Con**: Requires duplicating the entire provider lifecycle (password prompt,
-  keyring storage, file path management) for the second file.
+- **Pro**: True file-level isolation.
+- **Con**: Two files, two keyring passwords, more complex setup wizard.
 - **Why not chosen**: The key-prefix approach achieves the same user-visible
-  isolation with far less complexity, and the encrypted provider already encrypts
-  values — key names in plaintext is acceptable.
+  isolation with far less complexity.
 
-### Alternative 2: Single `SystemProvider` with no named scopes
+### Alternative 2: Single system scope (no named scopes)
 
-Use a single `thv_sys/` namespace for all system tokens (no `registry/`,
-`workloads/`, `auth/` sub-scopes).
+Use a single `__thv_` namespace for all system tokens without sub-scopes.
 
-- **Pro**: Simpler — one scope constant, one factory function.
-- **Con**: Registry tokens and workload tokens are co-mingled; a bug in workload
-  token cleanup could affect registry tokens.
-- **Con**: No extensibility for future token types without redesigning the prefix.
+- **Pro**: Simpler — one constant.
+- **Con**: Registry tokens and workload tokens are co-mingled; no extensibility.
 - **Why not chosen**: Named scopes cost one string constant each and provide
-  meaningful isolation and debuggability at negligible implementation cost.
+  meaningful isolation and debuggability at negligible cost.
 
-### Alternative 3: CLI-layer filtering only
+### Alternative 3: Slash-separated prefix (`thv_sys/<scope>/`)
 
-Filter system keys in `cmd/thv/app/secret.go` without a `UserProvider` wrapper.
+Use `thv_sys/registry/REGISTRY_OAUTH_abc` instead of `__thv_registry_REGISTRY_OAUTH_abc`.
 
-- **Pro**: Minimal change — no new types, no interface changes.
-- **Con**: The filter must be duplicated in the API layer, the MCP tool server,
-  and any future surface that exposes secrets.
-- **Con**: A new caller that forgets the filter accidentally exposes system keys.
-- **Why not chosen**: Putting the filter in the `UserProvider` wrapper means it
-  is enforced by construction for any caller that uses `CreateUserSecretProvider`.
+- **Pro**: Visually hierarchical.
+- **Con**: Conflicts with 1Password's vault path separator (`/`), which would break
+  key parsing if the scoped provider is ever backed by 1Password.
+- **Why not chosen**: `__thv_<scope>_` eliminates the conflict by construction
+  without restricting which provider types can be used as the backing store.
+
+### Alternative 4: CLI-layer filtering only
+
+Filter system keys only in `cmd/thv/app/secret.go`.
+
+- **Pro**: Minimal change.
+- **Con**: Filter must be duplicated in the API layer, MCP server, and any future surface.
+- **Why not chosen**: `UserProvider` enforces the filter for any caller that uses
+  `CreateUserSecretProvider`, making it impossible to accidentally expose system keys.
 
 ## Compatibility
 
 ### Backward Compatibility
 
-This change is **not backward compatible** for existing installations with
-system-managed tokens in the store. Without migration, `thv registry login`
-tokens and workload auth tokens stored under legacy keys would become
-unreachable after upgrade.
-
-The migration helper in `pkg/secrets/migration.go` addresses this by renaming
-legacy keys on first startup. The migration must ship simultaneously with the
-caller changes (Steps 3 and 4 of the implementation plan).
+This change is not backward compatible for existing installations. The migration
+helper in `pkg/secrets/migration.go` addresses this by atomically renaming legacy
+keys using `BulkRenameKeys` on first startup. Migration must ship simultaneously
+with the caller changes (Phases 3, 4, and 5).
 
 ### Forward Compatibility
 
-- New system token types can be introduced by adding a new scope constant and
+- New system token types can be added by introducing a new scope constant and
   using `CreateScopedSecretProvider` with that scope — no changes to `ScopedProvider`
-  or `UserProvider` are needed.
+  or `UserProvider` needed.
 - The enterprise login implementation uses `ScopeAuth` out of the box.
-- The `UserProvider` filter (`strings.HasPrefix(key, "thv_sys/")`) automatically
+- The `UserProvider` filter (`strings.HasPrefix(key, "__thv_")`) automatically
   covers any new scope without code changes.
 
 ## Implementation Plan
@@ -335,30 +399,37 @@ caller changes (Steps 3 and 4 of the implementation plan).
 - Add `pkg/secrets/scoped_test.go` — unit tests for both types
 - No wiring changes; safe to merge independently
 
-### Phase 2: Factory helpers
+### Phase 2: Factory helpers and bulk EncryptedManager methods
 
+- Add `BulkRenameKeys` and `BulkDeleteKeys` to `EncryptedManager` in `pkg/secrets/encrypted.go`
 - Add `CreateScopedSecretProvider` and `CreateUserSecretProvider` to `pkg/secrets/factory.go`
-- Update `pkg/secrets/factory_test.go`
+- Update `pkg/secrets/factory_test.go` and `pkg/secrets/encrypted_test.go`
 - No callers changed yet; safe to merge independently
 
-### Phase 3: System callers (simultaneous with Phase 4 and 5)
+### Phase 3: System callers (simultaneous with Phases 4 and 5)
 
 - `pkg/auth/secrets/secrets.go` → `GetSecretsManager()` uses `ScopeWorkloads`
 - `pkg/registry/factory.go` → `resolveTokenSource()` uses `ScopeRegistry`
-- `pkg/runner/protocol.go` → auth file resolution uses `ScopeWorkloads`
+- `cmd/thv/app/registry_login.go:77` → uses `ScopeRegistry`
 
-### Phase 4: User callers (simultaneous with Phase 3 and 5)
+### Phase 4: User callers (simultaneous with Phases 3 and 5)
 
 - `cmd/thv/app/secret.go`, `pkg/api/v1/secrets.go`
+- `cmd/thv/app/config_buildauthfile.go` (4 calls)
+- `cmd/thv/app/config_buildenv.go`, `cmd/thv/app/header_flags.go`
+- `pkg/runner/protocol.go`, `pkg/runner/runner.go`, `pkg/workloads/manager.go`
 - `pkg/mcp/server/list_secrets.go`, `set_secret.go`
-- `pkg/runner/runner.go`, `pkg/workloads/manager.go`
-- `cmd/thv/app/config_buildenv.go`, `pkg/runner/env.go`, `cmd/thv/app/header_flags.go`
 
 ### Phase 5: Key migration (simultaneous with Phases 3 and 4)
 
 - Add `pkg/secrets/migration.go` with `MigrateSystemKeys`
 - Call migration at startup before any provider is used for reads
 - Guard with config flag to run exactly once
+
+### Phase 6: Admin escape hatch
+
+- Add `--system` flag to `thv secret list` and `thv secret delete`
+- Document as advanced/emergency commands
 
 ### Dependencies
 
@@ -371,10 +442,12 @@ caller changes (Steps 3 and 4 of the implementation plan).
 
 - **Unit tests**: Table-driven tests for `ScopedProvider` and `UserProvider` covering
   all methods, edge cases (empty results, error propagation, scope filtering).
-- **Unit tests**: `MigrateSystemKeys` with a mock provider — verify each legacy
-  pattern is renamed correctly, migration is idempotent, config flag is set.
-- **Integration tests**: Existing `pkg/secrets/integration_test.go` extended to
-  verify that a `UserProvider`-wrapped `EncryptedManager` does not list scoped keys.
+- **Unit tests**: `BulkRenameKeys` and `BulkDeleteKeys` — verify atomicity, correct
+  key selection, store-before-delete ordering, idempotency.
+- **Unit tests**: `MigrateSystemKeys` with a mock `EncryptedManager` — verify each
+  legacy pattern is renamed correctly, migration is idempotent, config flag is set.
+- **Integration tests**: `UserProvider`-wrapped `EncryptedManager` does not list
+  scoped keys; `ScopedProvider` does not list user keys.
 - **E2E tests**: `thv secret list` after `thv registry login` does not show
   `REGISTRY_OAUTH_*` keys.
 
@@ -383,24 +456,22 @@ caller changes (Steps 3 and 4 of the implementation plan).
 - Update `docs/arch/` with a note on the two-tier secret model (user vs. system).
 - Update CLI help text for `thv secret list` to clarify it shows user-managed
   secrets only.
-- Add a note to the `thv secret setup` wizard output explaining that system tokens
-  (registry auth, workload auth) are stored separately and not shown in secret listings.
+- Document `thv secret list --system` and `thv secret delete --system` as
+  advanced/emergency commands.
 
 ## Open Questions
 
 1. Should `MigrateSystemKeys` be called unconditionally on every startup (with an
    early-exit if already migrated) or only when the relevant commands are first used?
    The unconditional approach is simpler and less error-prone.
-2. Should `ScopedProvider.Cleanup` be a no-op (leaving cleanup to explicit deletion)
-   or a prefix-filtered sweep? The current proposal uses a prefix-filtered sweep —
-   this is more correct for the `thv secret reset` flow but slightly more complex.
 
 ## References
 
 - [toolhive#4192](https://github.com/stacklok/toolhive/issues/4192) — Implementation tracking issue
-- [stacklok-enterprise-platform#103](https://github.com/stacklok/stacklok-enterprise-platform/issues/103) — Enterprise secret isolation issue  
+- [stacklok-enterprise-platform#103](https://github.com/stacklok/stacklok-enterprise-platform/issues/103) — Enterprise secret isolation issue
 - [stacklok-enterprise-platform#69](https://github.com/stacklok/stacklok-enterprise-platform/issues/69) — Enterprise CLI/Desktop login (consumer of ScopeAuth)
 - `pkg/secrets/fallback.go` — Pattern reference for provider wrapper implementation
+- `pkg/secrets/encrypted.go` — EncryptedManager implementation details
 
 ---
 
@@ -413,6 +484,7 @@ caller changes (Steps 3 and 4 of the implementation plan).
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-03-17 | @amirejaz | Draft | Initial submission |
+| 2026-03-18 | @amirejaz | Draft | Address review feedback: key prefix (`__thv_`), bulk migration, UserProvider.Cleanup, thread safety, complete call-site table, admin escape hatch |
 
 ### Implementation Tracking
 
