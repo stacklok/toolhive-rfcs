@@ -21,7 +21,7 @@ ToolHive currently has no mechanism to limit the rate of requests flowing throug
 
 These risks grow as ToolHive deployments move to shared, multi-user Kubernetes environments. Without rate limiting, cluster administrators have no knob to turn between "fully open" and "take the server offline."
 
-> **Scope**: This RFC targets Kubernetes-based deployments of ToolHive.
+**Scope**: This RFC targets Kubernetes-based deployments of ToolHive.
 
 ## Goals
 
@@ -37,7 +37,6 @@ These risks grow as ToolHive deployments move to shared, multi-user Kubernetes e
 - **Adaptive / auto-tuning rate limits**: Automatically adjusting limits based on observed load or downstream health signals. Limits are static and administrator-configured.
 - **Cost or billing integration**: Tracking usage for billing purposes. This is purely a protective mechanism.
 - **Request queuing or throttling**: Requests that exceed the limit are rejected, not queued.
-- **Rate limiting at the vMCP routing layer**: Limits are applied at the individual server proxy, not at the vMCP aggregation/routing level.
 
 ## Proposed Solution
 
@@ -165,7 +164,7 @@ Per-user limits work identically — each user gets their own bucket, keyed by i
 - Per-user: `thv:rl:{server}:user:{userId}`
 - Per-user per-tool: `thv:rl:{server}:user:{userId}:tool:{toolName}`
 
-Each bucket is stored as a Redis hash with two fields: token count and last refill timestamp. The check-and-decrement runs as a single atomic operation, so there are no race conditions across replicas. Keys auto-expire when inactive, so no garbage collection is needed.
+Each bucket is stored as a Redis hash with two fields: token count and last refill timestamp. Refill is lazy — there is no background process. When a request arrives, an atomic Lua script calculates how many tokens should have accumulated since the last access based on elapsed time, adds them (capped at capacity), and then attempts to consume one. This ensures no race conditions across replicas. Keys auto-expire when inactive, so no garbage collection is needed.
 
 Storage is **O(1) per counter** (two fields per hash). For example, 500 users with 10 per-operation limits = 5,000 hashes — negligible for Redis.
 
