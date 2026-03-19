@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
 - **Created**: 2026-03-18
-- **Last Updated**: 2026-03-18
+- **Last Updated**: 2026-03-19
 - **Target Repository**: toolhive
 - **Related Issues**: None
 
@@ -13,26 +13,28 @@ Enable rate limiting for `MCPServer` and `VirtualMCPServer`, supporting per-user
 
 ## Problem Statement
 
-ToolHive currently has no mechanism to limit the rate of requests flowing through its proxy layer. This creates several risks for operators:
+ToolHive currently has no mechanism to limit the rate of requests flowing through its proxy layer. This creates several risks for administrators:
 
 1. **Noisy-neighbor problem**: A single authenticated user can consume unbounded resources, degrading the experience for all other users of a shared MCP server.
 2. **Downstream overload**: Aggregate traffic spikes — even when no single user is misbehaving — can overwhelm the upstream MCP server or the external services it depends on (APIs with their own rate limits, databases, etc.).
 3. **Agent data exfiltration**: AI agents can invoke tools in tight loops to export large volumes of data. Without per-tool or per-user limits, there is no mechanism to cap this behavior.
 
-These risks grow as ToolHive deployments move from single-user local setups to shared, multi-user Kubernetes environments. Without rate limiting, operators have no knob to turn between "fully open" and "take the server offline."
+These risks grow as ToolHive deployments move to shared, multi-user Kubernetes environments. Without rate limiting, cluster administrators have no knob to turn between "fully open" and "take the server offline."
+
+> **Scope**: This RFC targets Kubernetes-based deployments of ToolHive.
 
 ## Goals
 
-- Allow operators to configure **per-user** rate limits so that no single user can monopolize a server.
-- Allow operators to configure **global** rate limits so that total throughput stays within safe bounds for downstream services.
-- Allow operators to configure rate limits **per tool**, **per prompt**, or **per resource**, so that expensive or externally-constrained operations can have tighter limits than the server default.
+- Allow administrators to configure **per-user** rate limits so that no single user can monopolize a server.
+- Allow administrators to configure **global** rate limits so that total throughput stays within safe bounds for downstream services.
+- Allow administrators to configure rate limits **per tool**, **per prompt**, or **per resource**, so that expensive or externally-constrained operations can have tighter limits than the server default.
 - Provide a consistent configuration experience across `MCPServer` and `VirtualMCPServer` resources.
 - Enforce rate limits in the existing proxy middleware chain with minimal latency overhead.
 - Support correct enforcement across multiple replicas using Redis as the shared counter backend.
 
 ## Non-Goals
 
-- **Adaptive / auto-tuning rate limits**: Automatically adjusting limits based on observed load or downstream health signals. Limits are static and operator-configured.
+- **Adaptive / auto-tuning rate limits**: Automatically adjusting limits based on observed load or downstream health signals. Limits are static and administrator-configured.
 - **Cost or billing integration**: Tracking usage for billing purposes. This is purely a protective mechanism.
 - **Request queuing or throttling**: Requests that exceed the limit are rejected, not queued.
 - **Rate limiting at the vMCP routing layer**: Limits are applied at the individual server proxy, not at the vMCP aggregation/routing level.
@@ -147,19 +149,31 @@ spec:
             windowSeconds: 60
 ```
 
-### Windowing
+### Algorithm: Token Bucket
 
-We plan to use a simple, approximate windowing approach for the initial implementation. Exact enforcement at window boundaries is not a goal — the intent is protection against sustained overuse, not precise metering.
+Rate limits are enforced using a **token bucket** algorithm. The configuration maps directly onto it:
 
-Common approaches include fixed window counters, sliding window counters, and token buckets. Each trades off simplicity, memory usage, and burst behavior differently. We will select an approach during implementation that is straightforward and good enough for the use cases described above.
+- `requestsPerWindow` = bucket capacity (max tokens)
+- `windowSeconds` = time to fully refill the bucket
+- Refill rate = `requestsPerWindow / windowSeconds` tokens per second
 
-If you have strong opinions on windowing algorithm choice, please raise them during review.
+Each token represents a single allowed request. The bucket starts full, refills at a steady rate, and each incoming request consumes one token. When the bucket is empty, requests are rejected.
 
-The configuration schema (`requestsPerWindow` + `windowSeconds`) is intentionally minimal and can map onto any of these algorithms without changing the operator-facing API.
+Per-user limits work identically — each user gets their own bucket, keyed by identity. Redis keys follow a structure like:
+
+- Global: `thv:rl:{server}:global`
+- Per-user: `thv:rl:{server}:user:{userId}`
+- Per-user per-tool: `thv:rl:{server}:user:{userId}:tool:{toolName}`
+
+Each bucket is stored as a Redis hash with two fields: token count and last refill timestamp. The check-and-decrement runs as a single atomic operation, so there are no race conditions across replicas. Keys auto-expire when inactive, so no garbage collection is needed.
+
+Storage is **O(1) per counter** (two fields per hash). For example, 500 users with 10 per-operation limits = 5,000 hashes — negligible for Redis.
+
+**Burst behavior**: An idle user accumulates tokens up to the bucket capacity. This means they can send a full burst of `requestsPerWindow` requests at once after a period of inactivity. This is intentional — it handles legitimate traffic spikes — but administrators should understand it when setting capacity.
 
 ### Rejection Behavior
 
-When a request is rate-limited, the middleware returns an MCP-appropriate error response. The response should include enough information for the client to understand what happened and when to retry (e.g., a `Retry-After` hint).
+When a request is rate-limited, the middleware returns an MCP-appropriate error response. Because token bucket tracks the refill rate, the middleware can compute a precise `Retry-After` value (`1 / refill_rate`) telling the client exactly when the next token will be available.
 
 ## Open Questions
 
