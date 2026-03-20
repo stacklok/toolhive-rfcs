@@ -19,6 +19,10 @@ When backend tools are excluded from advertising via `excludeAll` or `filter`, c
 
 The root cause: the advertising filter runs inside the aggregator **before** session creation. The session's `tools` field only contains advertised tools. The composite tools decorator builds its workflow engine from `sess.Tools()`, so it never sees schemas for non-advertised tools.
 
+### Abstraction leak: workflow engine bypasses the session
+
+The workflow engine directly uses `Router.RouteTool()` to resolve a `BackendTarget`, then calls `BackendClient.CallTool()` with that target — completely bypassing the session's `CallTool` method and every decorator in the stack. The session already encapsulates routing + backend dispatch in its own `CallTool`, making the engine's direct use of `Router` and `BackendClient` redundant. This leak is why `getToolInputSchema()` must maintain its own tool list rather than relying on the session — the engine doesn't call through the session at all.
+
 ### Architectural issue: the aggregator is a monolithic middleman
 
 The `Aggregator` interface has 7 responsibilities: backend capability querying, per-backend overrides, conflict resolution, advertising filtering, routing table construction, name reversal, and discovery pipeline orchestration. It sits between the HTTP middleware and the session object — operating on data that logically belongs to session construction.
@@ -32,6 +36,7 @@ As the aggregator's responsibilities shift (e.g. removing the filter), it become
 - Fix composite tool type coercion for non-advertised backend tools
 - Eliminate the `Aggregator` interface and `defaultAggregator` struct
 - Move advertising filtering to a session decorator in the correct position in the decorator stack
+- Simplify the workflow engine by routing tool calls through the session instead of directly using `Router` + `BackendClient`
 - Keep conflict resolvers and per-backend override utilities as a reusable library
 - No breaking changes to configuration or client-visible behavior
 
@@ -56,6 +61,8 @@ Decorator stack (top → bottom):
 ```
 
 The session factory directly orchestrates: per-backend overrides → conflict resolution → routing table construction → advertising set computation. No `Aggregator` object. The advertising filter becomes a session decorator that sits above composite tools, so composite tools see all tool schemas while clients only see advertised tools.
+
+The workflow engine is simplified: instead of directly using `Router` and `BackendClient` to dispatch tool calls, it calls `sess.CallTool()`. The session already handles routing and backend dispatch. This eliminates the abstraction leak and means the engine's `getToolInputSchema()` can use `sess.Tools()` — which, at the composite tools layer (below the filter), includes all tools.
 
 ### Detailed Design
 
@@ -113,6 +120,31 @@ func (d *filterDecorator) Tools() []vmcp.Tool {
 
 `CallTool`, `ReadResource`, `GetPrompt` pass through unchanged — the filter only affects what's advertised via `Tools()`, not what's callable.
 
+#### Workflow engine calls through the session
+
+`pkg/vmcp/composer/workflow_engine.go`
+
+The workflow engine currently takes a `Router` and `BackendClient` and dispatches tool calls directly:
+
+```go
+// Current: bypasses the session entirely
+target, err := e.router.RouteTool(ctx, step.Tool)
+result, err := e.backendClient.CallTool(ctx, target, step.Tool, args, nil)
+```
+
+This is replaced with a call through the session:
+
+```go
+// New: routes through the session's CallTool
+result, err := e.session.CallTool(ctx, step.Tool, args, nil)
+```
+
+The session already handles routing table lookup, backend capability name reversal, and backend dispatch. The engine no longer needs `Router` or `BackendClient` interfaces — it only needs a reference to the `MultiSession` it decorates.
+
+Similarly, `getToolInputSchema()` currently maintains its own `e.tools` list. It can instead call `e.session.Tools()`, which at the composite tools layer (below the filter) returns all tools including non-advertised ones. This naturally fixes the #4287 bug: the schema for every backend tool is available regardless of advertising.
+
+The `ResolveToolName` call in `getToolInputSchema` (for dot-convention support) moves to the session's `CallTool` implementation, which already handles this via the session router.
+
 #### Decorator wiring
 
 `pkg/vmcp/server/sessionmanager/factory.go` (assumes PR #4231 landed)
@@ -148,7 +180,9 @@ Delete:
 
 ### API Changes
 
-**Removed**: `WithAggregator(agg aggregator.Aggregator)` session factory option
+**Removed**:
+- `WithAggregator(agg aggregator.Aggregator)` session factory option
+- `Router` and `BackendClient` dependencies from the workflow engine (tool calls route through the session)
 
 **Added**:
 - `WithAggregationConfig(cfg *config.AggregationConfig, cr ConflictResolver)` — required conflict resolver and aggregation config. The conflict resolver always exists (`NewConflictResolver` defaults to prefix strategy).
@@ -232,7 +266,7 @@ All configuration fields work identically. Client-visible behavior is unchanged.
 | Feature | Current flow | New flow | Impact |
 |---|---|---|---|
 | **Authentication (Cedar)** | HTTP middleware intercepts `tools/list` and `tools/call` at the JSON-RPC level, evaluates Cedar policies against resolved tool names | Unchanged — Cedar middleware sits above the entire session decorator stack, sees the same resolved tool names in requests/responses | None |
-| **Composite tool calling** | Workflow engine receives `sess.Tools()` (advertised only) and `sess.GetRoutingTable()`. Calls `backendClient.CallTool()` directly (bypasses session decorators). `getToolInputSchema()` fails for non-advertised tools | Workflow engine receives `sess.Tools()` (ALL tools, since composite tools decorator sits below the filter). `backendClient.CallTool()` still bypasses decorators. `getToolInputSchema()` now finds schemas for all tools | **Bug fix** — coercion works for non-advertised tools |
+| **Composite tool calling** | Workflow engine receives `sess.Tools()` (advertised only) and `sess.GetRoutingTable()`. Calls `backendClient.CallTool()` directly (bypasses session decorators). `getToolInputSchema()` fails for non-advertised tools | Workflow engine calls `sess.CallTool()` — routes through the session instead of bypassing it. `getToolInputSchema()` uses `sess.Tools()` which, below the filter decorator, includes all tools | **Bug fix** — coercion works for non-advertised tools. **Simplification** — engine no longer depends on `Router` or `BackendClient` |
 | **Advertising filter** | Aggregator applies `shouldAdvertiseTool` before session creation. `sess.Tools()` returns only advertised tools | Filter decorator applies after composite tools. `sess.Tools()` at the filter level returns only advertised tools + composite tools. Below the filter (where composite tools operate), `sess.Tools()` returns all tools | Same client-visible result; composite tools see more |
 | **Optimizer** | Wraps session after composite tools, indexes `sess.Tools()` (advertised + composite) into find_tool/call_tool | Wraps session after filter, indexes `sess.Tools()` (advertised + composite) — same tools as before | None |
 | **Tool call routing** | `defaultMultiSession.CallTool` looks up routing table → `GetBackendCapabilityName()` → backend HTTP call | Unchanged — routing table is built with the same resolved names and `OriginalCapabilityName` values, just by the factory instead of the aggregator | None |
@@ -253,13 +287,14 @@ The decorator-based architecture makes it straightforward to add new session-lev
 2. Inline aggregator pipeline into `buildRoutingTable` in `pkg/vmcp/session/factory.go` — always use conflict resolver
 3. Create filter decorator at `pkg/vmcp/session/filterdec/decorator.go`
 4. Wire filter decorator in `pkg/vmcp/server/sessionmanager/factory.go`
-5. Update server wiring in `cmd/vmcp/app/commands.go` and `pkg/vmcp/server/server.go`
+5. Simplify workflow engine: replace `Router` + `BackendClient` with `sess.CallTool()`; replace `e.tools` with `sess.Tools()`
+6. Update server wiring in `cmd/vmcp/app/commands.go` and `pkg/vmcp/server/server.go`
 
 ### Phase 2: Cleanup
 
-6. Delete `Aggregator` interface, `defaultAggregator`, and associated methods
-7. Delete dead types (`AggregatedCapabilities`, `BackendDiscoverer`, etc.)
-8. Delete aggregator tests for removed methods; add integration tests on MultiSession construction/decoration
+7. Delete `Aggregator` interface, `defaultAggregator`, and associated methods
+8. Delete dead types (`AggregatedCapabilities`, `BackendDiscoverer`, etc.)
+9. Delete aggregator tests for removed methods; remove `Router` and `BackendClient` interfaces from workflow engine
 
 ## Testing Strategy
 
