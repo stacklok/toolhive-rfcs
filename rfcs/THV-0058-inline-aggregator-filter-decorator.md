@@ -298,33 +298,35 @@ The decorator-based architecture makes it straightforward to add new session-lev
 
 ## Testing Strategy
 
-All validation is at the K8s/Ginkgo E2E level (`test/e2e/thv-operator/virtualmcp/`). Tests deploy real MCPServers + VirtualMCPServers to a Kind cluster and exercise the full stack via MCP clients.
+New tests that don't involve auth are written as in-process integration tests at the `MultiSession` level, using real MCP backends hosted via `httptest.NewServer()`. This constructs the full vMCP stack (factory → conflict resolution → decorators → tool calls) without a K8s dependency. The existing pattern lives in `pkg/vmcp/session/connector_integration_test.go` — `startInProcessMCPServer()` creates real MCP servers with registered tools, and the session factory connects to them with full capability discovery.
+
+K8s/Ginkgo E2E tests (`test/e2e/thv-operator/virtualmcp/`) remain the regression gates for auth-dependent flows and CRD-driven configuration.
 
 ### Feature combination matrix
 
-The features being modified interact with each other. The matrix below maps every relevant combination to an E2E test — either an existing one that provides coverage or a new one that must be written.
+The features being modified interact with each other. The matrix below maps every relevant combination to a test — either an existing one that provides coverage or a new one that must be written.
 
 **Features**: **F** = Filter (per-workload), **EA** = ExcludeAll (per-workload or global), **R** = Renames/Overrides, **CR** = Conflict Resolution, **CT** = Composite Tools, **O** = Optimizer, **A** = Authn (non-anonymous)
 
-| # | F | EA | R | CR | CT | O | A | E2E test | Status |
-|---|---|---|---|---|---|---|---|----------|--------|
-| 1 | | G | | prefix | | | anon | `virtualmcp_excludeall_global_test.go` | Existing |
-| 2 | Y | Y | | prefix | | | anon | `virtualmcp_aggregation_filtering_test.go` | Existing |
-| 3 | Y | Y | | prefix | Y | | anon | `virtualmcp_composite_hidden_tools_test.go` | Existing |
-| 4 | | | | prefix/priority/manual | | | anon | `virtualmcp_conflict_resolution_test.go` | Existing |
-| 5 | | | Y | prefix | | | anon | `virtualmcp_aggregation_overrides_test.go` | Existing |
-| 6 | Y | | Y | prefix | | | anon | `virtualmcp_toolconfig_test.go` (MCPToolConfig CRD) | Existing |
-| 7 | | | Y | prefix | Y | Y | anon | `virtualmcp_optimizer_composite_test.go` | Existing |
-| 8 | Y | Y | | prefix | Y | | anon | **`virtualmcp_composite_coercion_test.go`** | **New** |
-| 9 | Y | | Y | prefix | | | anon | **`virtualmcp_overrides_filter_test.go`** | **New** |
-| 10 | Y | Y | Y | prefix | Y | Y | anon | **`virtualmcp_full_stack_test.go`** | **New** |
-| 11 | | | | prefix | | | token | `virtualmcp_external_auth_test.go` | Existing |
+| # | F | EA | R | CR | CT | O | A | Test | Level | Status |
+|---|---|---|---|---|---|---|---|------|-------|--------|
+| 1 | | G | | prefix | | | anon | `virtualmcp_excludeall_global_test.go` | K8s E2E | Existing |
+| 2 | Y | Y | | prefix | | | anon | `virtualmcp_aggregation_filtering_test.go` | K8s E2E | Existing |
+| 3 | Y | Y | | prefix | Y | | anon | `virtualmcp_composite_hidden_tools_test.go` | K8s E2E | Existing |
+| 4 | | | | prefix/priority/manual | | | anon | `virtualmcp_conflict_resolution_test.go` | K8s E2E | Existing |
+| 5 | | | Y | prefix | | | anon | `virtualmcp_aggregation_overrides_test.go` | K8s E2E | Existing |
+| 6 | Y | | Y | prefix | | | anon | `virtualmcp_toolconfig_test.go` (MCPToolConfig CRD) | K8s E2E | Existing |
+| 7 | | | Y | prefix | Y | Y | anon | `virtualmcp_optimizer_composite_test.go` | K8s E2E | Existing |
+| 8 | Y | Y | | prefix | Y | | | **composite_coercion_test.go** | **In-process** | **New** |
+| 9 | Y | | Y | prefix | | | | **overrides_filter_test.go** | **In-process** | **New** |
+| 10 | Y | Y | Y | prefix | Y | Y | | **full_stack_test.go** | **In-process** | **New** |
+| 11 | | | | prefix | | | token | `virtualmcp_external_auth_test.go` | K8s E2E | Existing |
 
 **Legend**: G = global ExcludeAllTools, Y = feature active in test, blank = not exercised.
 
-### Existing tests (regression gates)
+### Existing K8s E2E tests (regression gates)
 
-All existing tests in the matrix must pass without modification after the refactor. Any failure is a regression.
+All existing tests must pass without modification after the refactor. Any failure is a regression.
 
 - **Row 1**: Global `ExcludeAllTools: true` hides all backend tools; MCP server still responds.
 - **Row 2**: Per-workload `Filter` + `ExcludeAll` applied to different backends; only filtered tools exposed.
@@ -335,58 +337,66 @@ All existing tests in the matrix must pass without modification after the refact
 - **Row 7**: Optimizer wraps composite tools + overridden backend tools through `find_tool`/`call_tool`.
 - **Row 11**: Token-based incoming auth with backend routing.
 
-### New E2E tests
+### New in-process integration tests
+
+These tests construct the full decorator stack against real in-process MCP backends (via `httptest.NewServer()` + `mcp-go`). No K8s, no containers — the session factory connects to backends over HTTP, discovers capabilities, applies conflict resolution + overrides, and wires the decorator chain. Tests call through the decorated `MultiSession` interface.
+
+**Location**: `pkg/vmcp/session/` (alongside existing `connector_integration_test.go`)
 
 #### Row 8: Composite tool type coercion with hidden tools (regression test for #4287)
 
-**File**: `test/e2e/thv-operator/virtualmcp/virtualmcp_composite_coercion_test.go`
+**File**: `pkg/vmcp/session/composite_coercion_integration_test.go`
 
 The specific bug this RFC fixes. When a composite tool workflow step calls a hidden backend tool with a numeric parameter, `getToolInputSchema()` fails to find the schema, skips coercion, and the backend rejects `"42"` (string) instead of `float64(42)`.
 
 **Setup**:
-- Backend with a tool accepting an integer parameter (requires adding an `add` tool to yardstick: `{"a": integer, "b": integer}` → returns sum)
-- `ExcludeAll: true` for the backend
-- Composite tool whose workflow step calls the hidden tool via template expansion (`"{{ .params.a }}"`)
+- In-process MCP backend with a tool accepting integer parameters (e.g., `add` tool: `{"a": integer, "b": integer}` → returns sum)
+- Session factory with `ExcludeAll: true` for the backend
+- Composite tools decorator applied with a workflow step that calls the hidden tool via template expansion (`"{{ .params.a }}"`)
+- Filter decorator applied above composite tools
 
 **Assertions**:
-- `tools/list` returns only the composite tool
-- Calling the composite tool succeeds — backend receives coerced numeric args
+- `sess.Tools()` at top of stack returns only the composite tool
+- `sess.CallTool()` with the composite tool succeeds — backend receives coerced numeric args
 - Response contains correct output (the sum), proving type coercion worked
 
 **Must fail before the refactor, pass after.**
 
 #### Row 9: Overrides + filter on the same backend
 
-**File**: `test/e2e/thv-operator/virtualmcp/virtualmcp_overrides_filter_test.go`
+**File**: `pkg/vmcp/session/overrides_filter_integration_test.go`
 
 No existing test exercises overrides and filter together. The `shouldAdvertiseTool` comment bug (says "before overrides" but receives post-override name) was never caught because this combination is untested.
 
 **Setup**:
-- Backend with tool `echo`, overridden to `custom_echo`
+- In-process MCP backend with tool `echo`
+- Override config: `echo` → `custom_echo`
 - Filter configured with `["echo"]` (pre-override name)
+- Session constructed with full decorator chain
 
 **Assertions**:
 - Document whether the filter matches pre- or post-override names
-- Verify the overridden tool is callable by its new name
+- Verify the overridden tool is callable by its new name via `sess.CallTool()`
 - Lock in the actual behavior so the refactor preserves it
 
 #### Row 10: Full stack — all features combined
 
-**File**: `test/e2e/thv-operator/virtualmcp/virtualmcp_full_stack_test.go`
+**File**: `pkg/vmcp/session/full_stack_integration_test.go`
 
 Exercises the entire decorator stack with all features active simultaneously.
 
 **Setup**:
-- Two backends with conflicting tool names (prefix conflict resolution)
+- Two in-process MCP backends with conflicting tool names (prefix conflict resolution)
 - Backend A: tool overridden (`echo` → `custom_echo`), plus filter hiding some tools
 - Backend B: `ExcludeAll: true`
 - Composite tool calling tools from both backends (including hidden + overridden)
 - Optimizer enabled
+- Full decorator chain: base session → composite tools → filter → optimizer
 
 **Assertions**:
-- `tools/list` via optimizer returns only `find_tool`/`call_tool`
-- `find_tool` returns the composite tool + filtered backend A tools (not excluded backend B tools, not hidden backend A tools)
-- `call_tool` with composite tool succeeds — reaches both backends with correct original names
+- `sess.Tools()` via optimizer returns only `find_tool`/`call_tool`
+- `sess.CallTool("find_tool", ...)` returns the composite tool + filtered backend A tools (not excluded backend B tools)
+- `sess.CallTool("call_tool", {tool_name: compositeToolName, ...})` succeeds — reaches both backends with correct original names
 - Overridden tool callable by its new name through the optimizer
 - Backend B tools reachable via composite tool despite `ExcludeAll`
 
@@ -408,12 +418,12 @@ Lightweight unit tests for the new filter decorator in isolation:
 ### Verification
 
 ```bash
-# Unit tests
+# Unit + in-process integration tests
 go vet ./pkg/vmcp/... ./cmd/vmcp/...
 go test ./pkg/vmcp/... ./cmd/vmcp/...
 task lint-fix
 
-# E2E tests (Kind cluster)
+# K8s E2E tests (Kind cluster — regression gates)
 task test-e2e
 ```
 
