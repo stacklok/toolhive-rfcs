@@ -1,4 +1,4 @@
-# RFC-XXXX: First-Class vMCP Support in the Local CLI Experience
+# RFC-0059: First-Class vMCP Support in the Local CLI Experience
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
