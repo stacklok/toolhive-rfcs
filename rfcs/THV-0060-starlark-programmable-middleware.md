@@ -1,4 +1,4 @@
-# THV-0059: Starlark Session Initialization for vMCP
+# THV-0060: Starlark Session Initialization for vMCP
 
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
