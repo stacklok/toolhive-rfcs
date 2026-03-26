@@ -10,7 +10,7 @@
 
 ## Summary
 
-Introduce a Starlark-based session initialization script for vMCP. A single script runs once per session, receives the authorized backends and their capabilities, and calls `publish()` to declare what the agent sees — optionally wrapping handlers with additional logic. This replaces the growing set of independent config knobs (aggregation, optimizer, filtering, rate limiting) whose combinations interact in ways that are difficult to predict, test, and explain.
+Introduce a Starlark-based session initialization script for vMCP. A single script runs once per session, receives discovered backends and their capabilities, and calls `publish()` to declare what the agent sees — optionally wrapping handlers with additional logic. Existing config knobs remain fully supported, but customization of vMCP behavior can now be exactly tailored to the use case without adding more knobs and the cognitive load of their interactions.
 
 ## Problem Statement
 
@@ -54,11 +54,30 @@ A config knob for "optimizer description template" would fix this one case. But 
 
 THV-0051 proposes Starlark for composite tools. Before that engine ships, we should decide whether Starlark is *only* for composite tools or whether it's the foundation for a unified session initialization model. Shipping THV-0051 as-is and then later expanding scope would mean a second migration.
 
+The cost equation also favors acting now. As more capabilities are added, the cost of retrofitting a composable system increases — more code to replace, more interactions to preserve. Meanwhile, the cost of building each new config knob is *also* increasing, because each knob must reason about its interactions with every existing knob and implement more than a simple built-in. A session initialization model inverts this: new capabilities ship as simple built-in functions, and administrators compose them as needed. The longer we wait, the more expensive both paths become.
+
+### Background: How authorization works today
+
+Authorization in vMCP is enforced by authz middleware that sits between the client and the session:
+
+- For **`tools/list`** (and other list methods): the authz middleware filters the response, removing items the caller isn't authorized to use.
+- For **`tools/call`** (and other action methods): the authz middleware gates the request, returning 403 if the caller isn't authorized.
+
+Critically, the authz middleware operates on the *final published tool set* — it does not restrict which tools are visible during session construction. The session initialization script runs during session construction, so it sees all tools from all backends the persona is configured to use. Authorization is applied afterward at request time.
+
+**Implication for this RFC**: Because the script sees all tools regardless of the caller's authorization:
+
+1. `backends()` returns all backends configured for the persona, not filtered by user authorization.
+2. Published tools are still subject to authz filtering/gating at runtime — publishing a tool does not bypass authorization.
+3. A handler could dispatch to any discovered tool via saved references, including tools the current user isn't authorized to use. This is the same trust model as composite tools today — see [Interaction with authorization](#interaction-with-authorization).
+
+Fixing the authz boundary is out of scope for this RFC.
+
 ## Goals
 
 - Define a Starlark-based programming model that subsumes tool advertising, renaming, optimizer behavior, and composite tool workflows into a single script that runs once per session
-- Provide built-in functions for capabilities that would otherwise be config knobs: search indexing, PII scrubbing, rate limiting checks
-- Maintain the invariant that **Starlark never sees tools the user is not authorized to use** — Cedar authorization remains the access control boundary
+- Make it easy to add new capabilities (search indexing, PII scrubbing, rate limiting) as simple built-in functions rather than config knobs with complex interactions
+- Preserve the existing authorization boundary — Cedar authz middleware continues to filter `tools/list` and gate `tools/call` at runtime, independent of what the script publishes
 - Make the system accessible to non-power-users via built-in presets that replicate today's config-driven behavior
 - Enable policies that span multiple features (e.g., "non-readonly tools require elicitation")
 - Maintain full backward compatibility with existing config fields — the session initialization script must be able to replicate every behavior currently achievable via `aggregation`, `optimizer`, and related config (except legacy composite tools, which are replaced by Starlark scripts from THV-0051)
@@ -75,12 +94,13 @@ THV-0051 proposes Starlark for composite tools. Before that engine ships, we sho
 
 ### High-Level Design
 
-A vMCP persona runs a single Starlark **session initialization script** once per session. The script receives the authorized backends via `backends()` — a dict keyed by backend name, where each value exposes the backend's tools, resources, and prompts. The script calls `publish()` to declare what the agent sees.
+A vMCP persona runs a single Starlark **session initialization script** once per session. The script receives discovered backends via `backends()` — a dict keyed by backend name, where each value exposes the backend's tools, resources, and prompts. The script calls `publish()` to declare what the agent sees.
 
 ```mermaid
 flowchart TB
     subgraph "Session Initialization"
-        Cedar[Cedar Authorization] -->|authorized backends| Factory[Session Factory]
+        Factory[Session Factory] -->|discover backends| Backends[Backend MCP Servers]
+        Backends -->|capabilities| Factory
         Factory -->|run script once| Script[Session Init Script]
         Script -->|"publish(meta, fn)"| Session[MultiSession]
     end
@@ -89,31 +109,32 @@ flowchart TB
         backends_fn["backends() → dict of backend objects"]
         publish_fn["publish(metadata, handler)"]
         search_fn["search_index(tools) → index"]
-        scrub_fn["scrub_pii(text) → text"]
-        rate_fn["check_rate_limit(key, limit, window) → (ok, retry_after)"]
+        config_fn["config() → persona config dict"]
         elicit_fn["elicit(message, schema) → decision"]
-        call_fn["call_tool(name, args) → result"]
     end
 
-    subgraph "Runtime"
-        Agent[MCP Client] -->|tools/list| Session
-        Agent -->|tools/call| Handler[Published Handler]
-        Handler -->|backend tools| Backend[Backend MCP Servers]
+    subgraph "Runtime (per request)"
+        Agent[MCP Client] -->|tools/list| Authz[Authz Middleware]
+        Agent -->|tools/call| Authz
+        Authz -->|filtered/gated| Session
+        Session -->|invoke handler| Backend2[Backend MCP Servers]
     end
 
     style Factory fill:#90caf9
-    style Cedar fill:#ffcc80
+    style Authz fill:#ffcc80
 ```
 
-**Key invariant**: `backends()` returns only backends and capabilities the current user is authorized to use. Cedar policies are evaluated *before* the script runs. The script operates within the authorization boundary, not outside it.
+**Key invariant**: `backends()` returns all backends configured for the persona. The script publishes tools, and the authz middleware filters `tools/list` responses and gates `tools/call` requests at runtime. Publishing a tool does not bypass authorization.
 
 ### The Programming Model
 
 The script runs once when a session is created. `backends()` returns a dict keyed by backend name. Each backend object exposes:
 
 - **`backend.tools()`** — returns a list of `(metadata, handler)` tuples for the backend's tools
-- **`backend.resources()`** — returns the backend's resources (future use)
-- **`backend.prompts()`** — returns the backend's prompts (future use)
+- **`backend.resources()`** — returns the backend's resources
+- **`backend.prompts()`** — returns the backend's prompts
+
+**Resources and prompts in v0**: Today, vMCP aggregates resources and prompts from all backends and passes them through unmodified — no conflict resolution, renaming, or filtering is applied (unlike tools). In v0, the session initialization script only controls tools via `publish()`. Resources and prompts continue to be passed through from backends unchanged. Future versions may add `publish_resource()` and `publish_prompt()` to give scripts control over these capabilities as well.
 
 Each tool tuple is `(metadata, handler)`:
 
@@ -125,7 +146,7 @@ Each tool tuple is `(metadata, handler)`:
 #### Simplest possible script
 
 ```python
-# Publish everything the user is authorized to use. No modification.
+# Publish everything from all backends. No modification.
 for name, backend in backends().items():
     for meta, fn in backend.tools():
         publish(meta, fn)
@@ -229,6 +250,8 @@ publish(
 
 ### Motivating Use Cases
 
+The following use cases illustrate what the programming model enables. Use Cases 1, 2, and 4 are achievable with the v0 built-ins. Use Cases 3, 5, and 6 depend on future built-ins (`scrub_pii()`, `check_rate_limit()`) that are not in scope for this RFC but demonstrate why the model is worth building.
+
 #### Use Case 1: Dynamic optimizer descriptions
 
 **Problem**: Agents don't use `find_tool` because its static description doesn't tell them what's available.
@@ -258,14 +281,20 @@ publish(
     lambda args: {"results": index.search(args["query"])},
 )
 
+# Save handlers by name for dispatch
+tool_handlers = {}
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        tool_handlers[meta.name] = fn
+
 publish(
     metadata(name="call_tool", description="Call a tool by name.",
              parameters=CALL_TOOL_SCHEMA, annotations={}),
-    lambda args: call_tool(args["tool_name"], args["arguments"]),
+    lambda args: tool_handlers[args["tool_name"]](args["arguments"]),
 )
 ```
 
-When backends change and the session is recreated, the script re-runs and the description updates. A `tools/list_changed` notification is sent to clients that support it.
+The value here is that the administrator defines the policy that works best for their use case. ToolHive doesn't need to build one-size-fits-all solutions for optimizer behavior — the script is the policy.
 
 #### Use Case 2: Elicitation gate for write operations
 
@@ -318,7 +347,7 @@ for name, backend in backends().items():
         publish(meta, with_pii_scrubbing(fn))
 ```
 
-`scrub_pii()` is a Go-implemented built-in that applies regex-based and NER-based entity detection. It handles common patterns (emails, phone numbers, SSNs, credit cards) without requiring an external service.
+`scrub_pii()` is an example of a future built-in (not in scope for this RFC) that could handle common patterns (emails, phone numbers, SSNs, credit cards). Users can also write their own scrubbing decorators — the programming model makes this natural without needing ToolHive to explicitly support every scrubbing pattern.
 
 #### Use Case 4: Tool aggregation and renaming
 
@@ -329,6 +358,8 @@ for name, backend in backends().items():
 **With session initialization script**:
 
 ```python
+jira_handlers = {}
+
 for name, backend in backends().items():
     for meta, fn in backend.tools():
         # Hide internal tools
@@ -344,21 +375,17 @@ for name, backend in backends().items():
             )
             continue
 
-        # Skip Jira tools — we'll group them below
+        # Save Jira tools — we'll group them below
         if meta.name in ["jira_create", "jira_update", "jira_search"]:
+            jira_handlers[meta.name] = fn
             continue
 
         publish(meta, fn)
 
-# Publish a composite Jira tool
+# Publish a composite Jira tool using saved handlers
 def jira_handler(args):
     action = args["action"]
-    if action == "create":
-        return call_tool("jira_create", args)
-    elif action == "update":
-        return call_tool("jira_update", args)
-    elif action == "search":
-        return call_tool("jira_search", args)
+    return jira_handlers["jira_" + action](args)
 
 publish(
     metadata(name="jira", description="Manage Jira issues: create, update, or search",
@@ -401,16 +428,33 @@ for name, backend in backends().items():
         publish(meta, with_rate_limit(fn, meta.name))
 ```
 
-`check_rate_limit()` is backed by the same Redis token bucket from THV-0057. The *policy* is expressed in Starlark; the *mechanism* lives in Go.
+`check_rate_limit()` is backed by the same Redis token bucket from THV-0057. The *policy* is expressed in Starlark; the *mechanism* lives in Go. This allows users to define rate limiting that meets the needs of their use case without ToolHive needing to explicitly support every rate limiting pattern.
 
 #### Use Case 6: Composing multiple concerns
 
 A single script handles optimizer + elicitation gate + PII scrubbing + rate limiting — behaviors that today require four different config surfaces:
 
 ```python
+def build_summary(tool_list):
+    cats = {}
+    for meta, fn in tool_list:
+        cat = meta.annotations.get("category", "general")
+        if cat not in cats:
+            cats[cat] = []
+        cats[cat].append(meta.name)
+    return "Search for tools across: " + ", ".join(
+        "%s (%d tools)" % (c, len(ns)) for c, ns in cats.items()
+    )
+
 all_tools = []
+tool_handlers = {}
+tool_metadata = {}
+
 for name, backend in backends().items():
-    all_tools += backend.tools()
+    for meta, fn in backend.tools():
+        all_tools.append((meta, fn))
+        tool_handlers[meta.name] = fn
+        tool_metadata[meta.name] = meta
 
 index = search_index(all_tools)
 desc = build_summary(all_tools)
@@ -428,14 +472,14 @@ def dispatch(args):
         return {"error": "Rate limited", "retry_after": retry_after}
 
     # Elicitation gate for non-readonly tools
-    t = get_tool(tool_name)
-    if t and not t.annotations.get("readOnly", False):
+    meta = tool_metadata.get(tool_name)
+    if meta and not meta.annotations.get("readOnly", False):
         decision = elicit("Approve call to '%s'?" % tool_name)
         if decision.action != "accept":
             return {"error": "Declined"}
 
     # Execute and scrub
-    result = call_tool(tool_name, arguments)
+    result = tool_handlers[tool_name](arguments)
     if "text" in result:
         result["text"] = scrub_pii(result["text"])
     return result
@@ -451,17 +495,6 @@ publish(
              parameters=CALL_TOOL_SCHEMA, annotations={}),
     dispatch,
 )
-
-def build_summary(tool_list):
-    cats = {}
-    for meta, fn in tool_list:
-        cat = meta.annotations.get("category", "general")
-        if cat not in cats:
-            cats[cat] = []
-        cats[cat].append(meta.name)
-    return "Search for tools across: " + ", ".join(
-        "%s (%d tools)" % (c, len(ns)) for c, ns in cats.items()
-    )
 ```
 
 The ordering is explicit. The interactions are visible. There are no surprising feature interactions because the administrator wrote the interaction.
@@ -474,30 +507,42 @@ These are Go-implemented functions exposed to Starlark scripts.
 
 | Built-in | Signature | Description |
 |----------|-----------|-------------|
-| `backends()` | `backends() → dict[string, Backend]` | Returns all authorized backends keyed by name. Each `Backend` object exposes `.tools()` (returns `list[(metadata, handler)]`), `.resources()`, and `.prompts()`. Only backends and capabilities the current user is authorized to use are included. |
-| `publish(meta, handler)` | `publish(metadata, callable) → None` | Adds a tool to the set visible to the agent. `handler` receives a single `dict` argument. |
+| `backends()` | `backends() → dict[string, Backend]` | Returns all backends configured for the persona, keyed by name. Each `Backend` object exposes `.tools()` (returns `list[(metadata, handler)]`), `.resources()`, and `.prompts()`. |
+| `publish(meta, handler)` | `publish(metadata, callable) → None` | Adds a tool to the set visible to the agent. `handler` receives a single `dict` argument. Authz middleware still filters/gates at runtime. |
 | `metadata(...)` | `metadata(name, description, parameters, annotations) → metadata` | Creates a new metadata struct. All four fields are required — this prevents accidentally dropping `annotations` or `parameters` when renaming. |
-| `get_tool(name)` | `get_tool(name) → metadata or None` | Looks up a specific authorized tool's metadata by name. |
-
-#### Tool call execution
-
-| Built-in | Signature | Description |
-|----------|-----------|-------------|
-| `call_tool(name, args)` | `call_tool(name, dict) → dict` | Calls a backend tool by name. Halts on error. |
-| `try_call_tool(name, args)` | `try_call_tool(name, dict) → struct(ok, error, output)` | Calls a backend tool. Returns error info instead of halting. |
-| `retry(fn, max_attempts, delay)` | `retry(fn, max_attempts=3, delay="1s") → any` | Retries a callable with exponential backoff. |
-| `parallel(fns)` | `parallel(fns) → list` | Executes zero-argument callables concurrently. |
 
 #### Session initialization capabilities
 
 | Built-in | Signature | Description |
 |----------|-----------|-------------|
 | `search_index(tools)` | `search_index(list[(metadata, handler)]) → SearchIndex` | Builds a semantic search index over the tool list. Returns an object with `.search(query) → list[dict]`. |
+| `elicit(message, schema)` | `elicit(message, schema={}) → struct(action, content)` | Prompts the user for a decision via MCP elicitation. |
+| `config()` | `config() → dict` | Returns the vMCP persona's config fields (`aggregation`, `optimizer`, etc.) as a read-only dict. Used by the `default` preset. |
+| `log(message)` | `log(message) → None` | Emits a structured audit log entry. |
+
+#### Handler options
+
+Handlers returned from `backend.tools()` accept an optional `timeout` keyword argument to control backend call timeouts:
+
+```python
+# Default timeout (inherited from backend config)
+result = fn(args)
+
+# Custom timeout
+result = fn(args, timeout=10)  # 10 second timeout
+```
+
+This is useful for handlers that wrap expensive backend calls or for scripts that need tighter latency guarantees.
+
+#### Future built-ins (examples)
+
+The programming model makes it straightforward to add new capabilities as simple built-in functions. These are examples of what could be added — they are **not** in scope for this RFC:
+
+| Built-in | Signature | Description |
+|----------|-----------|-------------|
+| `current_user()` | `current_user() → struct(sub, email, groups)` | Returns the authenticated user's identity. The user is known at init time, but this built-in is deferred to a future version. |
 | `scrub_pii(text)` | `scrub_pii(text) → string` | Redacts PII patterns (emails, phones, SSNs, credit cards) from text. |
 | `check_rate_limit(key, limit, window)` | `check_rate_limit(key, limit, window) → (bool, int)` | Checks a token bucket counter in Redis. Returns `(allowed, retry_after_seconds)`. |
-| `elicit(message, schema)` | `elicit(message, schema={}) → struct(action, content)` | Prompts the user for a decision via MCP elicitation. |
-| `current_user()` | `current_user() → struct(sub, email, groups)` | Returns the authenticated user's identity. |
-| `log(message)` | `log(message) → None` | Emits a structured audit log entry. |
 
 ### Presets: Making it Easy for Non-Power-Users
 
@@ -506,7 +551,7 @@ The critical question is: how do people who don't want to write Starlark still u
 **Answer: presets.** A preset is a named, built-in Starlark script that replicates the behavior of today's config knobs. Presets are transparent — users can inspect the underlying Starlark source and fork it when they need customization:
 
 ```bash
-thv vmcp show-preset optimizer
+thv vmcp show-preset default
 ```
 
 This prints the Starlark source. A user who needs 90% of a preset's behavior can copy it, modify the 10% they need, and use `sessionInit.script` or `sessionInit.scriptFile` instead.
@@ -515,23 +560,113 @@ This prints the Starlark source. A user who needs 90% of a preset's behavior can
 
 | Preset | Behavior | Today's equivalent |
 |--------|----------|--------------------|
-| `passthrough` | Publishes all authorized tools unmodified. | No `aggregation`, no `optimizer` |
-| `standard` | Applies filtering, renaming, and conflict resolution from the existing `aggregation` config. | `aggregation` config |
-| `optimizer` | Publishes `find_tool` / `call_tool` with dynamic descriptions, applying filtering/renaming from `aggregation`. | `aggregation` + `optimizer` config |
+| `default` | Reads existing config knobs (`aggregation`, `optimizer`, etc.) and produces identical behavior to the current config-driven system. Applies filtering, renaming, conflict resolution, and optimizer behavior based on what's configured. | All existing config |
 
-#### Migration path
-
-The existing config fields (`aggregation`, `optimizer`, etc.) are **always** translated into a session initialization script internally. There is no separate legacy code path — the Starlark engine is the single implementation.
-
-When no `sessionInit` block is present, vMCP automatically generates the equivalent session initialization script from the existing config fields. This is the same script a user would get from running:
-
-```bash
-thv vmcp migrate-config
-```
-
-This command outputs the Starlark script equivalent of the current config, which the user can adopt as their `sessionInit.script` and customize from there.
+A single `default` preset handles all existing config knobs. When no `sessionInit` block is present, vMCP uses the `default` preset, which reads the existing config fields and produces identical behavior. There is no separate legacy code path — the Starlark engine is the single implementation.
 
 The only exception is legacy declarative composite tools (`compositeTools`, `compositeToolRefs`), which are not supported in the session initialization script. These are replaced by Starlark scripted tools from THV-0051.
+
+#### Sketch of the `default` preset
+
+The `default` preset is the most complex part of this RFC — it must faithfully replicate the behavior of the existing config-driven system. Below is a sketch of what this script looks like. The exact implementation will be validated during the POC phase.
+
+```python
+cfg = config()
+agg = cfg.get("aggregation", {})
+opt = cfg.get("optimizer", None)
+
+# --- Conflict resolution strategy ---
+strategy = agg.get("conflictResolution", "prefix")
+prefix_format = "{workload}_"
+priority_order = []
+cr_config = agg.get("conflictResolutionConfig", {})
+if cr_config:
+    prefix_format = cr_config.get("prefixFormat", "{workload}_")
+    priority_order = cr_config.get("priorityOrder", [])
+
+# --- Collect tools per backend, applying filtering and overrides ---
+tool_configs = {}
+for tc in agg.get("tools", []):
+    tool_configs[tc["workload"]] = tc
+
+all_published = []  # track names for conflict detection
+seen_names = {}     # name → backend for collision detection
+
+for backend_name, backend in backends().items():
+    tc = tool_configs.get(backend_name, {})
+
+    # ExcludeAll: skip entire backend
+    if agg.get("excludeAllTools", False) or tc.get("excludeAll", False):
+        continue
+
+    allowed = tc.get("filter", None)  # None = allow all
+    overrides = tc.get("overrides", {})
+
+    for meta, fn in backend.tools():
+        # Apply filter (allow-list)
+        if allowed and meta.name not in allowed:
+            continue
+
+        # Apply overrides (renaming, description changes)
+        override = overrides.get(meta.name, None)
+        if override:
+            meta = metadata(
+                name = override.get("name", meta.name),
+                description = override.get("description", meta.description),
+                parameters = meta.parameters,
+                annotations = meta.annotations,
+            )
+
+        # Apply conflict resolution
+        if meta.name in seen_names:
+            if strategy == "prefix":
+                prefix = prefix_format.replace("{workload}", backend_name)
+                meta = metadata(
+                    name = prefix + meta.name,
+                    description = meta.description,
+                    parameters = meta.parameters,
+                    annotations = meta.annotations,
+                )
+            elif strategy == "priority":
+                existing_backend = seen_names[meta.name]
+                if priority_order.index(backend_name) > priority_order.index(existing_backend):
+                    continue  # lower priority, skip
+                # else: higher priority, will overwrite
+
+        seen_names[meta.name] = backend_name
+        all_published.append((meta, fn))
+
+# --- Optimizer mode: publish find_tool/call_tool instead of raw tools ---
+if opt:
+    index = search_index(all_published)
+
+    desc_parts = []
+    for backend_name, backend in backends().items():
+        n = len(backend.tools())
+        desc_parts.append("%s (%d tools)" % (backend_name, n))
+    summary = "Search for tools. Available: " + ", ".join(desc_parts)
+
+    tool_handlers = {}
+    for m, f in all_published:
+        tool_handlers[m.name] = f
+
+    publish(
+        metadata(name="find_tool", description=summary,
+                 parameters=FIND_TOOL_SCHEMA, annotations={}),
+        lambda args: {"results": index.search(args["query"])},
+    )
+    publish(
+        metadata(name="call_tool", description="Call a tool by name.",
+                 parameters=CALL_TOOL_SCHEMA, annotations={}),
+        lambda args: tool_handlers[args["tool_name"]](args["arguments"]),
+    )
+else:
+    # Standard mode: publish tools directly
+    for m, f in all_published:
+        publish(m, f)
+```
+
+This is approximately 80 lines of Starlark. It replaces ~2000 lines of Go across the aggregator, optimizer, and decorator stack. The POC will validate whether this sketch is complete and correct.
 
 ### Detailed Design
 
@@ -539,33 +674,37 @@ The only exception is legacy declarative composite tools (`compositeTools`, `com
 
 ```mermaid
 sequenceDiagram
-    participant Factory as Session Factory
-    participant Cedar as Cedar Authz
-    participant Script as Session Init Script
-    participant Session as MultiSession
     participant Agent as MCP Client
+    participant Authz as Authz Middleware
+    participant Session as MultiSession
+    participant Backend as Backend MCP Servers
+    participant Factory as Session Factory
+    participant Script as Session Init Script
 
-    Note over Factory: Session creation
-    Factory->>Factory: Load script (preset or generated from config)
-    Factory->>Cedar: Determine authorized backends for user
-    Cedar-->>Factory: Authorized backend set
-
-    Factory->>Script: Execute script with authorized backends
+    Note over Factory: Session creation (once)
+    Factory->>Backend: Discover backend capabilities
+    Backend-->>Factory: Tools, resources, prompts
+    Factory->>Script: Execute session init script
     Script->>Script: backends() → iterate, filter, wrap, publish
     Script-->>Factory: Published (metadata, handler) set
     Factory->>Session: Construct MultiSession from published tools
 
-    Note over Agent: tools/list
-    Agent->>Session: tools/list
-    Session-->>Agent: Published tool metadata
+    Note over Agent: Runtime (per request)
+    Agent->>Authz: tools/list
+    Authz->>Session: tools/list
+    Session-->>Authz: Published tool metadata
+    Authz-->>Agent: Filtered tool metadata (unauthorized tools removed)
 
-    Note over Agent: tools/call
-    Agent->>Session: tools/call "find_tool" {query: "github"}
-    Session->>Session: Invoke published handler
-    Session-->>Agent: CallToolResult
+    Agent->>Authz: tools/call "find_tool" {query: "github"}
+    Authz->>Authz: Check authorization
+    Authz->>Session: Invoke published handler
+    Session->>Backend: Forward to backend
+    Backend-->>Session: Result
+    Session-->>Authz: CallToolResult
+    Authz-->>Agent: CallToolResult
 ```
 
-The script runs **once** per session, not per request. `publish()` calls build up the tool set. The resulting `(metadata, handler)` pairs are used to construct the `MultiSession`, which handles all subsequent `tools/list` and `tools/call` requests.
+The script runs **once** per session, not per request. `publish()` calls build up the tool set. The resulting `(metadata, handler)` pairs are used to construct the `MultiSession`, which handles all subsequent `tools/list` and `tools/call` requests. The authz middleware sits between the agent and the session, filtering and gating requests at runtime.
 
 #### Where this fits in the architecture
 
@@ -584,9 +723,16 @@ The session initialization script is not a decorator — it is used during sessi
 
 #### Interaction with authorization
 
-The session initialization script runs after authorization has determined which backends and tools are available. `backends()` returns only what the user is authorized to use. `call_tool()` delegates to the base session, which enforces the routing table. The script cannot escalate privileges.
+As described in [Background: How authorization works today](#background-how-authorization-works-today), the session initialization script runs during session construction — before the authz middleware. `backends()` returns all backends configured for the persona, regardless of the current user's authorization.
 
-The specific mechanism for authorization (Cedar policies at the HTTP middleware layer, or a future alternative) is orthogonal to this design. Additional built-in functions could be added in the future to make the authorization integration more explicit within the script, but that is out of scope for this RFC.
+The authz middleware continues to enforce authorization at runtime:
+
+- `tools/list` responses are filtered to remove tools the caller isn't authorized to use
+- `tools/call` requests are gated — unauthorized calls return 403
+
+This means publishing a tool via `publish()` does not bypass authorization. The script controls *what tools exist and how they behave*; the authz middleware controls *who can see and use them*.
+
+**Note**: Because the script sees all discovered tools, a handler could dispatch to tools the current user isn't authorized to use by saving handler references into a dict. This is the same trust model as composite tools today — administrators who write composite tool configurations can already wire calls to any backend tool. Fixing this boundary (moving authz before session construction) is out of scope for this RFC.
 
 #### Interaction with dynamic webhooks
 
@@ -599,10 +745,10 @@ Both coexist. A request passes through webhooks first (external policy), then re
 
 #### Interaction with rate limiting
 
-THV-0057's Redis-backed token bucket is the *mechanism*. `check_rate_limit()` exposes it to scripts. The *policy* can be:
+THV-0057's Redis-backed token bucket is the *mechanism*. A future `check_rate_limit()` built-in could expose it to scripts. Once available, the *policy* could be:
 
-1. **Config-driven**: The `standard` / `optimizer` presets read `rateLimiting` from `config` and call `check_rate_limit()` internally
-2. **Script-driven**: Custom scripts implement context-aware rate limiting
+1. **Config-driven**: The `default` preset reads `rateLimiting` from config and applies limits internally
+2. **Script-driven**: Custom scripts implement context-aware rate limiting using the built-in
 
 ### API Changes
 
@@ -611,9 +757,8 @@ THV-0057's Redis-backed token bucket is the *mechanism*. `check_rate_limit()` ex
 ```go
 type SessionInitConfig struct {
     // Preset is a named built-in session initialization script.
-    // One of: "passthrough", "standard", "optimizer".
-    // When empty and no Script/ScriptFile is set, the session init script
-    // is auto-generated from the existing aggregation/optimizer config.
+    // Currently only "default" is supported (reads existing config knobs).
+    // When empty and no Script/ScriptFile is set, the "default" preset is used.
     Preset string `json:"preset,omitempty" yaml:"preset,omitempty"`
 
     // Script is inline Starlark source. Mutually exclusive with Preset and ScriptFile.
@@ -626,7 +771,7 @@ type SessionInitConfig struct {
 
 #### Existing config fields
 
-`aggregation`, `compositeToolRefs`, and `optimizer` remain on `Config`. When no `sessionInit` block is present, they are used to auto-generate the session initialization script. When `sessionInit` is present, `aggregation` and `optimizer` are ignored (if both are set, vMCP logs a warning).
+`aggregation`, `compositeToolRefs`, and `optimizer` remain on `Config`. The `default` preset reads these fields and produces identical behavior. When a custom `sessionInit.script` or `sessionInit.scriptFile` is set, these fields are ignored (if both are set, vMCP logs a warning).
 
 Legacy declarative composite tools (`compositeTools`, `compositeToolRefs`) are not supported in the session initialization script and will be removed in a future release.
 
@@ -651,26 +796,25 @@ spec:
 
 | Threat | Description | Severity |
 |--------|-------------|----------|
-| **Privilege escalation via script** | Script calls `call_tool()` for an unauthorized tool | High |
+| **Privilege escalation via script** | Script handler dispatches to an unauthorized tool via saved references | Medium |
 | **Denial of service via infinite loop** | Script with `while True` or deep recursion | High |
 | **Tool list manipulation** | Script publishes tools that shouldn't be visible | Medium |
-| **Decorator bypass** | Script omits `scrub_pii()` or `check_rate_limit()` | Medium |
+| **Decorator bypass** | Script omits expected handler wrappers (e.g., scrubbing, rate limiting) | Medium |
 | **Resource exhaustion** | Script builds large data structures | High |
 
 ### Authentication and Authorization
 
-**Cedar remains the authorization boundary.** The Starlark engine cannot circumvent it:
+**Cedar remains the authorization boundary at runtime.** The authz middleware filters `tools/list` and gates `tools/call`:
 
-- `backends()` returns only authorized backends and tools
-- `call_tool()` delegates to the base session's `CallTool()`, which checks the routing table built from authorized tools only
-- `publish()` can publish tools from `backends()` or new tools whose handlers use `call_tool()` — which is authorization-gated
+- `backends()` returns all backends configured for the persona (not filtered by user authorization)
+- `publish()` declares tools visible to the session, but the authz middleware filters/gates them at runtime
+- Handlers can dispatch to any discovered tool via saved references — same trust model as composite tools today
 
 **Trust model**: Session initialization scripts are written by administrators, not end users. An administrator who can write a Starlark script already has the authority to configure vMCP.
 
 ### Data Security
 
 - Scripts cannot access filesystem, network, or environment variables (Starlark sandbox)
-- `scrub_pii()` operates on the Go side with auditable patterns
 - Tool call results transit through handlers; administrators are trusted (same model as webhook config)
 
 ### Input Validation
@@ -687,96 +831,147 @@ Scripts have no access to secrets. Backend authentication is handled below the s
 
 - Each `publish()` logged (tool name, source: backend or script-defined)
 - Each handler invocation logged (tool name, duration, outcome)
-- Each `check_rate_limit()` logged (key, limit, decision)
-- Each `scrub_pii()` logged (redaction count)
+- Each built-in function invocation logged with relevant parameters
 - Each `elicit()` logged (prompt, action, duration)
 
 ### Mitigations
 
 | Threat | Mitigation |
 |--------|-----------|
-| Privilege escalation | `tools()` and `call_tool()` are Cedar-gated |
+| Privilege escalation | Authz middleware filters `tools/list` and gates `tools/call` at runtime; scripts are admin-authored |
 | DoS via loops | Execution step limit (default 1M), context timeout (same as THV-0051) |
-| Tool list manipulation | `publish()` only surfaces tools from `tools()` or script-defined tools; audit logs record every call |
-| Decorator bypass | Presets include scrubbing/rate limiting when configured; custom scripts are admin's responsibility |
+| Tool list manipulation | `publish()` declares tools but authz middleware still filters at runtime; audit logs record every call |
+| Decorator bypass | Custom scripts are admin's responsibility; presets include expected wrappers |
 | Resource exhaustion | Execution step limit, memory monitoring (same as THV-0051) |
 
 ## Alternatives Considered
 
-### Alternative 1: Keep adding config knobs
+### Configuration approaches
+
+#### Alternative 1: Keep adding config knobs
 
 - **Pros**: No new concepts for simple cases
 - **Cons**: Interaction matrix grows quadratically. Bugs like #4287 from non-obvious interactions. Testing becomes intractable.
 - **Why not chosen**: Already causing problems at current feature count.
 
-### Alternative 2: Starlark for composite tools only (THV-0051 as-is)
+#### Alternative 2: Declarative pipeline (ordered stages)
+
+Instead of a scripting language, make the config ordering explicit — a pipeline of named stages (like Envoy filter chains or Traefik middleware stacks).
+
+- **Pros**: Declarative, no scripting language to learn, explicit ordering solves the interaction problem.
+- **Cons**: A declarative pipeline can express ordering and filtering, but cannot express computed values (dynamic descriptions based on available tools), conditional logic (different behavior based on annotations), or new synthetic tools (a `find_tool` with a generated description). Every new behavior still requires a new stage type implemented in Go.
+- **Why not chosen**: The problem isn't just ordering — it's that administrators need to express logic that varies per deployment. A pipeline makes ordering explicit but keeps the "new knob per behavior" problem.
+
+#### Alternative 3: Starlark for composite tools only (THV-0051 as-is)
 
 - **Pros**: Smaller scope
 - **Cons**: Misses the opportunity to unify. Interaction problem remains for optimizer + filter + rate limiting. Expanding scope later means a second migration.
 - **Why not chosen**: Design for the broader use case from day one.
 
-### Alternative 3: Use webhooks for everything
+#### Alternative 4: Use webhooks for everything
 
 - **Pros**: Maximum flexibility, language-agnostic
 - **Cons**: External services for simple policies. Network latency on every call. Overkill for "hide these tools."
 - **Why not chosen**: Webhooks for external integration, Starlark for internal configuration. Both should exist.
 
-### Alternative 4: OPA / Rego instead of Starlark
+### Language considerations
+
+#### Why Starlark
+
+[Starlark](https://github.com/bazelbuild/starlark/blob/master/spec.md) is a Python-like language designed for embedding in Go applications. It was created for Bazel's build configuration and is used by Buck2, Tilt, Drone CI, and other infrastructure tools. Key properties:
+
+- **Deterministic**: No I/O, no threads, no randomness. The only side effects are the built-ins we provide.
+- **Sandboxed**: No filesystem, network, or environment variable access by design.
+- **Familiar syntax**: Python-like, readable by anyone who's seen Python.
+- **Mature Go implementation**: [google/starlark-go](https://github.com/google/starlark-go) is well-maintained and battle-tested.
+- **Resource limits**: Execution step limits prevent infinite loops.
+
+#### Alternative: OPA / Rego
 
 - **Pros**: Established policy language
 - **Cons**: Rego is for boolean decisions (allow/deny), not programmatic composition. Expressing "publish a search tool with a dynamic description" would be extremely awkward. We already use Cedar for authz.
 - **Why not chosen**: Wrong abstraction — we need a programming model, not a policy language.
 
+#### Alternative: Risor
+
+[Risor](https://risor.io/) is a Go-native scripting language with richer features (try/catch, goroutines, Go stdlib access).
+
+- **Pros**: More expressive, has exception handling, familiar Go-like stdlib.
+- **Cons**: Go stdlib access is a security risk requiring extensive auditing. Younger project with smaller community. Extra features (goroutines, classes) are unnecessary complexity. Less battle-tested for embedded sandboxed use.
+- **Why not chosen**: Starlark's restrictions are features for our use case. We want a language where the only side effects are the built-ins we provide.
+
+#### Alternative: WebAssembly (Wasm) plugins
+
+- **Pros**: Language-agnostic, strong sandboxing via Wasm runtime.
+- **Cons**: Massive complexity increase (Wasm runtime, host function bindings, memory management). Poor developer experience (compile step, no REPL, opaque errors). Overkill for tool orchestration scripts.
+- **Why not chosen**: The problem is configuring tool behavior, not running arbitrary compute. Starlark is the right level of abstraction.
+
+#### Alternative: Lua (OpenResty / Envoy model)
+
+- **Pros**: Proven in proxy scripting (Nginx/OpenResty, Kong, Envoy). Large ecosystem.
+- **Cons**: Lua has mutable global state, unrestricted I/O by default — sandboxing requires careful auditing. `1`-indexed arrays are a footgun. Go bindings (gopher-lua) are less mature than starlark-go. Not deterministic without effort.
+- **Why not chosen**: Starlark provides sandboxing and determinism by default. Lua requires building those guarantees on top.
+
 ## Compatibility
 
 ### Backward Compatibility
 
-All existing config fields (`aggregation`, `optimizer`) continue to produce identical behavior. Internally, they are translated into a session initialization script rather than running through a separate legacy code path. Users can run `thv vmcp migrate-config` to see and adopt the generated script.
+All existing config fields (`aggregation`, `optimizer`) continue to produce identical behavior. The `default` preset reads these fields and produces the same behavior as the current config-driven system. There is no separate legacy code path.
 
 The exception is legacy declarative composite tools (`compositeTools`, `compositeToolRefs`), which are replaced by Starlark scripted tools from THV-0051.
 
 ### Forward Compatibility
 
-New built-in functions can be added without breaking existing scripts. New presets can be added alongside existing ones. The `config` map on presets uses the same types as existing config, so new config fields are automatically available.
+New built-in functions can be added without breaking existing scripts. New presets can be added alongside existing ones.
 
 ## Implementation Plan
 
-### Phase 1: Feature parity — session initialization replaces existing decorators
+### Phase 1: Proof of concept
 
-The first deliverable must produce identical behavior to the existing config-driven system (except for legacy composite tools). This is the critical migration gate.
+A fast, rough POC to validate the high-level design. The goal is to prove the programming model works end-to-end and surface any surprises before committing to a production implementation.
 
-- Extend the Starlark engine from THV-0051 with `backends()`, `publish()`, `metadata()`, `get_tool()` built-ins
+- Implement `backends()`, `publish()`, `metadata()` built-ins in the Starlark engine
 - Session factory runs the script and constructs `MultiSession` from `publish()` results
+- Implement the `default` preset that reads existing config knobs (`aggregation`, `optimizer`, etc.)
+- **Delete** the existing decorator-based code that supports these config knobs today (optimizer, filter, composite tools decorators)
+- All existing tests must pass **except** those that test legacy composite tools (`compositeTools`, `compositeToolRefs`)
+- Update this RFC with any findings — design changes, missing built-ins, edge cases discovered
+
+### Phase 2: Production implementation
+
+Take the learnings from the POC and implement for real. This is the production-quality version with proper error handling, tests, and documentation.
+
+- Extend the Starlark engine from THV-0051 with production-quality `backends()`, `publish()`, `metadata()` built-ins
 - Port `search_index()` from current optimizer implementation
-- Implement `passthrough`, `standard`, and `optimizer` presets
-- Auto-generate session init script from existing `aggregation` / `optimizer` config when no `sessionInit` block is present
-- `thv vmcp migrate-config` command to output the generated script
 - `thv vmcp show-preset` command to inspect built-in presets
 - Config model: `sessionInit.preset`, `sessionInit.script`, `sessionInit.scriptFile`
-- Preset equivalence tests: verify every preset produces identical behavior to the old config-driven feature it replaces
+- Preset equivalence tests: verify the `default` preset produces identical behavior to the old config-driven system
 - Remove optimizer, filter, and composite tools decorators — the session init script is the single implementation
 
-### Phase 2: New capabilities
+### Phase 3: Deprecate composite tools
 
-These are net-new built-in functions that make new use cases *possible*. The scope of this phase is to add the built-in functions, not to ship fully-featured implementations.
+- Mark `compositeTools` and `compositeToolRefs` as deprecated
+- Log deprecation warnings when these fields are used
+- Document migration path from declarative composite tools to Starlark scripts
 
-- Implement `scrub_pii()` built-in
-- Implement `check_rate_limit()` built-in (backed by THV-0057's Redis token bucket when available)
+### Phase 4: Ship and document
+
 - E2E tests for custom scripts in K8s via ConfigMap
-- Documentation: user guide, built-in reference, migration guide
+- Documentation: user guide, built-in reference, composite tools migration guide, advanced use cases
+
+New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of scope for this RFC. The programming model makes them straightforward to add as follow-up work.
 
 ### Dependencies
 
-- THV-0051 (Starlark engine core) — base engine, value converter, `call_tool`, `try_call_tool`, `retry`, `parallel`, `elicit`, `log`
-- THV-0057 (rate limiting) — Redis token bucket for `check_rate_limit()` (Phase 2 only)
+- THV-0051 (Starlark engine core) — base engine, value converter, `elicit`, `log`
 
 ## Testing Strategy
 
 - **Unit tests**: Each built-in in isolation. Handler wrapping / function composition. `publish()` validation. Preset loading and config injection.
-- **Integration tests**: Full script execution with mock backends. Decorator chains. Composite tool handlers via `call_tool()`. Optimizer pattern with `search_index()`.
-- **E2E tests**: Preset configuration in K8s. Custom scripts via ConfigMap. Old config → session init migration.
-- **Security tests**: `tools()` respects Cedar. `call_tool()` rejects unauthorized tools. Step limits. Memory.
-- **Preset equivalence tests**: For each preset, verify behavior matches the old config-driven feature it replaces.
+- **Integration tests**: Full script execution with mock backends. Handler wrapping chains. Composite tool handlers via saved references. Optimizer pattern with `search_index()`.
+- **E2E tests**: Preset configuration in K8s. Custom scripts via ConfigMap.
+- **Security tests**: Authz middleware filters published tools correctly. Step limits. Memory.
+- **Preset equivalence tests**: Verify the `default` preset produces identical behavior to the old config-driven system.
 
 ## Documentation
 
@@ -788,13 +983,9 @@ These are net-new built-in functions that make new use cases *possible*. The sco
 
 ## Open Questions
 
-1. **Should presets be composable?** Could a user layer multiple presets, or is a single preset sufficient? Multiple presets add complexity in ordering and config conflicts.
+1. **Hot reloading**: Should ConfigMap updates to scripts trigger live session recreation? Convenient but complex (re-validation, in-flight calls).
 
-2. **Hot reloading**: Should ConfigMap updates to scripts trigger live session recreation? Convenient but complex (re-validation, in-flight calls).
-
-3. **Custom PII patterns**: Should `scrub_pii()` accept custom regex patterns (e.g., internal employee ID formats), or is the built-in set sufficient?
-
-4. **Error handling in handler functions**: When a handler function calls `call_tool()` and it fails, the script halts and the agent receives an error. How should administrators configure error handling behavior? Options include: (a) `try_call_tool()` for opt-in error handling (already in THV-0051), (b) a `with_fallback(fn, fallback_fn)` pattern for decorator-style error recovery, (c) preset parameters for common error policies (retry N times, fall back to a default response).
+2. **Error handling in handler functions**: When a handler function invokes a backend tool and it fails, what should happen? Options include: (a) the handler returns an error dict to the agent, (b) a `with_fallback(fn, fallback_fn)` pattern for decorator-style error recovery, (c) preset parameters for common error policies (retry N times, fall back to a default response).
 
 ## References
 
