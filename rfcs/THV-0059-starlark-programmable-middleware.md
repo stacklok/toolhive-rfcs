@@ -250,7 +250,7 @@ publish(
 
 ### Motivating Use Cases
 
-The following use cases illustrate what the programming model enables. Use Cases 1, 2, and 4 are achievable with the v0 built-ins. Use Cases 3, 5, and 6 depend on future built-ins (`scrub_pii()`, `check_rate_limit()`) that are not in scope for this RFC but demonstrate why the model is worth building.
+The following use cases illustrate what the programming model enables. Use Cases 1, 2, and 4 are achievable with the v0 built-ins. Use Cases 3, 5, and 6 depend on future built-ins (`current_user()`, `scrub_pii()`, `check_rate_limit()`) that are not in scope for this RFC but demonstrate why the model is worth building.
 
 #### Use Case 1: Dynamic optimizer descriptions
 
