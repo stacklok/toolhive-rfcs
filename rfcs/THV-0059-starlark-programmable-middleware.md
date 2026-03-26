@@ -16,7 +16,7 @@ Introduce a Starlark-based session initialization script for vMCP. A single scri
 
 ### Config knob combinations
 
-vMCP's feature set is growing. Each feature has arrived with its own configuration surface. The problem is not just the number of knobs, but that they have subtle dependencies on each other: conflict resolution and aggregation change tool names, filtering changes which tools are available at different points in the pipeline, and downstream config blocks (rate limiting, composite tools) must reference tool names that earlier config blocks may have renamed or removed. The result is that configuring one feature correctly requires understanding the side effects of every other feature:
+vMCP's feature set is growing. Each feature has arrived with its own configuration surface. The problem is not just the number of knobs, but that they have subtle dependencies on each other: conflict resolution and aggregation change tool names, filtering changes which tools are available at different points in the pipeline, and downstream config blocks (rate limiting, composite tools) must reference tool names that earlier config blocks may have renamed or removed. The result is that configuring one feature correctly requires understanding the side effects of every other feature. A concrete example: enabling the optimizer replaces real tool names with `find_tool` / `call_tool` meta-tools, which silently breaks Cedar policies that reference the original names ([stacklok/toolhive#4373](https://github.com/stacklok/toolhive/issues/4373)).
 
 | Feature | Config surface | Introduced in |
 |---------|---------------|---------------|
@@ -986,6 +986,8 @@ New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of sc
 1. **Hot reloading**: Should ConfigMap updates to scripts trigger live session recreation? Convenient but complex (re-validation, in-flight calls).
 
 2. **Error handling in handler functions**: When a handler function invokes a backend tool and it fails, what should happen? Options include: (a) the handler returns an error dict to the agent, (b) a `with_fallback(fn, fallback_fn)` pattern for decorator-style error recovery, (c) preset parameters for common error policies (retry N times, fall back to a default response).
+
+3. **Should authz decisions move into Starlark?** Authorization (Cedar) and session initialization (Starlark) remain entirely separate systems. This RFC reduces config knob interactions significantly and makes most of them explicit, but the "who sees what?" question still requires reasoning across both systems. The optimizer/Cedar incompatibility ([stacklok/toolhive#4373](https://github.com/stacklok/toolhive/issues/4373)) is one example — the script rewrites tool names that Cedar policies reference, and neither system is aware of the other. Pulling authz decisions into the script (e.g., a `current_user()` built-in combined with policy logic) would unify the model but raises questions about Cedar's role and the trust boundary. Worth exploring once the base programming model is proven.
 
 ## References
 
