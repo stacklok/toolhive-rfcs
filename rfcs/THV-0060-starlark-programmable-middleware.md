@@ -28,7 +28,7 @@ Users want to combine features in ways that make sense for their deployment. But
 
 Every new feature enters a web of dependencies with existing features. As we add to this web, we have to think carefully about how each addition interacts with everything else ([excalidraw source](https://excalidraw.com/#json=C3Co-yHQMwzjrJptY7Qmv,mCqdzvMmerb6yZ0_gmt24g)):
 
-![vMCP feature dependency graph](../images/vmcp-feature-dependencies.png)
+![vMCP feature dependency graph](../assets/0060/vmcp-feature-dependencies.png)
 
 The cost is concrete — implicit interactions produce bugs:
 
