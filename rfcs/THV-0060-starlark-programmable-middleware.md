@@ -14,9 +14,26 @@ Introduce a Starlark-based session initialization script for vMCP. A single scri
 
 ## Problem Statement
 
-### Config knob combinations
+vMCP's feature set is growing, and two forces are pulling against each other: users want more configurability, maintainers need the system to stay understandable. Each new capability makes both sides worse.
 
-vMCP's feature set is growing. Each feature has arrived with its own configuration surface. The problem is not just the number of knobs, but that they have subtle dependencies on each other: conflict resolution and aggregation change tool names, filtering changes which tools are available at different points in the pipeline, and downstream config blocks (rate limiting, composite tools) must reference tool names that earlier config blocks may have renamed or removed. The result is that configuring one feature correctly requires understanding the side effects of every other feature. A concrete example: the advertising filter runs before composite tools, causing a [type coercion bug](https://github.com/stacklok/toolhive/issues/4287) — the fact that the bug existed shows how opaque the interaction is.
+### The configurability problem
+
+Users want to combine features in ways that make sense for their deployment. But each feature has its own config surface, and the interactions between them are implicit and surprising:
+
+- **Filter × composite tools**: The advertising filter runs before composite tools, causing a [type coercion bug](https://github.com/stacklok/toolhive/issues/4287). RFC-0058 fixes the ordering, but the fact that the bug existed shows how opaque the interaction is.
+- **Rate limiting × overrides**: Rate limiting (THV-0057) adds per-tool limits that must reference tool names — names that may have been renamed by overrides in a different config block.
+- **Optimizer × discoverability**: The optimizer replaces the entire tool list with `find_tool` / `call_tool`, but `find_tool`'s description is static. We've discussed many solutions on [this issue](https://github.com/stacklok/toolhive/issues/4357). To support them all, we'd have to add many more config knobs. As Alejandro's comment points out, we'd also like the solutions to not be one-size-fits-all — but each option is another knob.
+- **Cross-cutting policies**: There is no mechanism to express policies that span features, like "tools without a `readOnly` annotation must require an elicitation step."
+
+The following diagram maps the dependencies between vMCP features ([excalidraw source](https://excalidraw.com/#json=C3Co-yHQMwzjrJptY7Qmv,mCqdzvMmerb6yZ0_gmt24g)):
+
+![vMCP feature dependency graph](./images/vmcp-feature-dependencies.png)
+
+Configuring one feature correctly requires understanding the side effects of every other feature — a burden that scales poorly.
+
+### The maintainability problem
+
+Every new capability must reason about every existing one. The config surfaces today:
 
 | Feature | Config surface | Introduced in |
 |---------|---------------|---------------|
@@ -29,56 +46,13 @@ vMCP's feature set is growing. Each feature has arrived with its own configurati
 | Rate limiting | `rateLimiting.perUser`, `rateLimiting.global`, `rateLimiting.tools[]` | THV-0057 (proposed) |
 | Dynamic webhooks | `validating_webhooks[]`, `mutating_webhooks[]` | THV-0017 (proposed) |
 
-Each knob is individually reasonable. The problem is their **interaction**. Today:
-
-- The advertising filter runs before composite tools, causing a [type coercion bug](https://github.com/stacklok/toolhive/issues/4287) (RFC-0058 fixes the ordering, but the fact that the bug existed shows how opaque the interaction is).
-- Rate limiting (THV-0057) adds per-tool limits via yet another config block that must reference the same tool names that may have been renamed by overrides.
-- There is no mechanism to express cross-cutting policies like "tools without a `readOnly` annotation must only be invokable via a composite tool that includes an elicitation step."
-- The optimizer replaces the entire tool list with `find_tool` / `call_tool`, but `find_tool`'s description is static. We've discussed many solutions on [this issue](https://github.com/stacklok/toolhive/issues/4357). To support them all, we'd have to add many more config knobs. As Alejandro comment points out too, we'd also like the solutions to not be one-size fits all. There are valid reasons for allowing more configurability, but that comes at the cost of cognitive load for operators and maintainers.
-
-Every new capability doubles the interaction matrix. The following diagram maps the dependencies between vMCP features ([excalidraw source](https://excalidraw.com/#json=C3Co-yHQMwzjrJptY7Qmv,mCqdzvMmerb6yZ0_gmt24g)):
-
-![vMCP feature dependency graph](./images/vmcp-feature-dependencies.png)
-
-Administrators who need non-trivial configurations must understand the ordering and interaction of all these knobs — a burden that scales poorly.
-
-
-### Who is affected
-
-- **Platform administrators** who configure vMCP for multi-tenant deployments and need predictable behavior from feature combinations.
-- **Enterprise integrators** who need custom policies (PII scrubbing, approval workflows, tool restrictions) but don't want to fork ToolHive or maintain webhook services for simple logic.
-- **The vMCP maintainers** who must reason about the interaction of every new feature with every existing feature.
+Adding a simple capability (e.g., PII scrubbing) requires understanding how it interacts with filtering, renaming, the optimizer, composite tools, and rate limiting. Testing every combination is intractable. The interaction matrix grows quadratically — and so does the cost of getting it wrong.
 
 ### Why this is worth solving now
 
 THV-0051 proposes Starlark for composite tools. Before that engine ships, we should decide whether Starlark is *only* for composite tools or whether it's the foundation for a unified session initialization model. Shipping THV-0051 as-is and then later expanding scope would mean a second migration.
 
-The cost equation also favors acting now. As more capabilities are added, the cost of retrofitting a composable system increases — more code to replace, more interactions to preserve. Meanwhile, the cost of building each new config knob is *also* increasing, because each knob must reason about its interactions with every existing knob and implement more than a simple built-in. A session initialization model inverts this: new capabilities ship as simple built-in functions, and administrators compose them as needed. The longer we wait, the more expensive both paths become.
-
-### Prior Art: Gateway Configurability Patterns
-
-Envoy Proxy faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal Lua filter, WASM filters, and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its ext_authz filter, with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer.
-
-Kong Gateway built its plugin architecture on Lua lifecycle callbacks with a Plugin Development Kit exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model.
-
-The [Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html) (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
-
-### Background: How authorization works today
-
-Authorization in vMCP is enforced by authz middleware that sits between the client and the session:
-
-- For **`tools/list`** (and other list methods): the authz middleware filters the response, removing items the caller isn't authorized to use.
-- For **`tools/call`** (and other action methods): the authz middleware gates the request, returning 403 if the caller isn't authorized.
-
-Critically, the authz middleware operates on the *final published tool set* — it does not restrict which tools are visible during session construction. The session initialization script runs during session construction, so it sees all tools from all backends the persona is configured to use. Authorization is applied afterward at request time.
-
-**Implication for this RFC**: Because the script sees all tools regardless of the caller's authorization:
-
-1. `backends()` returns all backends configured for the persona, not filtered by user authorization.
-2. Published tools are still subject to authz filtering/gating at runtime — publishing a tool does not bypass authorization.
-3. A handler could dispatch to any discovered tool via saved references, including tools the current user isn't authorized to use. This is the same trust model as composite tools today — see [Interaction with authorization](#interaction-with-authorization).
-
-Modifying the authz boundary is out of scope for this RFC.
+The cost equation favors acting now. As more capabilities land, the cost of retrofitting a composable system increases — more code to replace, more interactions to preserve. Meanwhile, the cost of building each new config knob is *also* increasing, because each knob must reason about its interactions with every existing knob. A session initialization model inverts this: new capabilities ship as simple built-in functions, and administrators compose them explicitly. The longer we wait, the more expensive both paths become.
 
 ## Goals
 
@@ -98,6 +72,33 @@ Modifying the authz boundary is out of scope for this RFC.
 - Supporting multiple scripting languages
 
 ## Proposed Solution
+
+### Background
+
+#### Prior art: gateway configurability patterns
+
+Envoy Proxy faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal Lua filter, WASM filters, and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its ext_authz filter, with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer.
+
+Kong Gateway built its plugin architecture on Lua lifecycle callbacks with a Plugin Development Kit exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model.
+
+The [Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html) (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
+
+#### How authorization works today
+
+Authorization in vMCP is enforced by authz middleware that sits between the client and the session:
+
+- For **`tools/list`** (and other list methods): the authz middleware filters the response, removing items the caller isn't authorized to use.
+- For **`tools/call`** (and other action methods): the authz middleware gates the request, returning 403 if the caller isn't authorized.
+
+Critically, the authz middleware operates on the *final published tool set* — it does not restrict which tools are visible during session construction. The session initialization script runs during session construction, so it sees all tools from all backends the persona is configured to use. Authorization is applied afterward at request time.
+
+**Implication for this RFC**: Because the script sees all tools regardless of the caller's authorization:
+
+1. `backends()` returns all backends configured for the persona, not filtered by user authorization.
+2. Published tools are still subject to authz filtering/gating at runtime — publishing a tool does not bypass authorization.
+3. A handler could dispatch to any discovered tool via saved references, including tools the current user isn't authorized to use. This is the same trust model as composite tools today — see [Interaction with authorization](#interaction-with-authorization).
+
+Modifying the authz boundary is out of scope for this RFC.
 
 ### High-Level Design
 
@@ -688,7 +689,7 @@ The session initialization script is not a decorator — it is used during sessi
 
 #### Interaction with authorization
 
-As described in [Background: How authorization works today](#background-how-authorization-works-today), the session initialization script runs during session construction — before the authz middleware. `backends()` returns all backends configured, regardless of the current user's authorization.
+As described in [How authorization works today](#how-authorization-works-today), the session initialization script runs during session construction — before the authz middleware. `backends()` returns all backends configured, regardless of the current user's authorization.
 
 The authz middleware continues to enforce authorization at runtime:
 
