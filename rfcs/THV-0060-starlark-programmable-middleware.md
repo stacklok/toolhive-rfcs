@@ -36,7 +36,11 @@ Each knob is individually reasonable. The problem is their **interaction**. Toda
 - There is no mechanism to express cross-cutting policies like "tools without a `readOnly` annotation must only be invokable via a composite tool that includes an elicitation step."
 - The optimizer replaces the entire tool list with `find_tool` / `call_tool`, but `find_tool`'s description is static. We've discussed many solutions on [this issue](https://github.com/stacklok/toolhive/issues/4357). To support them all, we'd have to add many more config knobs. As Alejandro comment points out too, we'd also like the solutions to not be one-size fits all. There are valid reasons for allowing more configurability, but that comes at the cost of cognitive load for operators and maintainers.
 
-Every new capability doubles the interaction matrix. Administrators who need non-trivial configurations must understand the ordering and interaction of all these knobs — a burden that scales poorly.
+Every new capability doubles the interaction matrix. The following diagram maps the dependencies between vMCP features ([excalidraw source](https://excalidraw.com/#json=C3Co-yHQMwzjrJptY7Qmv,mCqdzvMmerb6yZ0_gmt24g)):
+
+![vMCP feature dependency graph](./images/vmcp-feature-dependencies.png)
+
+Administrators who need non-trivial configurations must understand the ordering and interaction of all these knobs — a burden that scales poorly.
 
 
 ### Who is affected
@@ -50,6 +54,14 @@ Every new capability doubles the interaction matrix. Administrators who need non
 THV-0051 proposes Starlark for composite tools. Before that engine ships, we should decide whether Starlark is *only* for composite tools or whether it's the foundation for a unified session initialization model. Shipping THV-0051 as-is and then later expanding scope would mean a second migration.
 
 The cost equation also favors acting now. As more capabilities are added, the cost of retrofitting a composable system increases — more code to replace, more interactions to preserve. Meanwhile, the cost of building each new config knob is *also* increasing, because each knob must reason about its interactions with every existing knob and implement more than a simple built-in. A session initialization model inverts this: new capabilities ship as simple built-in functions, and administrators compose them as needed. The longer we wait, the more expensive both paths become.
+
+### Prior Art: Gateway Configurability Patterns
+
+Envoy Proxy faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal Lua filter, WASM filters, and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its ext_authz filter, with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer.
+
+Kong Gateway built its plugin architecture on Lua lifecycle callbacks with a Plugin Development Kit exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model.
+
+The [Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html) (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
 
 ### Background: How authorization works today
 
