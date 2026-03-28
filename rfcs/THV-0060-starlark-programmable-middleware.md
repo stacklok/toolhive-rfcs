@@ -21,7 +21,7 @@ vMCP's feature set is growing, and two forces are pulling against each other: us
 Users want to combine features in ways that make sense for their deployment. But each feature has its own config surface, and the interactions between them are implicit and surprising. Configuring one feature correctly requires understanding the side effects of every other feature:
 
 - The optimizer replaces the entire tool list with `find_tool` / `call_tool`, but `find_tool`'s description is static. We've discussed many solutions on [this issue](https://github.com/stacklok/toolhive/issues/4357). To support them all, we'd have to add many more config knobs. As Alejandro's comment points out, we'd also like the solutions to not be one-size-fits-all — but each option is another knob.
-- Rate limiting (THV-0057) adds per-tool limits that must reference tool names — names that may have been renamed by overrides in a different config block.
+- Rate limiting (THV-0057) adds per-tool limits that must reference tool names — but those names may have been renamed by overrides in a different config block. Users also have to know that limits apply to post-resolution names. What happens when a rate-limited tool is called inside a composite tool, potentially many times? Is it still rate limited? What if an administrator wants different limits for groups of tools or entire backends? Each question either becomes another knob or hard-coded behavior that needs documentation — and users reading that documentation.
 - There is no mechanism to express policies that span features, like "tools without a `readOnly` annotation must require an elicitation step."
 
 ### The maintainability problem
@@ -33,8 +33,9 @@ Every new feature enters a web of dependencies with existing features. As we add
 The cost is concrete — implicit interactions produce bugs:
 
 - **Filter × composite tools**: The advertising filter runs before composite tools, causing a [type coercion bug](https://github.com/stacklok/toolhive/issues/4287). RFC-0058 fixes the ordering, but the fact that the bug existed shows how opaque the interaction is.
+- **Optimizer × authorization**: The optimizer wasn't tested with Cedar authz due to time constraints. The result: enabling the optimizer silently breaks Cedar policies that reference real tool names ([#4373](https://github.com/stacklok/toolhive/issues/4373)), and `find_tool` returns tools the caller isn't authorized to use ([#4374](https://github.com/stacklok/toolhive/issues/4374)).
 
-Adding a simple capability (e.g., PII scrubbing) requires understanding how it interacts with filtering, renaming, the optimizer, composite tools, and rate limiting. Testing every combination is intractable. The interaction matrix grows quadratically — and so does the time to ship new features and the cost of getting it wrong.
+In practice, it's infeasible to always test all feature combinations and remain aware of their interactions. The interaction matrix grows quadratically — and so does the time to ship new features and the cost of getting it wrong. Instead, the relationships between features should be flexible but explicit.
 
 ### Why this is worth solving now
 
@@ -65,9 +66,30 @@ The cost equation favors acting now. As more capabilities land, the cost of retr
 
 #### Prior art: gateway configurability patterns
 
-**[Envoy Proxy](https://www.envoyproxy.io/)** faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal [Lua filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter), [WASM filters](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/wasm_filter), and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its [ext_authz filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter), with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer.
+**[Envoy Proxy](https://www.envoyproxy.io/)** faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal [Lua filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter), [WASM filters](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/wasm_filter), and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its [ext_authz filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter), with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer. Envoy's Lua filter exposes built-in functions for request/response manipulation ([source](https://github.com/envoyproxy/envoy/blob/main/source/extensions/filters/http/lua/lua_filter.cc)):
 
-**[Kong Gateway](https://docs.konghq.com/gateway/latest/)** built its plugin architecture on Lua lifecycle callbacks with a [Plugin Development Kit](https://docs.konghq.com/gateway/latest/plugin-development/pdk/) exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model.
+```lua
+-- Envoy Lua filter: built-in functions as escape hatch from declarative config
+function envoy_on_request(request_handle)
+  local headers = request_handle:headers()
+  if headers:get("x-custom-header") == nil then
+    request_handle:respond({[":status"] = "403"}, "Forbidden")
+  end
+end
+```
+
+**[Kong Gateway](https://docs.konghq.com/gateway/latest/)** built its plugin architecture on Lua lifecycle callbacks with a [Plugin Development Kit](https://docs.konghq.com/gateway/latest/plugin-development/pdk/) exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model ([source](https://github.com/Kong/kong/blob/master/kong/pdk/init.lua)):
+
+```lua
+-- Kong plugin: lifecycle callbacks + PDK built-ins
+function MyPlugin:access(conf)
+  local consumer = kong.client.get_consumer()
+  if not consumer then
+    return kong.response.exit(403, { message = "Unauthorized" })
+  end
+  kong.service.request.set_header("X-Consumer-ID", consumer.id)
+end
+```
 
 **[The Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html)** (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
 
