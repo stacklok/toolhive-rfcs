@@ -66,29 +66,42 @@ The cost equation favors acting now. As more capabilities land, the cost of retr
 
 #### Prior art: gateway configurability patterns
 
-**[Envoy Proxy](https://www.envoyproxy.io/)** faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal [Lua filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter), [WASM filters](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/wasm_filter), and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its [ext_authz filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter), with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer. Envoy's Lua filter exposes built-in functions for request/response manipulation ([source](https://github.com/envoyproxy/envoy/blob/main/source/extensions/filters/http/lua/lua_filter.cc)):
+**[Envoy Proxy](https://www.envoyproxy.io/)** faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal [Lua filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter), [WASM filters](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/wasm_filter), and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its [ext_authz filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter), with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer. Envoy's Lua filter exposes built-in functions for request/response manipulation ([docs](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter)):
 
 ```lua
--- Envoy Lua filter: built-in functions as escape hatch from declarative config
+-- Envoy Lua filter (from docs)
 function envoy_on_request(request_handle)
-  local headers = request_handle:headers()
-  if headers:get("x-custom-header") == nil then
-    request_handle:respond({[":status"] = "403"}, "Forbidden")
-  end
+  request_handle:headers():add("request_body_size", request_handle:body():length())
+end
+
+function envoy_on_response(response_handle)
+  response_handle:headers():add("response_body_size", response_handle:body():length())
+  response_handle:headers():remove("foo")
 end
 ```
 
-**[Kong Gateway](https://docs.konghq.com/gateway/latest/)** built its plugin architecture on Lua lifecycle callbacks with a [Plugin Development Kit](https://docs.konghq.com/gateway/latest/plugin-development/pdk/) exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model ([source](https://github.com/Kong/kong/blob/master/kong/pdk/init.lua)):
+**[Kong Gateway](https://docs.konghq.com/gateway/latest/)** built its plugin architecture on Lua lifecycle callbacks with a [Plugin Development Kit](https://docs.konghq.com/gateway/latest/plugin-development/pdk/) exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model ([docs](https://developer.konghq.com/custom-plugins/handler.lua/)):
 
 ```lua
--- Kong plugin: lifecycle callbacks + PDK built-ins
-function MyPlugin:access(conf)
-  local consumer = kong.client.get_consumer()
-  if not consumer then
-    return kong.response.exit(403, { message = "Unauthorized" })
-  end
-  kong.service.request.set_header("X-Consumer-ID", consumer.id)
+-- Kong plugin handler (from docs)
+local CustomHandler = {
+  VERSION  = "1.0.0",
+  PRIORITY = 10,
+}
+
+function CustomHandler:access(config)
+  kong.log("access")
 end
+
+function CustomHandler:header_filter(config)
+  kong.log("header_filter")
+end
+
+function CustomHandler:body_filter(config)
+  kong.log("body_filter")
+end
+
+return CustomHandler
 ```
 
 **[The Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html)** (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
