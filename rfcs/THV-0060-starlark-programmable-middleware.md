@@ -576,7 +576,15 @@ Scripts have no access to secrets. Backend authentication is handled below the s
 - **Cons**: Interaction matrix grows quadratically. Bugs like #4287 from non-obvious interactions. Testing becomes intractable.
 - **Why not chosen**: Already causing problems at current feature count.
 
-#### Alternative 2: Declarative pipeline (ordered stages)
+#### Alternative 2: Refactor the existing Go code
+
+Invest in better code organization — clearer interfaces between features, a well-defined internal pipeline, better test coverage for combinations.
+
+- **Pros**: No new language or dependency. Directly improves code quality and maintainability.
+- **Cons**: Addresses maintainability but not configurability — every new behavior still requires a code change and release. Code organization works best when concerns have clean boundaries, but vMCP's concerns are cross-cutting: the optimizer rewrites tool names that authorization policies reference, rate limiting must track names after conflict resolution, and an elicitation gate needs annotations that aggregation doesn't surface. These concerns cut across module boundaries rather than fitting neatly within them. Additionally, with AI-driven development, code quality in a complex, cross-cutting codebase is harder to police. A model where new capabilities ship as isolated built-in functions is more resistant to quality erosion — each built-in has a single, self-contained implementation.
+- **Why not chosen**: Refactoring is valuable and should continue regardless, but it doesn't address the configurability gap. Administrators who need deployment-specific policies are still waiting for ToolHive to build them.
+
+#### Alternative 3: Declarative pipeline (ordered stages)
 
 Instead of a scripting language, make the config ordering explicit — a pipeline of named stages (like Envoy filter chains or Traefik middleware stacks).
 
@@ -584,13 +592,13 @@ Instead of a scripting language, make the config ordering explicit — a pipelin
 - **Cons**: A declarative pipeline can express ordering and filtering, but cannot express computed values (dynamic descriptions based on available tools), conditional logic (different behavior based on annotations), or new synthetic tools (a `find_tool` with a generated description). Every new behavior still requires a new stage type implemented in Go.
 - **Why not chosen**: The problem isn't just ordering — it's that administrators need to express logic that varies per deployment. A pipeline makes ordering explicit but keeps the "new knob per behavior" problem.
 
-#### Alternative 3: Starlark for composite tools only (THV-0051 as-is)
+#### Alternative 4: Starlark for composite tools only (THV-0051 as-is)
 
 - **Pros**: Smaller scope
 - **Cons**: Misses the opportunity to unify. Interaction problem remains for optimizer + filter + rate limiting. Expanding scope later means a second migration.
 - **Why not chosen**: Design for the broader use case from day one.
 
-#### Alternative 4: Use webhooks for everything
+#### Alternative 5: Use webhooks for everything
 
 - **Pros**: Maximum flexibility, language-agnostic
 - **Cons**: External services for simple policies. Network latency on every call. Overkill for "hide these tools."
