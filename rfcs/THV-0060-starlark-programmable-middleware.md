@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
 - **Created**: 2026-03-24
-- **Last Updated**: 2026-03-25
+- **Last Updated**: 2026-03-27
 - **Target Repository**: toolhive
 - **Related Issues**: [stacklok-epics#213](https://github.com/stacklok/stacklok-epics/issues/213)
 - **Related**: [THV-0051 (Starlark Scripted Tools)](./THV-0051-starlark-scripted-tools.md) — this RFC broadens the scope of Starlark in vMCP from composite tool workflows to a unified session initialization model
@@ -206,18 +206,18 @@ for name, backend in backends().items():
 Since handlers are just functions, decoration is plain function wrapping:
 
 ```python
-def with_pii_scrubbing(fn):
-    """Wrap a handler to scrub PII from responses."""
+def with_logging(fn, tool_name):
+    """Wrap a handler to log calls."""
     def wrapper(args):
+        log("calling %s" % tool_name)
         result = fn(args)
-        if "text" in result:
-            result["text"] = scrub_pii(result["text"])
+        log("finished %s" % tool_name)
         return result
     return wrapper
 
 for name, backend in backends().items():
     for meta, fn in backend.tools():
-        publish(meta, with_pii_scrubbing(fn))
+        publish(meta, with_logging(fn, meta.name))
 ```
 
 
@@ -237,256 +237,7 @@ publish(
 )
 ```
 
-### Motivating Use Cases
-
-The following use cases illustrate what the programming model enables. Use Cases 1, 2, and 4 are achievable with the v0 built-ins. Use Cases 3, 5, and 6 depend on future built-ins (`current_user()`, `scrub_pii()`, `check_rate_limit()`) that are not in scope for this RFC but demonstrate why the model is worth building.
-
-#### Use Case 1: Dynamic optimizer descriptions
-
-**Problem**: Agents don't use `find_tool` because its static description doesn't tell them what's available.
-
-**Today's solution**: Manual description override or hope the agent figures it out.
-
-**With session initialization script**:
-
-```python
-all_tools = []
-for name, backend in backends().items():
-    all_tools += backend.tools()
-
-index = search_index(all_tools)
-
-# Build a dynamic description from actual available backends
-desc_parts = []
-for name, backend in backends().items():
-    n = len(backend.tools())
-    desc_parts.append("%s (%d tools)" % (name, n))
-
-summary = "Search for tools. Available: " + ", ".join(desc_parts)
-
-publish(
-    metadata(name="find_tool", description=summary,
-             parameters=FIND_TOOL_SCHEMA, annotations={}),
-    lambda args: {"results": index.search(args["query"])},
-)
-
-# Save handlers by name for dispatch
-tool_handlers = {}
-for name, backend in backends().items():
-    for meta, fn in backend.tools():
-        tool_handlers[meta.name] = fn
-
-publish(
-    metadata(name="call_tool", description="Call a tool by name.",
-             parameters=CALL_TOOL_SCHEMA, annotations={}),
-    lambda args: tool_handlers[args["tool_name"]](args["arguments"]),
-)
-```
-
-The value here is that the administrator defines the policy that works best for their use case. ToolHive doesn't need to build one-size-fits-all solutions for optimizer behavior — the script is the policy.
-
-#### Use Case 2: Elicitation gate for write operations
-
-**Problem**: An administrator wants to ensure that tools capable of mutation are never called without human confirmation.
-
-**Today's solution**: Not possible without writing a custom composite tool wrapper for every write tool.
-
-**With session initialization script**:
-
-```python
-def with_approval_gate(fn, tool_name):
-    def wrapper(args):
-        decision = elicit(
-            "Tool '%s' may modify data. Approve?" % tool_name,
-            schema={"type": "object", "properties": {"reason": {"type": "string"}}},
-        )
-        if decision.action != "accept":
-            return {"error": "Declined by user"}
-        return fn(args)
-    return wrapper
-
-for name, backend in backends().items():
-    for meta, fn in backend.tools():
-        if not meta.annotations.get("readOnly", False):
-            fn = with_approval_gate(fn, meta.name)
-        publish(meta, fn)
-```
-
-A single policy, applied once, covering all tools.
-
-#### Use Case 3: PII scrubbing
-
-**Problem**: Tool responses may contain PII that should be redacted before reaching the agent.
-
-**Today's solution**: Requires a mutating webhook (THV-0017) calling an external service.
-
-**With session initialization script**:
-
-```python
-def with_pii_scrubbing(fn):
-    def wrapper(args):
-        result = fn(args)
-        if "text" in result:
-            result["text"] = scrub_pii(result["text"])
-        return result
-    return wrapper
-
-for name, backend in backends().items():
-    for meta, fn in backend.tools():
-        publish(meta, with_pii_scrubbing(fn))
-```
-
-`scrub_pii()` is an example of a future built-in (not in scope for this RFC) that could handle common patterns (emails, phone numbers, SSNs, credit cards). Users can also write their own scrubbing decorators — the programming model makes this natural without needing ToolHive to explicitly support every scrubbing pattern.
-
-#### Use Case 4: Tool aggregation and renaming
-
-**Problem**: An administrator wants to present a curated set of tools — renaming some, hiding others, grouping related tools under a single facade.
-
-**Today's solution**: `aggregation.tools[].overrides` for renaming, `aggregation.tools[].filter` / `excludeAll` for hiding.
-
-**With session initialization script**:
-
-```python
-jira_handlers = {}
-
-for name, backend in backends().items():
-    for meta, fn in backend.tools():
-        # Hide internal tools
-        if meta.name.startswith("internal_"):
-            continue
-
-        # Rename for clarity
-        if meta.name == "pg_query":
-            publish(
-                metadata(name="database_query", description="Query the production database",
-                         parameters=meta.parameters, annotations=meta.annotations),
-                fn,
-            )
-            continue
-
-        # Save Jira tools — we'll group them below
-        if meta.name in ["jira_create", "jira_update", "jira_search"]:
-            jira_handlers[meta.name] = fn
-            continue
-
-        publish(meta, fn)
-
-# Publish a composite Jira tool using saved handlers
-def jira_handler(args):
-    action = args["action"]
-    return jira_handlers["jira_" + action](args)
-
-publish(
-    metadata(name="jira", description="Manage Jira issues: create, update, or search",
-             parameters=JIRA_SCHEMA, annotations={}),
-    jira_handler,
-)
-```
-
-#### Use Case 5: Rate limiting with context-aware policies
-
-**Problem**: Rate limits need to vary by tool sensitivity and user role.
-
-**Today's solution**: THV-0057 provides static `requestsPerWindow` / `windowSeconds` per tool.
-
-**With session initialization script**:
-
-```python
-LIMITS = {
-    "admin":    {"default": 1000, "expensive_search": 100},
-    "standard": {"default": 100,  "expensive_search": 10},
-}
-
-def with_rate_limit(fn, tool_name):
-    def wrapper(args):
-        user = current_user()
-        role = user.groups[0] if user.groups else "standard"
-        role_limits = LIMITS.get(role, LIMITS["standard"])
-        limit = role_limits.get(tool_name, role_limits["default"])
-
-        allowed, retry_after = check_rate_limit(
-            key=user.sub + ":" + tool_name, limit=limit, window=60,
-        )
-        if not allowed:
-            return {"error": "Rate limited", "retry_after": retry_after}
-        return fn(args)
-    return wrapper
-
-for name, backend in backends().items():
-    for meta, fn in backend.tools():
-        publish(meta, with_rate_limit(fn, meta.name))
-```
-
-`check_rate_limit()` is backed by the same Redis token bucket from THV-0057. The *policy* is expressed in Starlark; the *mechanism* lives in Go. This allows users to define rate limiting that meets the needs of their use case without ToolHive needing to explicitly support every rate limiting pattern.
-
-#### Use Case 6: Composing multiple concerns
-
-A single script handles optimizer + elicitation gate + PII scrubbing + rate limiting — behaviors that today require four different config surfaces:
-
-```python
-def build_summary(tool_list):
-    cats = {}
-    for meta, fn in tool_list:
-        cat = meta.annotations.get("category", "general")
-        if cat not in cats:
-            cats[cat] = []
-        cats[cat].append(meta.name)
-    return "Search for tools across: " + ", ".join(
-        "%s (%d tools)" % (c, len(ns)) for c, ns in cats.items()
-    )
-
-all_tools = []
-tool_handlers = {}
-tool_metadata = {}
-
-for name, backend in backends().items():
-    for meta, fn in backend.tools():
-        all_tools.append((meta, fn))
-        tool_handlers[meta.name] = fn
-        tool_metadata[meta.name] = meta
-
-index = search_index(all_tools)
-desc = build_summary(all_tools)
-
-def dispatch(args):
-    tool_name = args["tool_name"]
-    arguments = args["arguments"]
-    user = current_user()
-
-    # Rate limit
-    allowed, retry_after = check_rate_limit(
-        key=user.sub + ":" + tool_name, limit=100, window=60,
-    )
-    if not allowed:
-        return {"error": "Rate limited", "retry_after": retry_after}
-
-    # Elicitation gate for non-readonly tools
-    meta = tool_metadata.get(tool_name)
-    if meta and not meta.annotations.get("readOnly", False):
-        decision = elicit("Approve call to '%s'?" % tool_name)
-        if decision.action != "accept":
-            return {"error": "Declined"}
-
-    # Execute and scrub
-    result = tool_handlers[tool_name](arguments)
-    if "text" in result:
-        result["text"] = scrub_pii(result["text"])
-    return result
-
-publish(
-    metadata(name="find_tool", description=desc,
-             parameters=FIND_TOOL_SCHEMA, annotations={}),
-    lambda args: {"results": index.search(args["query"])},
-)
-
-publish(
-    metadata(name="call_tool", description="Call a tool by name.",
-             parameters=CALL_TOOL_SCHEMA, annotations={}),
-    dispatch,
-)
-```
-
-The ordering is explicit. The interactions are visible. There are no surprising feature interactions because the administrator wrote the interaction.
+For detailed use case examples showing these patterns in practice, see [Appendix A: Motivating Use Cases](#appendix-a-motivating-use-cases).
 
 ### Built-in Functions
 
@@ -552,8 +303,6 @@ This prints the Starlark source. A user who needs 90% of a preset's behavior can
 | `default` | Reads existing config knobs (`aggregation`, `optimizer`, etc.) and produces identical behavior to the current config-driven system. Applies filtering, renaming, conflict resolution, and optimizer behavior based on what's configured. | All existing config |
 
 A single `default` preset handles all existing config knobs. When no `sessionInit` block is present, vMCP uses the `default` preset, which reads the existing config fields and produces identical behavior. There is no separate legacy code path — the Starlark engine is the single implementation.
-
-The only exception is legacy declarative composite tools (`compositeTools`, `compositeToolRefs`), which are not supported in the session initialization script. These are replaced by Starlark scripted tools from THV-0051.
 
 #### Sketch of the `default` preset
 
@@ -703,7 +452,7 @@ The session initialization script replaces the current decorator stack for tool-
 Current model:                     New model:
 
   optimizer decorator               Session factory runs
-                                      session init script,
+   filter decorator                   session init script,
     composite tools decorator         constructs MultiSession
      base session                     from publish() results
 ```
@@ -761,8 +510,6 @@ type SessionInitConfig struct {
 #### Existing config fields
 
 `aggregation`, `compositeToolRefs`, and `optimizer` remain on `Config`. The `default` preset reads these fields and produces identical behavior. When a custom `sessionInit.script` or `sessionInit.scriptFile` is set, these fields are ignored (if both are set, vMCP logs a warning).
-
-Legacy declarative composite tools (`compositeTools`, `compositeToolRefs`) are not supported in the session initialization script and will be removed in a future release.
 
 
 ## Security Considerations
@@ -893,7 +640,7 @@ Instead of a scripting language, make the config ordering explicit — a pipelin
 
 All existing config fields (`aggregation`, `optimizer`) continue to produce identical behavior. The `default` preset reads these fields and produces the same behavior as the current config-driven system. There is no separate legacy code path.
 
-The exception is legacy declarative composite tools (`compositeTools`, `compositeToolRefs`), which are replaced by Starlark scripted tools from THV-0051.
+Legacy declarative composite tools (`compositeTools`, `compositeToolRefs`) could be supported by having the `default` preset interpret them, but this is not required. If we want to cut scope, composite tools can be deprecated directly and users migrated to Starlark scripts (THV-0051).
 
 ### Forward Compatibility
 
@@ -958,7 +705,7 @@ New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of sc
 
 2. **Should authz decisions move into Starlark?** Authorization (Cedar) and session initialization (Starlark) remain entirely separate systems. This RFC reduces config knob interactions significantly and makes most of them explicit, but the "who sees what?" question still requires reasoning across both systems. The interaction between the optimizer and Cedar illustrates the problem: enabling the optimizer replaces real tool names with `find_tool` / `call_tool`, which silently breaks Cedar policies that reference the original names ([stacklok/toolhive#4373](https://github.com/stacklok/toolhive/issues/4373))); and `find_tool` returns tools the caller isn't authorized to use, because Cedar gates `tools/call` but doesn't filter search results inside a handler ([stacklok/toolhive#4374](https://github.com/stacklok/toolhive/issues/4374)). Neither system is aware of the other. Pulling authz decisions into the script (e.g., a `current_user()` built-in combined with policy logic) would unify the model but raises questions about Cedar's role and the trust boundary. Worth exploring once the base programming model is proven.
 
-3. What happens when MCP supports requests without sessions? Do we have to run this heavy script on every request? We could actually run the script once at startup, since it does not depend on request-time information. However, if we fold in authz concerns from above, then `current_user()` will be request-time information. We could cheat around this by recommending all logic which depends on `current_user()` be placed at the end of the script. When that's encountered during startup, we block and restore the state on each request. Alternatively, we could support two different scripts. One for initialization and one per-request.
+3. **Sessionless MCP requests**: What happens when MCP supports requests without sessions? Do we have to run this heavy script on every request? We could actually run the script once at startup, since it does not depend on request-time information. However, if we fold in authz concerns from above, then `current_user()` will be request-time information. We could cheat around this by recommending all logic which depends on `current_user()` be placed at the end of the script. When that's encountered during startup, we block and restore the state on each request. Alternatively, we could support two different scripts. One for initialization and one per-request.
 
 ## References
 
@@ -969,6 +716,259 @@ New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of sc
 - [Optimizer discoverability discussion](https://stacklok.slack.com/archives/C09L9QF47EU/p1774392171855569) — Slack thread
 - [Starlark Language Specification](https://github.com/bazelbuild/starlark/blob/master/spec.md)
 - [starlark-go Implementation](https://github.com/google/starlark-go)
+
+---
+
+## Appendix A: Motivating Use Cases
+
+The following use cases illustrate what the programming model enables. Use Cases 1, 2, and 4 are achievable with the v0 built-ins. Use Cases 3, 5, and 6 depend on future built-ins (`current_user()`, `scrub_pii()`, `check_rate_limit()`) that are not in scope for this RFC but demonstrate why the model is worth building.
+
+### Use Case 1: Dynamic optimizer descriptions
+
+**Problem**: Agents don't use `find_tool` because its static description doesn't tell them what's available.
+
+**Today's solution**: Manual description override or hope the agent figures it out.
+
+**With session initialization script**:
+
+```python
+all_tools = []
+for name, backend in backends().items():
+    all_tools += backend.tools()
+
+index = search_index(all_tools)
+
+# Build a dynamic description from actual available backends
+desc_parts = []
+for name, backend in backends().items():
+    n = len(backend.tools())
+    desc_parts.append("%s (%d tools)" % (name, n))
+
+summary = "Search for tools. Available: " + ", ".join(desc_parts)
+
+publish(
+    metadata(name="find_tool", description=summary,
+             parameters=FIND_TOOL_SCHEMA, annotations={}),
+    lambda args: {"results": index.search(args["query"])},
+)
+
+# Save handlers by name for dispatch
+tool_handlers = {}
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        tool_handlers[meta.name] = fn
+
+publish(
+    metadata(name="call_tool", description="Call a tool by name.",
+             parameters=CALL_TOOL_SCHEMA, annotations={}),
+    lambda args: tool_handlers[args["tool_name"]](args["arguments"]),
+)
+```
+
+The value here is that the administrator defines the policy that works best for their use case. ToolHive doesn't need to build one-size-fits-all solutions for optimizer behavior — the script is the policy.
+
+### Use Case 2: Elicitation gate for write operations
+
+**Problem**: An administrator wants to ensure that tools capable of mutation are never called without human confirmation.
+
+**Today's solution**: Not possible without writing a custom composite tool wrapper for every write tool.
+
+**With session initialization script**:
+
+```python
+def with_approval_gate(fn, tool_name):
+    def wrapper(args):
+        decision = elicit(
+            "Tool '%s' may modify data. Approve?" % tool_name,
+            schema={"type": "object", "properties": {"reason": {"type": "string"}}},
+        )
+        if decision.action != "accept":
+            return {"error": "Declined by user"}
+        return fn(args)
+    return wrapper
+
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        if not meta.annotations.get("readOnly", False):
+            fn = with_approval_gate(fn, meta.name)
+        publish(meta, fn)
+```
+
+A single policy, applied once, covering all tools.
+
+### Use Case 3: PII scrubbing
+
+**Problem**: Tool responses may contain PII that should be redacted before reaching the agent.
+
+**Today's solution**: Requires a mutating webhook (THV-0017) calling an external service.
+
+**With session initialization script**:
+
+```python
+def with_pii_scrubbing(fn):
+    def wrapper(args):
+        result = fn(args)
+        if "text" in result:
+            result["text"] = scrub_pii(result["text"])
+        return result
+    return wrapper
+
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        publish(meta, with_pii_scrubbing(fn))
+```
+
+`scrub_pii()` is an example of a future built-in (not in scope for this RFC) that could handle common patterns (emails, phone numbers, SSNs, credit cards). Users can also write their own scrubbing decorators — the programming model makes this natural without needing ToolHive to explicitly support every scrubbing pattern.
+
+### Use Case 4: Tool aggregation and renaming
+
+**Problem**: An administrator wants to present a curated set of tools — renaming some, hiding others, grouping related tools under a single facade.
+
+**Today's solution**: `aggregation.tools[].overrides` for renaming, `aggregation.tools[].filter` / `excludeAll` for hiding.
+
+**With session initialization script**:
+
+```python
+jira_handlers = {}
+
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        # Hide internal tools
+        if meta.name.startswith("internal_"):
+            continue
+
+        # Rename for clarity
+        if meta.name == "pg_query":
+            publish(
+                metadata(name="database_query", description="Query the production database",
+                         parameters=meta.parameters, annotations=meta.annotations),
+                fn,
+            )
+            continue
+
+        # Save Jira tools — we'll group them below
+        if meta.name in ["jira_create", "jira_update", "jira_search"]:
+            jira_handlers[meta.name] = fn
+            continue
+
+        publish(meta, fn)
+
+# Publish a composite Jira tool using saved handlers
+def jira_handler(args):
+    action = args["action"]
+    return jira_handlers["jira_" + action](args)
+
+publish(
+    metadata(name="jira", description="Manage Jira issues: create, update, or search",
+             parameters=JIRA_SCHEMA, annotations={}),
+    jira_handler,
+)
+```
+
+### Use Case 5: Rate limiting with context-aware policies
+
+**Problem**: Rate limits need to vary by tool sensitivity and user role.
+
+**Today's solution**: THV-0057 provides static `requestsPerWindow` / `windowSeconds` per tool.
+
+**With session initialization script**:
+
+```python
+LIMITS = {
+    "admin":    {"default": 1000, "expensive_search": 100},
+    "standard": {"default": 100,  "expensive_search": 10},
+}
+
+def with_rate_limit(fn, tool_name):
+    def wrapper(args):
+        user = current_user()
+        role = user.groups[0] if user.groups else "standard"
+        role_limits = LIMITS.get(role, LIMITS["standard"])
+        limit = role_limits.get(tool_name, role_limits["default"])
+
+        allowed, retry_after = check_rate_limit(
+            key=user.sub + ":" + tool_name, limit=limit, window=60,
+        )
+        if not allowed:
+            return {"error": "Rate limited", "retry_after": retry_after}
+        return fn(args)
+    return wrapper
+
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        publish(meta, with_rate_limit(fn, meta.name))
+```
+
+`check_rate_limit()` is backed by the same Redis token bucket from THV-0057. The *policy* is expressed in Starlark; the *mechanism* lives in Go. This allows users to define rate limiting that meets the needs of their use case without ToolHive needing to explicitly support every rate limiting pattern.
+
+### Use Case 6: Composing multiple concerns
+
+A single script handles optimizer + elicitation gate + PII scrubbing + rate limiting — behaviors that today require four different config surfaces:
+
+```python
+def build_summary(tool_list):
+    cats = {}
+    for meta, fn in tool_list:
+        cat = meta.annotations.get("category", "general")
+        if cat not in cats:
+            cats[cat] = []
+        cats[cat].append(meta.name)
+    return "Search for tools across: " + ", ".join(
+        "%s (%d tools)" % (c, len(ns)) for c, ns in cats.items()
+    )
+
+all_tools = []
+tool_handlers = {}
+tool_metadata = {}
+
+for name, backend in backends().items():
+    for meta, fn in backend.tools():
+        all_tools.append((meta, fn))
+        tool_handlers[meta.name] = fn
+        tool_metadata[meta.name] = meta
+
+index = search_index(all_tools)
+desc = build_summary(all_tools)
+
+def dispatch(args):
+    tool_name = args["tool_name"]
+    arguments = args["arguments"]
+    user = current_user()
+
+    # Rate limit
+    allowed, retry_after = check_rate_limit(
+        key=user.sub + ":" + tool_name, limit=100, window=60,
+    )
+    if not allowed:
+        return {"error": "Rate limited", "retry_after": retry_after}
+
+    # Elicitation gate for non-readonly tools
+    meta = tool_metadata.get(tool_name)
+    if meta and not meta.annotations.get("readOnly", False):
+        decision = elicit("Approve call to '%s'?" % tool_name)
+        if decision.action != "accept":
+            return {"error": "Declined"}
+
+    # Execute and scrub
+    result = tool_handlers[tool_name](arguments)
+    if "text" in result:
+        result["text"] = scrub_pii(result["text"])
+    return result
+
+publish(
+    metadata(name="find_tool", description=desc,
+             parameters=FIND_TOOL_SCHEMA, annotations={}),
+    lambda args: {"results": index.search(args["query"])},
+)
+
+publish(
+    metadata(name="call_tool", description="Call a tool by name.",
+             parameters=CALL_TOOL_SCHEMA, annotations={}),
+    dispatch,
+)
+```
+
+The ordering is explicit. The interactions are visible. There are no surprising feature interactions because the administrator wrote the interaction.
 
 ---
 
