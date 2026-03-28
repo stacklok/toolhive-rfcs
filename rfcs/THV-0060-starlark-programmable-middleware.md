@@ -10,43 +10,31 @@
 
 ## Summary
 
-Introduce a Starlark-based session initialization script for vMCP. A single script runs once per session, receives discovered backends and their capabilities, and calls `publish()` to declare what the agent sees — optionally wrapping handlers with additional logic. Existing config knobs remain fully supported, but customization of vMCP behavior can now be exactly tailored to the use case without adding more knobs and the cognitive load of their interactions.
+Introduce a Starlark-based session initialization script for vMCP. A single script runs once per session, receives discovered backends and their capabilities, and calls `publish()` to declare what the agent sees — optionally wrapping handlers with additional logic. Existing config knobs remain fully supported, but customization of vMCP behavior can now be exactly tailored to the use case without adding more knobs. Increasing configurability no longer means decreasing maintainability — new capabilities ship as simple built-in functions instead of config knobs that must reason about every other knob.
 
 ## Problem Statement
 
-vMCP's feature set is growing, and two forces are pulling against each other: users want more configurability, maintainers need the system to stay understandable. Each new capability makes both sides worse.
+vMCP's feature set is growing, and two forces are pulling against each other: users want more configurability, but increasing configurability decreases maintainability.
 
 ### The configurability problem
 
-Users want to combine features in ways that make sense for their deployment. But each feature has its own config surface, and the interactions between them are implicit and surprising:
+Users want to combine features in ways that make sense for their deployment. But each feature has its own config surface, and the interactions between them are implicit and surprising. Configuring one feature correctly requires understanding the side effects of every other feature:
 
-- **Filter × composite tools**: The advertising filter runs before composite tools, causing a [type coercion bug](https://github.com/stacklok/toolhive/issues/4287). RFC-0058 fixes the ordering, but the fact that the bug existed shows how opaque the interaction is.
-- **Rate limiting × overrides**: Rate limiting (THV-0057) adds per-tool limits that must reference tool names — names that may have been renamed by overrides in a different config block.
-- **Optimizer × discoverability**: The optimizer replaces the entire tool list with `find_tool` / `call_tool`, but `find_tool`'s description is static. We've discussed many solutions on [this issue](https://github.com/stacklok/toolhive/issues/4357). To support them all, we'd have to add many more config knobs. As Alejandro's comment points out, we'd also like the solutions to not be one-size-fits-all — but each option is another knob.
-- **Cross-cutting policies**: There is no mechanism to express policies that span features, like "tools without a `readOnly` annotation must require an elicitation step."
-
-The following diagram maps the dependencies between vMCP features ([excalidraw source](https://excalidraw.com/#json=C3Co-yHQMwzjrJptY7Qmv,mCqdzvMmerb6yZ0_gmt24g)):
-
-![vMCP feature dependency graph](./images/vmcp-feature-dependencies.png)
-
-Configuring one feature correctly requires understanding the side effects of every other feature — a burden that scales poorly.
+- The optimizer replaces the entire tool list with `find_tool` / `call_tool`, but `find_tool`'s description is static. We've discussed many solutions on [this issue](https://github.com/stacklok/toolhive/issues/4357). To support them all, we'd have to add many more config knobs. As Alejandro's comment points out, we'd also like the solutions to not be one-size-fits-all — but each option is another knob.
+- Rate limiting (THV-0057) adds per-tool limits that must reference tool names — names that may have been renamed by overrides in a different config block.
+- There is no mechanism to express policies that span features, like "tools without a `readOnly` annotation must require an elicitation step."
 
 ### The maintainability problem
 
-Every new capability must reason about every existing one. The config surfaces today:
+Every new feature enters a web of dependencies with existing features. As we add to this web, we have to think carefully about how each addition interacts with everything else ([excalidraw source](https://excalidraw.com/#json=C3Co-yHQMwzjrJptY7Qmv,mCqdzvMmerb6yZ0_gmt24g)):
 
-| Feature | Config surface | Introduced in |
-|---------|---------------|---------------|
-| Tool advertising filter | `aggregation.tools[].filter`, `excludeAll` | THV-0008 |
-| Tool renaming / overrides | `aggregation.tools[].overrides` | THV-0008 |
-| Conflict resolution | `aggregation.conflictResolution` | THV-0008 |
-| Composite tools | `compositeTools[]`, `compositeToolRefs[]` | THV-0008 |
-| Optimizer | `optimizer` (embedding service URL, thresholds, max results) | THV-0022 |
-| Starlark scripted tools | `scriptedTools[]`, `scriptedToolRefs[]` | THV-0051 (proposed) |
-| Rate limiting | `rateLimiting.perUser`, `rateLimiting.global`, `rateLimiting.tools[]` | THV-0057 (proposed) |
-| Dynamic webhooks | `validating_webhooks[]`, `mutating_webhooks[]` | THV-0017 (proposed) |
+![vMCP feature dependency graph](./images/vmcp-feature-dependencies.png)
 
-Adding a simple capability (e.g., PII scrubbing) requires understanding how it interacts with filtering, renaming, the optimizer, composite tools, and rate limiting. Testing every combination is intractable. The interaction matrix grows quadratically — and so does the cost of getting it wrong.
+The cost is concrete — implicit interactions produce bugs:
+
+- **Filter × composite tools**: The advertising filter runs before composite tools, causing a [type coercion bug](https://github.com/stacklok/toolhive/issues/4287). RFC-0058 fixes the ordering, but the fact that the bug existed shows how opaque the interaction is.
+
+Adding a simple capability (e.g., PII scrubbing) requires understanding how it interacts with filtering, renaming, the optimizer, composite tools, and rate limiting. Testing every combination is intractable. The interaction matrix grows quadratically — and so does the time to ship new features and the cost of getting it wrong.
 
 ### Why this is worth solving now
 
@@ -77,11 +65,11 @@ The cost equation favors acting now. As more capabilities land, the cost of retr
 
 #### Prior art: gateway configurability patterns
 
-Envoy Proxy faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal Lua filter, WASM filters, and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its ext_authz filter, with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer.
+**[Envoy Proxy](https://www.envoyproxy.io/)** faces the same configurability spectrum. Its declarative config handles routing well, but complex use cases require escape hatches: a minimal [Lua filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/lua_filter), [WASM filters](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/wasm_filter), and native C++ filters, each trading simplicity for power. Envoy keeps authorization architecturally separate from routing via its [ext_authz filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter), with shared context flowing between them through dynamic metadata — authorization and configuration are separate concerns connected through a shared namespace, not unified into one layer.
 
-Kong Gateway built its plugin architecture on Lua lifecycle callbacks with a Plugin Development Kit exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model.
+**[Kong Gateway](https://docs.konghq.com/gateway/latest/)** built its plugin architecture on Lua lifecycle callbacks with a [Plugin Development Kit](https://docs.konghq.com/gateway/latest/plugin-development/pdk/) exposing built-in functions for request inspection and response control. The pattern — built-in functions as mechanism, user scripts as policy — directly informs vMCP's `publish()` + handler model.
 
-The [Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html) (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
+**[The Configuration Complexity Clock](https://mikehadlow.blogspot.com/2012/05/configuration-complexity-clock.html)** (Hadlow, 2012) describes the lifecycle this RFC interrupts: hard-coded values → config file → complex config → rules engine → DSL → "essentially a programming language, except crappier." vMCP's config knob interactions are at the "complex config" stage. The session initialization model jumps to a real programming language with proper semantics, rather than waiting for the config surface to accumulate ad-hoc conditionals that amount to a worse one.
 
 #### How authorization works today
 
