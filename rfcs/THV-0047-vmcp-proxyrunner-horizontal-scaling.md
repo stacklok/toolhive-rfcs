@@ -117,6 +117,10 @@ Even for `SSE` and `streamable-http` transports, where the backend MCP server sp
 
 This is a structural constraint of the MCP protocol, not a ToolHive implementation choice, and it shapes the solution described in this RFC.
 
+#### Long-Lived SSE Streams and Server-to-Client Requests
+
+MCP's Streamable HTTP transport allows the server to respond to a client POST with an SSE stream and send mid-stream requests back to the client (e.g., `elicitation/create`, `sampling/createMessage`). The client's response arrives as a new POST — which may land on a different pod — while the original SSE stream remains pinned to the pod that opened it. Horizontally scaling this pattern would require either sticky sessions or cross-pod signaling (routing a response POST to the pod holding the open stream), adding significant intra-deployment routing complexity. The MCP spec is evolving toward stateless-friendly alternatives (task-based polling, reconnectable streams), but the interaction with mid-request elicitation/sampling is not yet well-defined. See §3.2 for why this is out of scope.
+
 
 ---
 
@@ -193,6 +197,7 @@ For `SSE` and `streamable-http`, the session exists as a logical identifier (`Mc
 - **Moving MCP server deployment out of the proxyrunner**: The proxyrunner remains responsible for creating, managing, and proxying to the MCP server StatefulSet. Changing this responsibility boundary (e.g., having vMCP manage backends directly) is desirable long-term but is more work and out of scope. Discussed in detail [here](https://github.com/stacklok/toolhive-rfcs/blob/main/rfcs/THV-0003-toolhive-kubernetes-architecture-improvement.md).
 - **Auto-scaling policy**: How to trigger scale-out (HPA metrics, KEDA event sources, custom metrics) is deferred to a follow-on RFC. This RFC makes auto-scaling possible; it does not specify when or how to do it.
 - **Backend StatefulSet scale-in**: Removing pods from the `MCPServer` StatefulSet (reducing `spec.backendReplicas`) is always disruptive — the backend session state lives in the removed process and cannot be reconstructed. Graceful drain of backend pods is out of scope for this RFC.
+- **Scalable SSE elicitation and sampling**: Both SSE and Streamable HTTP transports can use server-sent event streams to deliver server-to-client requests (elicitation, sampling) mid-flight. These long-lived streams are pinned to a specific pod, so scaling them would require intra-deployment routing to forward client response POSTs to the pod holding the open stream. This adds significant complexity for a pattern most deployments do not use. The MCP spec is evolving toward stateless-friendly alternatives (tasks, reconnectable streams) that may mitigate this; until then, we flag it as a known gap and candidate for future work.
 - **Session Hijack Prevention at MCPServer**: This capability will continue to work within vMCP, but it will not also be added to MCPServer.
 
 ### 3.3 Scaling Summary
