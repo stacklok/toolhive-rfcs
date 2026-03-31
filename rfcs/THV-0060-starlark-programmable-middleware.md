@@ -183,6 +183,8 @@ for name, backend in backends().items():
         publish(meta, fn)
 ```
 
+**Note on authorization**: Handlers returned from `backend.tools()` dispatch directly to the backend, bypassing Cedar authz middleware. This means a handler saved in a dict (as in the optimizer pattern) can invoke tools the current user isn't authorized to use — the same root cause as [#4374](https://github.com/stacklok/toolhive/issues/4374). See [Interaction with authorization](#interaction-with-authorization) for details. The implementation plan addresses this by shipping optimizer + authz integration together in Phase 3.
+
 #### Handling name collisions across backends
 
 Because the script sees which backend each tool comes from, it can handle collisions explicitly:
@@ -200,6 +202,22 @@ for name, backend in backends().items():
             )
         publish(meta, fn)
 ```
+
+#### Error handling
+
+When a handler invokes a backend tool and it fails, the Go engine catches the error and returns an MCP-standard `isError` response dict: `{"isError": true, "content": [{"type": "text", "text": "..."}]}`. The script is not halted — the error is a value the script can inspect and react to. This enables decorator-style error recovery as plain Starlark:
+
+```python
+def with_fallback(fn, fallback_fn):
+    def wrapper(args):
+        result = fn(args)
+        if result.get("isError"):
+            return fallback_fn(args)
+        return result
+    return wrapper
+```
+
+Retry wrappers, default responses, and other error policies are all expressible as userland decorators using the same mechanism.
 
 #### Decorating handlers
 
@@ -256,7 +274,7 @@ These are Go-implemented functions exposed to Starlark scripts.
 | Built-in | Signature | Description |
 |----------|-----------|-------------|
 | `search_index(tools)` | `search_index(list[(metadata, handler)]) → SearchIndex` | Builds a semantic search index over the tool list. Returns an object with `.search(query) → list[dict]`. |
-| `elicit(message, schema)` | `elicit(message, schema={}) → struct(action, content)` | Prompts the user for a decision via MCP elicitation. |
+| `elicit(message, schema, when_unavailable)` | `elicit(message, schema={}, when_unavailable) → struct(action, content)` | Prompts the user for a decision via MCP elicitation. `when_unavailable` is required and controls behavior when the client doesn't support elicitation: `"accept"` (permit the operation), `"reject"` (deny it), or `"error"` (halt the script). |
 | `config()` | `config() → dict` | Returns the vMCP config fields (`aggregation`, `optimizer`, etc.) as a read-only dict. Used by the `default` preset. |
 | `log(message)` | `log(message) → None` | Emits a structured audit log entry. |
 
@@ -291,10 +309,11 @@ An important question is: how do people who don't want to write Starlark still u
 **Answer: presets.** A preset is a named, built-in Starlark script that replicates the behavior of today's config knobs. Presets are transparent — users can inspect the underlying Starlark source and fork it when they need customization:
 
 ```bash
+thv vmcp list-presets
 thv vmcp show-preset default
 ```
 
-This prints the Starlark source. A user who needs 90% of a preset's behavior can copy it, modify the 10% they need, and use `sessionInit.script` or `sessionInit.scriptFile` instead.
+`list-presets` shows available presets. `show-preset` prints the Starlark source for a given preset. A user who needs 90% of a preset's behavior can copy it, modify the 10% they need, and use `sessionInit.script` or `sessionInit.scriptFile` instead.
 
 #### Built-in presets
 
@@ -306,9 +325,41 @@ A single `default` preset handles all existing config knobs. When no `sessionIni
 
 #### Sketch of the `default` preset
 
-The `default` preset is the most complex part of this RFC — it must faithfully replicate the behavior of the existing config-driven system. Below is a sketch of what this script looks like. The exact implementation will be validated during the POC phase.
+The `default` preset is the most complex part of this RFC — it must faithfully replicate the behavior of the existing config-driven system. The sketch below shows what we're aiming for. The exact nature of the built-ins — particularly for more distant phases like authz integration — is open to discussion and doesn't need to be resolved in this RFC.
 
 ```python
+# --- Optimizer tool schemas (used when optimizer mode is enabled) ---
+FIND_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool_description": {
+            "type": "string",
+            "description": "Description of the task or capability needed (e.g. 'web search', 'analyze CSV file'). Used for semantic similarity matching.",
+        },
+        "tool_keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional keywords for BM25 text search to narrow results. Combined with tool_description for hybrid search.",
+        },
+    },
+    "required": ["tool_description"],
+}
+
+CALL_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool_name": {
+            "type": "string",
+            "description": "The name of the tool to execute (obtain from find_tool results).",
+        },
+        "parameters": {
+            "type": "object",
+            "description": "Arguments required by the tool. Must match the tool's input schema from find_tool.",
+        },
+    },
+    "required": ["tool_name", "parameters"],
+}
+
 cfg = config()
 agg = cfg.get("aggregation", {})
 opt = cfg.get("optimizer", None)
@@ -367,12 +418,19 @@ for backend_name, backend in backends().items():
                 )
             elif strategy == "priority":
                 existing_backend = seen_names[meta.name]
+                if backend_name not in priority_order or existing_backend not in priority_order:
+                    continue  # unranked backends don't win collisions
                 if priority_order.index(backend_name) > priority_order.index(existing_backend):
                     continue  # lower priority, skip
                 # else: higher priority, will overwrite
 
         seen_names[meta.name] = backend_name
         all_published.append((meta, fn))
+
+# --- Enforce Cedar authorization policies (Phase 3) ---
+# Filters the tool set so handlers can only dispatch to authorized tools.
+# This ensures the optimizer pattern doesn't bypass authz (#4374).
+all_published = enforce_cedar_policies(all_published)
 
 # --- Optimizer mode: publish find_tool/call_tool instead of raw tools ---
 if opt:
@@ -442,7 +500,7 @@ sequenceDiagram
     Authz-->>Agent: CallToolResult
 ```
 
-The script runs **once** per session, not per request. `publish()` calls build up the tool set. The resulting `(metadata, handler)` pairs are used to construct the `MultiSession`, which handles all subsequent `tools/list` and `tools/call` requests. The authz middleware sits between the agent and the session, filtering and gating requests at runtime.
+The script runs **once** per session — either when a session is created or when it's restored from Redis. The Starlark state is in-memory and not serialized, but can be recreated by re-running the script. Even though the script output could technically be shared across sessions today, running it once per session is a deliberate choice — it enables safe adoption of user-centric built-ins like `current_user()` in the future without requiring an architectural change. `publish()` calls build up the tool set. The resulting `(metadata, handler)` pairs are used to construct the `MultiSession`, which handles all subsequent `tools/list` and `tools/call` requests. The authz middleware sits between the agent and the session, filtering and gating requests at runtime.
 
 #### Where this fits in the architecture
 
@@ -509,7 +567,7 @@ type SessionInitConfig struct {
 
 #### Existing config fields
 
-`aggregation`, `compositeToolRefs`, and `optimizer` remain on `Config`. The `default` preset reads these fields and produces identical behavior. When a custom `sessionInit.script` or `sessionInit.scriptFile` is set, these fields are ignored (if both are set, vMCP logs a warning).
+`aggregation`, `compositeToolRefs`, and `optimizer` remain on `Config`. The `default` preset reads these fields and produces identical behavior. When a custom `sessionInit.script` or `sessionInit.scriptFile` is set, these fields are ignored. Setting more than one of `preset`, `script`, or `scriptFile` is a validation error — vMCP rejects the configuration at load time.
 
 
 ## Security Considerations
@@ -663,31 +721,40 @@ A fast, rough POC to validate the high-level design. The goal is to prove the pr
 - Implement `backends()`, `publish()`, `metadata()` built-ins in the Starlark engine
 - Session factory runs the script and constructs `MultiSession` from `publish()` results
 - Implement the `default` preset that reads existing config knobs (`aggregation`, `optimizer`, etc.)
-- **Delete** the existing decorator-based code that supports these config knobs today (optimizer, filter, composite tools decorators)
+- Run the Starlark engine alongside existing decorators for comparison testing
 - All existing tests must pass **except** those that test legacy composite tools (`compositeTools`, `compositeToolRefs`)
 - Update this RFC with any findings — design changes, missing built-ins, edge cases discovered
 
-### Phase 2: Production implementation
+### Phase 2: Safe capabilities
 
-Take the learnings from the POC and implement for real. This is the production-quality version with proper error handling, tests, and documentation.
+Ship the capabilities that don't interact with the authz boundary. These are the "safe" features that can be validated independently.
 
-- Extend the Starlark engine from THV-0051 with production-quality `backends()`, `publish()`, `metadata()` built-ins
-- Port `search_index()` from current optimizer implementation
+- Production-quality `backends()`, `publish()`, `metadata()` built-ins
+- Name resolution, filtering, and overrides via the `default` preset
+- Rate limiting integration
 - `thv vmcp show-preset` command to inspect built-in presets
 - Config model: `sessionInit.preset`, `sessionInit.script`, `sessionInit.scriptFile`
-- Preset equivalence tests: verify the `default` preset produces identical behavior to the old config-driven system
-- Remove optimizer, filter, and composite tools decorators — the session init script is the single implementation
+- Preset equivalence tests for the capabilities in scope
+- Remove the decorator code for features replaced in this phase
 
-### Phase 3: Deprecate composite tools
+### Phase 3: Optimizer + authz integration
+
+Ship the optimizer and authz capabilities together so the relationship between them is explicit. Today, the optimizer bypasses Cedar because handlers dispatch directly to backends ([#4374](https://github.com/stacklok/toolhive/issues/4374), interim fix in [PR #4385](https://github.com/stacklok/toolhive/pull/4385)). By shipping them together, the script can enforce Cedar policies on the tool set before the optimizer builds its dispatch table (e.g. `enforce_cedar_policies(all_published)`).
+
+- `search_index()` built-in ported from current optimizer implementation
+- Authz built-in (e.g. `enforce_cedar_policies()`) that filters the `(metadata, handler)` list
+- Updated `default` preset with optimizer + authz integration
+- Preset equivalence tests for optimizer behavior
+- Remove remaining decorator code
+- The exact design of the authz built-ins will be detailed in a follow-up RFC
+
+### Phase 4: Deprecate composite tools, ship and document
 
 - Mark `compositeTools` and `compositeToolRefs` as deprecated
 - Log deprecation warnings when these fields are used
 - Document migration path from declarative composite tools to Starlark scripts
-
-### Phase 4: Ship and document
-
 - E2E tests for custom scripts in K8s via ConfigMap
-- Documentation: user guide, built-in reference, composite tools migration guide, advanced use cases
+- Documentation: user guide, built-in reference, migration guide, advanced use cases
 
 New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of scope for this RFC. The programming model makes them straightforward to add as follow-up work.
 
@@ -709,11 +776,7 @@ New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of sc
 
 ## Open Questions
 
-1. **Error handling in handler functions**: When a handler function invokes a backend tool and it fails, what should happen? Options include: (a) the handler returns an error dict to the agent, (b) a `with_fallback(fn, fallback_fn)` pattern for decorator-style error recovery, (c) preset parameters for common error policies (retry N times, fall back to a default response).
-
-2. **Should authz decisions move into Starlark?** Authorization (Cedar) and session initialization (Starlark) remain entirely separate systems. This RFC reduces config knob interactions significantly and makes most of them explicit, but the "who sees what?" question still requires reasoning across both systems. The interaction between the optimizer and Cedar illustrates the problem: enabling the optimizer replaces real tool names with `find_tool` / `call_tool`, which silently breaks Cedar policies that reference the original names ([stacklok/toolhive#4373](https://github.com/stacklok/toolhive/issues/4373))); and `find_tool` returns tools the caller isn't authorized to use, because Cedar gates `tools/call` but doesn't filter search results inside a handler ([stacklok/toolhive#4374](https://github.com/stacklok/toolhive/issues/4374)). Neither system is aware of the other. Pulling authz decisions into the script (e.g., a `current_user()` built-in combined with policy logic) would unify the model but raises questions about Cedar's role and the trust boundary. Worth exploring once the base programming model is proven.
-
-3. **Sessionless MCP requests**: What happens when MCP supports requests without sessions? Do we have to run this heavy script on every request? We could actually run the script once at startup, since it does not depend on request-time information. However, if we fold in authz concerns from above, then `current_user()` will be request-time information. We could cheat around this by recommending all logic which depends on `current_user()` be placed at the end of the script. When that's encountered during startup, we block and restore the state on each request. Alternatively, we could support two different scripts. One for initialization and one per-request.
+1. **Sessionless MCP requests**: What happens when MCP supports requests without sessions? Do we have to run this heavy script on every request? We could actually run the script once at startup, since it does not depend on request-time information. However, if we fold in authz concerns from above, then `current_user()` will be request-time information. We could cheat around this by recommending all logic which depends on `current_user()` be placed at the end of the script. When that's encountered during startup, we block and restore the state on each request. Alternatively, we could support two different scripts. One for initialization and one per-request.
 
 ## References
 
@@ -721,6 +784,7 @@ New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of sc
 - [THV-0057: Rate Limiting](./THV-0057-rate-limiting.md) — rate limiting mechanism
 - [THV-0017: Dynamic Webhook Middleware](./THV-0017-dynamic-webhook-middleware.md) — external webhook integration
 - [stacklok-epics#213](https://github.com/stacklok/stacklok-epics/issues/213) — Dynamic Webhook Middleware epic
+- [stacklok/toolhive#4385](https://github.com/stacklok/toolhive/pull/4385) — Interim fix for optimizer + authz bypass (#4374)
 - [Optimizer discoverability discussion](https://stacklok.slack.com/archives/C09L9QF47EU/p1774392171855569) — Slack thread
 - [Starlark Language Specification](https://github.com/bazelbuild/starlark/blob/master/spec.md)
 - [starlark-go Implementation](https://github.com/google/starlark-go)
@@ -789,6 +853,7 @@ def with_approval_gate(fn, tool_name):
         decision = elicit(
             "Tool '%s' may modify data. Approve?" % tool_name,
             schema={"type": "object", "properties": {"reason": {"type": "string"}}},
+            when_unavailable="reject",
         )
         if decision.action != "accept":
             return {"error": "Declined by user"}
@@ -953,7 +1018,7 @@ def dispatch(args):
     # Elicitation gate for non-readonly tools
     meta = tool_metadata.get(tool_name)
     if meta and not meta.annotations.get("readOnly", False):
-        decision = elicit("Approve call to '%s'?" % tool_name)
+        decision = elicit("Approve call to '%s'?" % tool_name, when_unavailable="reject")
         if decision.action != "accept":
             return {"error": "Declined"}
 
