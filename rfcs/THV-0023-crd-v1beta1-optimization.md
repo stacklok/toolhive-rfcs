@@ -195,10 +195,6 @@ spec:
     requiredClaims:
       iss: https://kubernetes.default.svc
   # OR
-  configMapRef:
-    name: oidc-config
-    key: oidc.json
-  # OR
   inline:
     issuer: https://keycloak.example.com/realms/prod
     clientId: toolhive-client
@@ -226,7 +222,7 @@ status:
 ```
 
 **Key design decisions:**
-- CEL validation ensures exactly one of `kubernetesServiceAccount`, `configMapRef`, or `inline` is set
+- CEL validation ensures exactly one of `kubernetesServiceAccount` or `inline` is set
 - `audience` and `scopes` are intentionally excluded from the shared config - they are per-server fields specified in the reference
 
 #### New CRD 2: MCPTelemetryConfig
@@ -503,7 +499,7 @@ CRDs use CEL (Common Expression Language) for admission-time validation:
 
 | CRD | Rule | Validation |
 |-----|------|------------|
-| MCPOIDCConfig | Exactly one source | `kubernetesServiceAccount`, `configMapRef`, or `inline` - only one allowed |
+| MCPOIDCConfig | Exactly one source | `kubernetesServiceAccount` or `inline` - only one allowed |
 | MCPAuthzConfig | Exactly one source | `configMapRef` or `inline` - only one allowed |
 | MCPServerSpec | Transport/port consistency | `mcpPort` cannot be set when transport is `stdio` |
 | IncomingAuthConfig | Auth mode selection | Either `oidcConfigRef` or `anonymous` - only one allowed |
