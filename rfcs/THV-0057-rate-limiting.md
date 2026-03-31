@@ -54,6 +54,8 @@ flowchart LR
 
 The rate limit middleware sits after authentication (so user identity is available) and before the rest of the middleware chain.
 
+**Request unit**: One token corresponds to one incoming `tools/call`, `prompts/get`, or `resources/read` invocation at the proxy. Other MCP methods (`tools/list`, `prompts/list`, `resources/list`, etc.) are not rate-limited — the motivation is to cap excessive use of operations that do real work, not to restrict discovery or listing. For `VirtualMCPServer`, rate limiting applies to incoming traffic only; outgoing calls to backends are not independently limited.
+
 Rate limit counters are stored in Redis, which ToolHive already depends on. This ensures accurate enforcement across multiple replicas in horizontally-scaled deployments.
 
 ### Configuration
@@ -72,13 +74,13 @@ spec:
   rateLimiting:
     # Global limit: total requests across all users
     global:
-      requestsPerWindow: 1000
-      windowSeconds: 60
+      capacity: 1000
+      refillPeriodSeconds: 60
 
     # Per-user limit: applied independently to each authenticated user
     perUser:
-      requestsPerWindow: 100
-      windowSeconds: 60
+      capacity: 100
+      refillPeriodSeconds: 60
 ```
 
 **Validation**: Per-user rate limits require authentication to be enabled. If `perUser` limits are configured with anonymous inbound auth, the server will raise an error at startup.
@@ -91,30 +93,30 @@ Individual tools, prompts, or resources can have their own limits that supplemen
 spec:
   rateLimiting:
     perUser:
-      requestsPerWindow: 100
-      windowSeconds: 60
+      capacity: 100
+      refillPeriodSeconds: 60
 
     tools:
       - name: "expensive_search"
         perUser:
-          requestsPerWindow: 10
-          windowSeconds: 60
+          capacity: 10
+          refillPeriodSeconds: 60
       - name: "shared_resource"
         global:
-          requestsPerWindow: 50
-          windowSeconds: 60
+          capacity: 50
+          refillPeriodSeconds: 60
 
     prompts:
       - name: "generate_report"
         perUser:
-          requestsPerWindow: 5
-          windowSeconds: 60
+          capacity: 5
+          refillPeriodSeconds: 60
 
     resources:
       - name: "large_dataset"
         global:
-          requestsPerWindow: 20
-          windowSeconds: 60
+          capacity: 20
+          refillPeriodSeconds: 60
 ```
 
 When an operation-level limit is defined, it is enforced **in addition to** any server-level limits. A request must pass all applicable limits.
@@ -123,7 +125,7 @@ The `tools`, `prompts`, and `resources` lists all follow the same structure — 
 
 #### VirtualMCPServer
 
-The same `rateLimiting` configuration is available on `VirtualMCPServer`. Limits configured here apply to the proxied traffic for each backend server independently.
+The same `rateLimiting` configuration is available on `VirtualMCPServer`. Server-level `perUser` limits are based on the user identity at ingress (e.g. the `sub` claim of an OIDC token) and are shared across all backends — they cap the user's total usage of the vMCP, not per-backend. Per-operation limits target specific backend operations by name (e.g. `backend_a/costly_tool`), so those are inherently scoped to a single backend.
 
 ```yaml
 apiVersion: toolhive.stacklok.dev/v1alpha1
@@ -134,49 +136,89 @@ spec:
   config:
     rateLimiting:
       perUser:
-        requestsPerWindow: 200
-        windowSeconds: 60
+        capacity: 200
+        refillPeriodSeconds: 60
       tools:
         - name: "backend_a/costly_tool"
           perUser:
-            requestsPerWindow: 5
-            windowSeconds: 60
+            capacity: 5
+            refillPeriodSeconds: 60
+
       prompts:
         - name: "backend_b/heavy_prompt"
           global:
-            requestsPerWindow: 30
-            windowSeconds: 60
+            capacity: 30
+            refillPeriodSeconds: 60
 ```
 
 ### Algorithm: Token Bucket
 
 Rate limits are enforced using a **token bucket** algorithm. The configuration maps directly onto it:
 
-- `requestsPerWindow` = bucket capacity (max tokens)
-- `windowSeconds` = time to fully refill the bucket
-- Refill rate = `requestsPerWindow / windowSeconds` tokens per second
+- `capacity` = bucket capacity (maximum tokens)
+- `refillPeriodSeconds` = time in seconds to fully refill the bucket from zero
+- Refill rate = `capacity / refillPeriodSeconds` tokens per second
 
 Each token represents a single allowed request. The bucket starts full, refills at a steady rate, and each incoming request consumes one token. When the bucket is empty, requests are rejected.
 
 Per-user limits work identically — each user gets their own bucket, keyed by identity. Redis keys follow a structure like:
 
 - Global: `thv:rl:{server}:global`
+- Global per-tool: `thv:rl:{server}:global:tool:{toolName}`
+- Global per-prompt: `thv:rl:{server}:global:prompt:{promptName}`
+- Global per-resource: `thv:rl:{server}:global:resource:{resourceName}`
 - Per-user: `thv:rl:{server}:user:{userId}`
 - Per-user per-tool: `thv:rl:{server}:user:{userId}:tool:{toolName}`
+- Per-user per-prompt: `thv:rl:{server}:user:{userId}:prompt:{promptName}`
+- Per-user per-resource: `thv:rl:{server}:user:{userId}:resource:{resourceName}`
 
 Each bucket is stored as a Redis hash with two fields: token count and last refill timestamp. Refill is lazy — there is no background process. When a request arrives, an atomic Lua script calculates how many tokens should have accumulated since the last access based on elapsed time, adds them (capped at capacity), and then attempts to consume one. This ensures no race conditions across replicas. Keys auto-expire when inactive, so no garbage collection is needed.
 
 Storage is **O(1) per counter** (two fields per hash). For example, 500 users with 10 per-operation limits = 5,000 hashes — negligible for Redis.
 
-**Burst behavior**: An idle user accumulates tokens up to the bucket capacity. This means they can send a full burst of `requestsPerWindow` requests at once after a period of inactivity. This is intentional — it handles legitimate traffic spikes — but administrators should understand it when setting capacity.
+**Burst behavior**: An idle user accumulates tokens up to the bucket capacity. This means they can send a full burst of `capacity` requests at once after a period of inactivity. This is intentional — it handles legitimate traffic spikes — but administrators should understand it when setting capacity.
+
+### Redis Unavailability
+
+If Redis is unreachable, the middleware **fails open** — all requests are allowed through. This ensures a Redis hiccup does not become a full MCP outage. When this occurs, the middleware emits a structured log entry and increments a `rate_limit_redis_unavailable` metric so that operators can detect and alert on Redis health independently.
 
 ### Rejection Behavior
 
-When a request is rate-limited, the middleware returns an MCP-appropriate error response. Because token bucket tracks the refill rate, the middleware can compute a precise `Retry-After` value (`1 / refill_rate`) telling the client exactly when the next token will be available.
+When a request is rate-limited, the middleware returns an MCP-appropriate error response. The middleware includes a `Retry-After` value computed as `1 / refill_rate` from the most restrictive bucket that caused the rejection. This value is a **best-effort lower bound**, not a guarantee — particularly for global limits, where other users may consume the next available token before this client retries.
 
-## Open Questions
+## Security Considerations
 
-1. **Redis unavailability**: How should the middleware behave if Redis is unreachable? Fail open (allow all requests) or fail closed (reject all requests)?
+### Threat Model
+
+| Threat | Likelihood | Impact | Mitigation |
+|--------|-----------|--------|------------|
+| Redis key injection via crafted operation names | Medium | High | Validate and sanitize operation names before constructing Redis keys. Reject names containing key-separator characters. |
+| Redis as single point of compromise | Low | High | Require Redis authentication and TLS. Reuse the existing Redis security posture established in [THV-0035](./THV-0035-auth-server-redis-storage.md). |
+| Rate limit bypass via identity spoofing | Low | Medium | Rate limiting relies on upstream auth middleware. It is only as strong as the authentication layer. |
+| Denial of service via Redis exhaustion | Low | Medium | Keys auto-expire when inactive. Storage is O(1) per counter, bounding memory usage. |
+| Unauthenticated DoS | Medium | High | Rate limiting sits after the auth middleware, so unauthenticated requests are rejected before reaching rate limit evaluation. Global limits only count authenticated traffic. |
+
+### Data Security
+
+No sensitive data is stored in Redis — only token counts and last-refill timestamps. User IDs appear in Redis key names but carry no additional PII.
+
+### Input Validation
+
+Operation names used to construct Redis keys must be validated and sanitized to prevent key injection. Names should be checked against a strict allowlist of characters (alphanumeric, hyphens, underscores, forward slashes for vMCP backend-prefixed names).
+
+### Audit and Logging
+
+Rate-limit rejections are logged with user identity, operation name, and which limit was hit (global, per-user, per-operation). Token counts and refill timestamps are not included in log output.
+
+## Alternatives Considered
+
+### Sliding Window Log
+
+The original proposal used a sliding window log algorithm, which tracks each request timestamp in a sorted set and counts entries within the window. This was replaced with a **token bucket** for the following reasons:
+
+- **Burst handling**: Token bucket naturally allows legitimate bursts after idle periods, while sliding window enforces a strict ceiling regardless of usage pattern.
+- **Simpler storage**: Token bucket requires a single Redis hash (two fields) per counter, compared to a sorted set with one entry per request for sliding window — significantly less memory under high throughput.
+- **Atomic operations**: The token bucket check-and-decrement is a single Lua script operating on two fields, reducing Redis round-trip complexity.
 
 ## References
 
