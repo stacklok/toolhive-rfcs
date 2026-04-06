@@ -1,15 +1,15 @@
-# RFC-0050: Support Embedded Auth Server alongside AWS STS token exchange
+# RFC-0050: Dedicated Auth Server Reference with AWS STS on Remote Proxies
 
 - **Status**: Draft
 - **Author(s)**: @tgrunnagle
 - **Created**: 2026-03-06
-- **Last Updated**: 2026-03-06
+- **Last Updated**: 2026-04-06
 - **Target Repository**: toolhive
 - **Related Issues**: https://github.com/stacklok/stacklok-epics/issues/256
 
 ## Summary
 
-Add an `awsStsConfigRef` field to `MCPServerSpec` that references an `MCPExternalAuthConfig` of `type: awsSts`, independently of `externalAuthConfigRef`. This enables the embedded authorization server (`type: embeddedAuthServer`) to be used alongside AWS STS outgoing credential signing in the same proxy runner pipeline, which is not possible today.
+Add an `authServerRef` field to both `MCPServerSpec` and `MCPRemoteProxySpec` that references an `MCPExternalAuthConfig` of `type: embeddedAuthServer`. This separates the embedded authorization server concern from the `externalAuthConfigRef` field, freeing `externalAuthConfigRef` on `MCPRemoteProxySpec` to reference an `MCPExternalAuthConfig` of `type: awsSts` (or other outgoing auth types) alongside the embedded auth server. Existing usage of `type: embeddedAuthServer` via `externalAuthConfigRef` is maintained for backward compatibility, but the new `authServerRef` is the preferred path.
 
 ## Problem Statement
 
@@ -20,43 +20,52 @@ The ToolHive proxy runner middleware pipeline already supports two complementary
 
 These layers are designed to work together: the embedded auth server produces the JWT that the AWS STS middleware consumes. However, the Kubernetes operator CRD model cannot express this combination today.
 
-The `MCPServer` resource accepts a single `externalAuthConfigRef` pointing to an `MCPExternalAuthConfig` resource, whose `type` field is strictly mutually exclusive (enforced by CEL admission rules). As a result, a user who wants to:
+Both `MCPServerSpec` and `MCPRemoteProxySpec` accept a single `externalAuthConfigRef` pointing to an `MCPExternalAuthConfig` resource, whose `type` field is strictly mutually exclusive (enforced by CEL admission rules). As a result, a user who wants to:
 - Use the embedded OAuth server to authenticate MCP clients, **and**
 - Forward requests to an AWS-hosted MCP backend signed with role-specific AWS credentials
 
 ...cannot configure both in the operator. They must use one or the other.
 
-This affects any team deploying an MCP server in front of an AWS-backed service (e.g., Amazon Bedrock, AWS Lambda, internal services secured with IAM) while also wanting a proper OAuth 2.0 client authentication flow for the MCP client side.
+Additionally, the embedded auth server is a conceptually distinct concern from outgoing token exchange or credential signing. Conflating it with other external auth types in a single reference field makes the API harder to reason about.
+
+This affects any team deploying a remote MCP proxy in front of an AWS-backed service (e.g., Amazon Bedrock, AWS Lambda, internal services secured with IAM) while also wanting a proper OAuth 2.0 client authentication flow for the MCP client side.
 
 ## Goals
 
-- Enable `embeddedAuthServer` and AWS STS request signing to be configured simultaneously on an `MCPServer`
-- Keep the change backwards-compatible: existing `MCPExternalAuthConfig` resources with `type: awsSts` continue to work unchanged when referenced via `externalAuthConfigRef`
+- Enable `embeddedAuthServer` and AWS STS request signing to be configured simultaneously on an `MCPRemoteProxy`
+- Provide a dedicated `authServerRef` field on both `MCPServerSpec` and `MCPRemoteProxySpec` for clearer separation of concerns
+- Keep the change backwards-compatible: existing `MCPExternalAuthConfig` resources with `type: embeddedAuthServer` referenced via `externalAuthConfigRef` continue to work unchanged
 - Remain consistent with the existing `MCPExternalAuthConfig` reference pattern used throughout the operator
-- Reuse existing types and conversion logic rather than introducing duplication
+- Require no changes to the proxy runner or its `RunConfig` — all changes are confined to the CRD and reconciler layers
 
 ## Non-Goals
 
-- General support for arbitrary combinations of incoming and outgoing auth types (e.g., `embeddedAuthServer` + `tokenExchange`)
+- General support for arbitrary combinations of incoming and outgoing auth types beyond the `embeddedAuthServer` + `awsSts` pipeline
 - Changes to the CLI-mode toolhive (`thv run`) or its configuration model
+- Deprecating or removing `ExternalAuthTypeEmbeddedAuthServer` from `MCPExternalAuthConfig`
 - Deprecating or removing `ExternalAuthTypeAWSSts` from `MCPExternalAuthConfig`
+- Adding AWS STS support to `MCPServer` (STS is only relevant for remote proxy scenarios where requests are forwarded to an AWS backend)
 - Introducing webhooks or admission controllers (validation remains at reconcile time, consistent with existing operator patterns)
 
 ## Proposed Solution
 
 ### High-Level Design
 
-Add a new optional `awsStsConfigRef` field to `MCPServerSpec` that references an `MCPExternalAuthConfig` of `type: awsSts`. When set alongside `externalAuthConfigRef`, the operator generates a `RunConfig` with both `EmbeddedAuthServerConfig` and `AWSStsConfig` populated, enabling the proxy runner's middleware pipeline to apply both layers in order:
+Add a new optional `authServerRef` field to both `MCPServerSpec` and `MCPRemoteProxySpec` that references an `MCPExternalAuthConfig` of `type: embeddedAuthServer`. This cleanly separates the embedded auth server from other external auth types, allowing both to be configured simultaneously on `MCPRemoteProxySpec`:
 
 ```mermaid
 flowchart LR
-    Client -->|Bearer JWT| AuthMiddleware["Auth Middleware<br>(validates JWT issued\nby embedded auth server)"]
+    Client -->|Bearer JWT| AuthMiddleware["Auth Middleware<br>(validates JWT issued by embedded auth server)"]
     AuthMiddleware --> UpstreamSwap["Upstream Swap<br>(exchanges ToolHive JWT for upstream IdP token)"]
     UpstreamSwap --> STSMiddleware["AWS STS Middleware<br>(AssumeRoleWithWebIdentity → SigV4 signing)"]
     STSMiddleware -->|Signed request| AWSBackend["AWS Backend<br>(Bedrock, Lambda, etc.)"]
 ```
 
-The `awsStsConfigRef` uses the same `ExternalAuthConfigRef` type as the existing `externalAuthConfigRef`, keeping the API surface consistent. The operator validates at reconcile time that the referenced resource is `type: awsSts`.
+On `MCPRemoteProxySpec`, the existing `externalAuthConfigRef` can now point to `type: awsSts` while `authServerRef` independently configures the embedded auth server. On `MCPServerSpec`, `authServerRef` provides a cleaner alternative to using `externalAuthConfigRef` for `type: embeddedAuthServer` (though the old path remains supported).
+
+The `authServerRef` uses the same `ExternalAuthConfigRef` type as the existing `externalAuthConfigRef`, keeping the API surface consistent. The operator validates at reconcile time that the referenced resource is `type: embeddedAuthServer`.
+
+**Key constraint**: AWS STS (`type: awsSts`) is only supported on `MCPRemoteProxySpec` via `externalAuthConfigRef`, not on `MCPServerSpec`. STS request signing is only meaningful when proxying requests to an AWS backend, which is the remote proxy's purpose.
 
 ### Detailed Design
 
@@ -65,113 +74,214 @@ The `awsStsConfigRef` uses the same `ExternalAuthConfigRef` type as the existing
 **`MCPServerSpec`** gains one new optional field:
 
 ```go
-// AWSStsConfigRef optionally references an MCPExternalAuthConfig of type 'awsSts'
-// to configure AWS STS token exchange and SigV4 request signing for outgoing
-// requests to AWS backends. When set, the proxy runner will call
-// AssumeRoleWithWebIdentity using the authenticated request's JWT, then sign
-// the backend request with the resulting temporary credentials.
+// AuthServerRef optionally references an MCPExternalAuthConfig of type
+// 'embeddedAuthServer' to configure an embedded OAuth 2.0/OIDC authorization
+// server that authenticates MCP clients and issues signed JWTs.
 //
-// This field can be combined with externalAuthConfigRef (e.g. type: embeddedAuthServer)
-// to layer AWS credential exchange on top of incoming OAuth 2.0 authentication.
+// This is the preferred way to configure the embedded auth server. The
+// existing externalAuthConfigRef field with type: embeddedAuthServer
+// continues to work for backward compatibility, but authServerRef should
+// be used for new configurations.
 //
-// The referenced MCPExternalAuthConfig must exist in the same namespace as this
-// MCPServer and must have type 'awsSts'.
+// If both authServerRef and externalAuthConfigRef are set with type:
+// embeddedAuthServer, the controller will return a validation error.
 //
-// Note: awsStsConfigRef and externalAuthConfigRef must not reference the same
-// MCPExternalAuthConfig resource.
+// The referenced MCPExternalAuthConfig must exist in the same namespace
+// as this MCPServer and must have type 'embeddedAuthServer'.
 //
 // +optional
-AWSStsConfigRef *ExternalAuthConfigRef `json:"awsStsConfigRef,omitempty"`
+AuthServerRef *ExternalAuthConfigRef `json:"authServerRef,omitempty"`
+```
+
+**`MCPRemoteProxySpec`** gains one new optional field:
+
+```go
+// AuthServerRef optionally references an MCPExternalAuthConfig of type
+// 'embeddedAuthServer' to configure an embedded OAuth 2.0/OIDC authorization
+// server that authenticates MCP clients and issues signed JWTs.
+//
+// This is the preferred way to configure the embedded auth server. The
+// existing externalAuthConfigRef field with type: embeddedAuthServer
+// continues to work for backward compatibility, but authServerRef should
+// be used for new configurations.
+//
+// When set alongside externalAuthConfigRef (e.g. type: awsSts), the
+// operator generates a RunConfig with both EmbeddedAuthServerConfig and
+// AWSStsConfig populated, enabling the proxy runner's middleware pipeline
+// to apply both layers: incoming OAuth 2.0 authentication followed by
+// outgoing AWS credential signing.
+//
+// If both authServerRef and externalAuthConfigRef are set with type:
+// embeddedAuthServer, the controller will return a validation error.
+//
+// The referenced MCPExternalAuthConfig must exist in the same namespace
+// as this MCPRemoteProxy and must have type 'embeddedAuthServer'.
+//
+// +optional
+AuthServerRef *ExternalAuthConfigRef `json:"authServerRef,omitempty"`
 ```
 
 **`MCPServerStatus`** gains one new field for change detection:
 
 ```go
-// AWSStsConfigHash is the hash of the referenced awsStsConfigRef spec,
+// AuthServerConfigHash is the hash of the referenced authServerRef spec,
 // used to detect configuration changes and trigger reconciliation.
 // +optional
-AWSStsConfigHash string `json:"awsStsConfigHash,omitempty"`
+AuthServerConfigHash string `json:"authServerConfigHash,omitempty"`
+```
+
+**`MCPRemoteProxyStatus`** gains one new field for change detection:
+
+```go
+// AuthServerConfigHash is the hash of the referenced authServerRef spec,
+// used to detect configuration changes and trigger reconciliation.
+// +optional
+AuthServerConfigHash string `json:"authServerConfigHash,omitempty"`
 ```
 
 #### Component Changes
 
-**`cmd/thv-operator/pkg/controllerutil/tokenexchange.go`**
+**`cmd/thv-operator/pkg/controllerutil/authserver.go`**
 
-Add a new exported function that resolves an `awsStsConfigRef` reference and appends the corresponding `RunConfigBuilderOption`:
+Add a new exported function that resolves an `authServerRef` reference and appends the corresponding `RunConfigBuilderOption`:
 
 ```go
-// AddAWSStsConfigRefOptions resolves an AWSStsConfigRef, validates that the
-// referenced MCPExternalAuthConfig is type:awsSts, and appends the corresponding
-// RunConfigBuilderOption. Returns an error if the referenced resource is not
-// type:awsSts or cannot be fetched.
-func AddAWSStsConfigRefOptions(
+// AddAuthServerRefOptions resolves an AuthServerRef, validates that the
+// referenced MCPExternalAuthConfig is type:embeddedAuthServer, and appends
+// the corresponding RunConfigBuilderOption. Returns an error if the
+// referenced resource is not type:embeddedAuthServer or cannot be fetched.
+//
+// This function is used by both MCPServer and MCPRemoteProxy reconcilers
+// to handle the new authServerRef field independently of externalAuthConfigRef.
+func AddAuthServerRefOptions(
     ctx context.Context,
     c client.Client,
     namespace string,
-    awsStsConfigRef *mcpv1alpha1.ExternalAuthConfigRef,
+    mcpServerName string,
+    authServerRef *mcpv1alpha1.ExternalAuthConfigRef,
+    oidcConfig *oidc.OIDCConfig,
     options *[]runner.RunConfigBuilderOption,
 ) error {
-    if awsStsConfigRef == nil {
+    if authServerRef == nil {
         return nil
     }
-    externalAuthConfig, err := GetExternalAuthConfigByName(ctx, c, namespace, awsStsConfigRef.Name)
+    externalAuthConfig, err := GetExternalAuthConfigByName(ctx, c, namespace, authServerRef.Name)
     if err != nil {
-        return fmt.Errorf("failed to get MCPExternalAuthConfig for awsStsConfigRef: %w", err)
+        return fmt.Errorf("failed to get MCPExternalAuthConfig for authServerRef: %w", err)
     }
-    if externalAuthConfig.Spec.Type != mcpv1alpha1.ExternalAuthTypeAWSSts {
+    if externalAuthConfig.Spec.Type != mcpv1alpha1.ExternalAuthTypeEmbeddedAuthServer {
         return fmt.Errorf(
-            "awsStsConfigRef must reference an MCPExternalAuthConfig of type %q, got %q",
-            mcpv1alpha1.ExternalAuthTypeAWSSts, externalAuthConfig.Spec.Type,
+            "authServerRef must reference an MCPExternalAuthConfig of type %q, got %q",
+            mcpv1alpha1.ExternalAuthTypeEmbeddedAuthServer, externalAuthConfig.Spec.Type,
         )
     }
-    return addAWSStsConfig(externalAuthConfig, options)
+    // Reuses the existing AddEmbeddedAuthServerConfigOptions logic
+    return AddEmbeddedAuthServerConfigOptions(ctx, c, namespace, mcpServerName, externalAuthConfig, oidcConfig, options)
 }
 ```
 
+This function delegates to the existing `AddEmbeddedAuthServerConfigOptions` after validation, so no logic is duplicated.
+
 **`cmd/thv-operator/controllers/mcpserver_runconfig.go`**
 
-After the existing `AddExternalAuthConfigOptions` call, add:
+After the existing `AddExternalAuthConfigOptions` call, add conflict detection and `authServerRef` resolution:
 
 ```go
-// Validate: awsStsConfigRef and externalAuthConfigRef must not be the same resource
-if m.Spec.AWSStsConfigRef != nil && m.Spec.ExternalAuthConfigRef != nil &&
-    m.Spec.AWSStsConfigRef.Name == m.Spec.ExternalAuthConfigRef.Name {
-    return nil, fmt.Errorf(
-        "awsStsConfigRef and externalAuthConfigRef must not reference the same MCPExternalAuthConfig",
+// Validate: authServerRef and externalAuthConfigRef must not both configure
+// an embedded auth server
+if m.Spec.AuthServerRef != nil && m.Spec.ExternalAuthConfigRef != nil {
+    extAuthConfig, err := ctrlutil.GetExternalAuthConfigByName(
+        ctx, r.Client, m.Namespace, m.Spec.ExternalAuthConfigRef.Name,
     )
+    if err != nil {
+        return nil, fmt.Errorf("failed to get MCPExternalAuthConfig for conflict check: %w", err)
+    }
+    if extAuthConfig.Spec.Type == mcpv1alpha1.ExternalAuthTypeEmbeddedAuthServer {
+        return nil, fmt.Errorf(
+            "authServerRef and externalAuthConfigRef cannot both configure an embedded auth server; "+
+                "use authServerRef for embedded auth server configuration",
+        )
+    }
 }
 
-// Add AWS STS config from reference if present
-if err := ctrlutil.AddAWSStsConfigRefOptions(
-    ctx, r.Client, m.Namespace, m.Spec.AWSStsConfigRef, &options,
+// Add embedded auth server config from authServerRef if present
+if err := ctrlutil.AddAuthServerRefOptions(
+    ctx, r.Client, m.Namespace, m.Name, m.Spec.AuthServerRef, oidcConfig, &options,
 ); err != nil {
-    return nil, fmt.Errorf("failed to process awsStsConfigRef: %w", err)
+    return nil, fmt.Errorf("failed to process authServerRef: %w", err)
+}
+```
+
+**`cmd/thv-operator/controllers/mcpremoteproxy_runconfig.go`**
+
+Same conflict detection and `authServerRef` resolution logic as `mcpserver_runconfig.go`. Because `MCPRemoteProxy` supports both `authServerRef` (embedded auth server) and `externalAuthConfigRef` (e.g., `type: awsSts`) simultaneously, the conflict check only triggers when `externalAuthConfigRef` is also `type: embeddedAuthServer`:
+
+```go
+// Validate: authServerRef and externalAuthConfigRef must not both configure
+// an embedded auth server
+if m.Spec.AuthServerRef != nil && m.Spec.ExternalAuthConfigRef != nil {
+    extAuthConfig, err := ctrlutil.GetExternalAuthConfigByName(
+        ctx, r.Client, m.Namespace, m.Spec.ExternalAuthConfigRef.Name,
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to get MCPExternalAuthConfig for conflict check: %w", err)
+    }
+    if extAuthConfig.Spec.Type == mcpv1alpha1.ExternalAuthTypeEmbeddedAuthServer {
+        return nil, fmt.Errorf(
+            "authServerRef and externalAuthConfigRef cannot both configure an embedded auth server; "+
+                "use authServerRef for embedded auth server configuration",
+        )
+    }
+}
+
+// Add embedded auth server config from authServerRef if present
+if err := ctrlutil.AddAuthServerRefOptions(
+    ctx, r.Client, m.Namespace, m.Name, m.Spec.AuthServerRef, oidcConfig, &options,
+); err != nil {
+    return nil, fmt.Errorf("failed to process authServerRef: %w", err)
 }
 ```
 
 **`cmd/thv-operator/controllers/mcpexternalauthconfig_controller.go`**
 
-Update the `ReferencingServers` listing logic to also include `MCPServer` resources that reference the config via `awsStsConfigRef` (in addition to the existing `externalAuthConfigRef` check). When the config hash changes, the controller already annotates all referencing servers to trigger reconciliation — extending that list to cover `awsStsConfigRef` ensures changes to the STS config propagate correctly.
+Update the `ReferencingServers` listing logic to also include `MCPServer` and `MCPRemoteProxy` resources that reference the config via `authServerRef` (in addition to the existing `externalAuthConfigRef` check). When the config hash changes, the controller already annotates all referencing servers to trigger reconciliation — extending that list to cover `authServerRef` ensures changes to the embedded auth server config propagate correctly.
+
+#### Runner Layer Impact
+
+**No changes required.** The proxy runner's `RunConfig` (`pkg/runner/config.go`) already supports both `EmbeddedAuthServerConfig` and `AWSStsConfig` simultaneously as independent optional fields. The `PopulateMiddlewareConfigs()` function already generates the correct middleware pipeline when both are present. The reconciler changes above produce exactly the same `RunConfig` output — they simply read the embedded auth server config from the new `authServerRef` field instead of (or in addition to) the `externalAuthConfigRef` field.
+
+This is confirmed by examining the `RunConfig` struct which has independent fields:
+```go
+EmbeddedAuthServerConfig *authserver.RunConfig `json:"embedded_auth_server_config,omitempty"`
+AWSStsConfig             *awssts.Config         `json:"aws_sts_config,omitempty"`
+```
+
+And the middleware pipeline builder (`PopulateMiddlewareConfigs`) which processes each config independently.
 
 #### Configuration Changes
 
-Example `MCPServer` YAML combining embedded auth server with a referenced AWS STS config:
+**Example 1: MCPRemoteProxy with embedded auth server + AWS STS (the primary new use case)**
 
 ```yaml
 apiVersion: toolhive.stacklok.com/v1alpha1
-kind: MCPServer
+kind: MCPRemoteProxy
 metadata:
-  name: my-aws-mcp-server
+  name: my-aws-remote-proxy
 spec:
-  image: ghcr.io/example/mcp-server:latest
   transport: streamable-http
+  remoteServerURL: https://bedrock.us-east-1.amazonaws.com/model/invoke
 
-  # Incoming auth: embedded OAuth 2.0 server authenticates MCP clients
-  externalAuthConfigRef:
+  oidcConfig:
+    issuer: https://auth.example.com
+    audience: my-remote-proxy
+    resourceURL: https://proxy.example.com
+
+  # Incoming auth: embedded OAuth 2.0 server authenticates MCP clients (NEW FIELD)
+  authServerRef:
     name: my-embedded-auth-server
 
   # Outgoing auth: sign requests to the AWS backend with role-specific credentials
-  awsStsConfigRef:
+  externalAuthConfigRef:
     name: my-aws-sts-config
 ---
 apiVersion: toolhive.stacklok.com/v1alpha1
@@ -207,20 +317,52 @@ spec:
     sessionDuration: 3600
 ```
 
+**Example 2: MCPServer with embedded auth server (new preferred path)**
+
+```yaml
+apiVersion: toolhive.stacklok.com/v1alpha1
+kind: MCPServer
+metadata:
+  name: my-mcp-server
+spec:
+  image: ghcr.io/example/mcp-server:latest
+  transport: streamable-http
+
+  # Preferred: use authServerRef for embedded auth server
+  authServerRef:
+    name: my-embedded-auth-server
+```
+
+**Example 3: MCPServer with embedded auth server (backward-compatible, still works)**
+
+```yaml
+apiVersion: toolhive.stacklok.com/v1alpha1
+kind: MCPServer
+metadata:
+  name: my-mcp-server
+spec:
+  image: ghcr.io/example/mcp-server:latest
+  transport: streamable-http
+
+  # Legacy path: still works, but authServerRef is preferred
+  externalAuthConfigRef:
+    name: my-embedded-auth-server
+```
+
 ## Security Considerations
 
 ### Threat Model
 
-The proposed change introduces no new attack surfaces beyond what `ExternalAuthTypeAWSSts` already exposes via `MCPExternalAuthConfig`. By keeping the STS configuration in a separate `MCPExternalAuthConfig` resource, existing RBAC policies that control who can read or modify auth configurations continue to apply without change.
+The proposed change introduces no new attack surfaces beyond what `ExternalAuthTypeAWSSts` and `ExternalAuthTypeEmbeddedAuthServer` already expose via `MCPExternalAuthConfig`. By keeping both configurations in separate `MCPExternalAuthConfig` resources, existing RBAC policies that control who can read or modify auth configurations continue to apply without change.
 
-Potential threats remain the same as the existing STS path:
+Potential threats remain the same as the existing auth paths:
 - **Role escalation**: a misconfigured `roleMappings` could grant excessive AWS permissions. Mitigated by IAM policy controls on the role itself (independent of ToolHive).
 - **JWT claim manipulation**: if an attacker can forge JWT claims (e.g., `groups`), they could influence role selection. Mitigated by the embedded auth server signing keys protecting JWT integrity.
 
 ### Authentication and Authorization
 
 - The AWS STS middleware executes **after** the auth middleware has validated the incoming JWT. The authenticated identity is always established before role selection occurs.
-- Kubernetes RBAC controls who can create/modify `MCPExternalAuthConfig` resources containing IAM role ARNs, separate from who can modify the `MCPServer` resource itself.
+- Kubernetes RBAC controls who can create/modify `MCPExternalAuthConfig` resources containing IAM role ARNs, separate from who can modify the `MCPServer` or `MCPRemoteProxy` resources themselves.
 
 ### Data Security
 
@@ -231,32 +373,34 @@ Potential threats remain the same as the existing STS path:
 
 - **Role ARN**: the existing `awssts` package validates ARN format (`arn:aws:iam::<12-digit-account>:role/<name>`).
 - **Session duration**: the existing CEL rules on `MCPExternalAuthConfig.spec.awsSts` already constrain to [900, 43200] seconds.
-- **Type mismatch**: the controller validates at reconcile time that `awsStsConfigRef` points to `type: awsSts`. A misconfigured reference surfaces as a condition on `MCPServerStatus`.
+- **Type mismatch**: the controller validates at reconcile time that `authServerRef` points to `type: embeddedAuthServer`. A misconfigured reference surfaces as a condition on the resource's status.
+- **Conflict detection**: if both `authServerRef` and `externalAuthConfigRef` are set with `type: embeddedAuthServer`, the controller returns a validation error.
 
 ### Secrets Management
 
-No new secrets are introduced. The AWS SDK uses standard credential chain resolution (IRSA / pod identity) for the initial STS call; no static credentials are required.
+No new secrets are introduced. The AWS SDK uses standard credential chain resolution (IRSA / pod identity) for the initial STS call; no static credentials are required. The embedded auth server's signing keys and HMAC secrets continue to be referenced via `SecretKeyRef` in the `MCPExternalAuthConfig` resource.
 
 ### Audit and Logging
 
 - The proxy runner already logs AWS STS middleware activity (role selection, session name) at DEBUG level.
-- Reconciliation errors (e.g., type mismatch, same-resource conflict) surface as conditions on `MCPServer` status, visible via `kubectl describe`.
+- The proxy runner already logs embedded auth server activity at DEBUG level.
+- Reconciliation errors (e.g., type mismatch, dual embedded auth server conflict) surface as conditions on the resource status, visible via `kubectl describe`.
 
 ### Mitigations
 
-- Reconcile-time type validation prevents `awsStsConfigRef` from silently pointing to a non-STS auth config.
-- Same-resource conflict detection prevents `awsStsConfigRef` and `externalAuthConfigRef` from pointing to the same `MCPExternalAuthConfig`.
-- Change propagation via the `MCPExternalAuthConfig` controller ensures STS config updates are picked up by all referencing `MCPServer` resources.
+- Reconcile-time type validation prevents `authServerRef` from silently pointing to a non-embedded-auth-server config.
+- Conflict detection prevents `authServerRef` and `externalAuthConfigRef` from both configuring an embedded auth server on the same resource.
+- Change propagation via the `MCPExternalAuthConfig` controller ensures auth server config updates are picked up by all referencing `MCPServer` and `MCPRemoteProxy` resources.
 
 ## Alternatives Considered
 
-### Alternative 1: Inline `awsSts` Field on `MCPServerSpec`
+### Alternative 1: Add `awsStsConfigRef` to `MCPServerSpec`
 
-Add `AWSSts *AWSStsConfig` directly to `MCPServerSpec`, inlining the STS configuration rather than referencing a separate resource.
+Add a separate `awsStsConfigRef` field `MCPRemoteProxySpec` that references an `MCPExternalAuthConfig` of `type: awsSts`.
 
-- **Pros**: No cross-resource watch or `AWSStsConfigHash` tracking needed; CEL validates field constraints at admission time without API calls; atomic updates with the MCPServer spec.
-- **Cons**: Inconsistent with the existing `externalAuthConfigRef` pattern; cannot share one STS config across multiple `MCPServer` resources; diverges from the RBAC separation model used for other auth types (even though `AWSStsConfig` has no secrets today, inline placement changes how access control can be scoped).
-- **Why not chosen**: Consistency with the existing reference pattern and RBAC separation model outweighs the controller simplicity benefit.
+- **Pros**: Directly solves the combined auth problem; mirrors the `externalAuthConfigRef` pattern.
+- **Cons**: Doesn't address the conceptual conflation of embedded auth server with outgoing auth types in `externalAuthConfigRef`.
+- **Why not chosen**: The embedded auth server is the common element across both server and proxy resource types, so extracting it to a dedicated field is more natural and keeps AWS STS where it belongs (on remote proxies).
 
 ### Alternative 2: Allow Multiple `ExternalAuthConfigRef` Entries
 
@@ -279,62 +423,55 @@ Add a new `type: embeddedAuthServerWithAwsSts` or allow optional `awsStsConfig` 
 ### Backward Compatibility
 
 This change is fully backwards-compatible:
-- The new `awsStsConfigRef` field on `MCPServerSpec` is optional (`omitempty`). Existing `MCPServer` resources are unaffected.
-- The new `awsStsConfigHash` field on `MCPServerStatus` is optional. No existing status consumers are broken.
-- Existing `MCPExternalAuthConfig` resources with `type: awsSts` referenced via `externalAuthConfigRef` continue to work unchanged. No deprecation is introduced.
+- The new `authServerRef` field on `MCPServerSpec` and `MCPRemoteProxySpec` is optional (`omitempty`). Existing resources are unaffected.
+- The new `authServerConfigHash` field on `MCPServerStatus` and `MCPRemoteProxyStatus` is optional. No existing status consumers are broken.
+- Existing `MCPExternalAuthConfig` resources with `type: embeddedAuthServer` referenced via `externalAuthConfigRef` continue to work unchanged. No deprecation is introduced.
+- Existing `MCPExternalAuthConfig` resources with `type: awsSts` referenced via `externalAuthConfigRef` continue to work unchanged.
 - No changes to the `MCPExternalAuthConfig` CRD or its CEL validation rules.
+- No changes to `RunConfig`, the proxy runner, or the middleware pipeline.
 
 ### Forward Compatibility
 
-The separate-ref approach keeps `awsStsConfigRef` as a distinct named field. If other outgoing auth types need the same treatment in the future, the same pattern can be applied (e.g., a hypothetical `tokenExchangeConfigRef`).
+The `authServerRef` pattern cleanly separates the embedded auth server concern. If other incoming auth types emerge in the future, the same dedicated-ref approach can be extended. The `externalAuthConfigRef` field remains available for outgoing auth types like `awsSts`, `tokenExchange`, `headerInjection`, and `bearerToken`.
 
 ## Implementation Plan
 
 ### Phase 1: CRD, Controller Changes, and Unit Tests
 
-- Add `AWSStsConfigRef *ExternalAuthConfigRef` to `MCPServerSpec` in `cmd/thv-operator/api/v1alpha1/mcpserver_types.go`
-- Add `AWSStsConfigHash string` to `MCPServerStatus` in the same file
-- Add `AWSStsConfigRef *ExternalAuthConfigRef` to `MCPRemoteProxySpec` in `cmd/thv-operator/api/v1alpha1/mcpremoteproxy_types.go`
-- Add `AWSStsConfigHash string` to `MCPRemoteProxyStatus` in the same file
-- Add `AddAWSStsConfigRefOptions()` to `cmd/thv-operator/pkg/controllerutil/tokenexchange.go`
-- Update `cmd/thv-operator/controllers/mcpserver_runconfig.go` to resolve `awsStsConfigRef`, add same-resource conflict validation, and update `AWSStsConfigHash` in status
-- Update `cmd/thv-operator/controllers/mcpremoteproxy_runconfig.go` with the same `awsStsConfigRef` resolution logic
-- Update `cmd/thv-operator/controllers/mcpexternalauthconfig_controller.go` to include `awsStsConfigRef` in `ReferencingServers` tracking and reconciliation-trigger annotations for both `MCPServer` and `MCPRemoteProxy`
+- Add `AuthServerRef *ExternalAuthConfigRef` to `MCPServerSpec` in `cmd/thv-operator/api/v1alpha1/mcpserver_types.go`
+- Add `AuthServerConfigHash string` to `MCPServerStatus` in the same file
+- Add `AuthServerRef *ExternalAuthConfigRef` to `MCPRemoteProxySpec` in `cmd/thv-operator/api/v1alpha1/mcpremoteproxy_types.go`
+- Add `AuthServerConfigHash string` to `MCPRemoteProxyStatus` in the same file
+- Add `AddAuthServerRefOptions()` to `cmd/thv-operator/pkg/controllerutil/authserver.go`
+- Update `cmd/thv-operator/controllers/mcpserver_runconfig.go` to resolve `authServerRef`, add conflict validation (both fields pointing to embedded auth server), and update `AuthServerConfigHash` in status
+- Update `cmd/thv-operator/controllers/mcpremoteproxy_runconfig.go` with the same `authServerRef` resolution and conflict validation logic
+- Update `cmd/thv-operator/controllers/mcpexternalauthconfig_controller.go` to include `authServerRef` in `ReferencingServers` tracking and reconciliation-trigger annotations for both `MCPServer` and `MCPRemoteProxy`
 - Run `task gen` to regenerate CRD YAML and deepcopy functions
-- Unit tests for `AddAWSStsConfigRefOptions` (type validation, nil ref, error paths) in `cmd/thv-operator/pkg/controllerutil/`
-- Unit tests for the same-resource conflict validation path in `mcpserver_runconfig.go` and `mcpremoteproxy_runconfig.go`
+- Unit tests for `AddAuthServerRefOptions` (type validation, nil ref, error paths) in `cmd/thv-operator/pkg/controllerutil/`
+- Unit tests for the conflict validation path (both `authServerRef` and `externalAuthConfigRef` set to `type: embeddedAuthServer`) in `mcpserver_runconfig.go` and `mcpremoteproxy_runconfig.go`
+- Unit tests for the combined `authServerRef` + `externalAuthConfigRef` (type: awsSts) path in `mcpremoteproxy_runconfig.go`
 - Unit tests for the updated `ReferencingServers` listing logic in the MCPExternalAuthConfig controller
 
-### Phase 2: E2E Testing
+### Phase 2: Documentation
 
-E2E tests following the patterns in `test/e2e/`:
-
-- Deploy an `MCPServer` with both `externalAuthConfigRef` (type: embeddedAuthServer) and `awsStsConfigRef` (type: awsSts); verify the generated `runconfig.json` ConfigMap contains both `embedded_auth_server_config` and `aws_sts_config`
-- Verify that updating the referenced `awsSts` MCPExternalAuthConfig triggers MCPServer reconciliation and the ConfigMap is updated
-- Verify the conflict error condition is set on `MCPServerStatus` when `awsStsConfigRef` and `externalAuthConfigRef` point to the same resource
-- Verify the type-mismatch error condition is set when `awsStsConfigRef` points to a non-`awsSts` MCPExternalAuthConfig
-
-### Phase 3: Documentation
-
-- Update `docs/arch/09-operator-architecture.md` to describe the new field and its relationship to `externalAuthConfigRef`
+- Update `docs/arch/09-operator-architecture.md` to describe the new `authServerRef` field and its relationship to `externalAuthConfigRef`
 - Update operator CRD reference documentation
-- Update the corresponding documentation in the `stacklok/docs-website` repository to reflect the new `awsStsConfigRef` field and the combined embedded auth server + AWS STS configuration pattern
+- Update the corresponding documentation in the `stacklok/docs-website` repository to reflect the new `authServerRef` field and the combined embedded auth server + AWS STS configuration pattern for remote proxies
 
 ### Dependencies
 
-None. The proxy runner's `RunConfig` already supports both `EmbeddedAuthServerConfig` and `AWSStsConfig` simultaneously; no changes to `pkg/` are required.
+None. The proxy runner's `RunConfig` already supports both `EmbeddedAuthServerConfig` and `AWSStsConfig` simultaneously; no changes to `pkg/runner/` are required. The existing `AddEmbeddedAuthServerConfigOptions` function in `cmd/thv-operator/pkg/controllerutil/authserver.go` is reused by the new `AddAuthServerRefOptions` function.
 
 ## Testing Strategy
 
-- **Unit tests**: `AddAWSStsConfigRefOptions`, same-resource conflict validation, `ReferencingServers` listing logic update (all in Phase 1)
-- **E2E tests**: end-to-end verification of the combined configuration using the test patterns in `test/e2e/` (Phase 2)
-- **Security tests**: type-mismatch and same-resource conflict error conditions on `MCPServerStatus`
+- **Unit tests**: `AddAuthServerRefOptions`, conflict validation, combined auth server + AWS STS RunConfig generation, `ReferencingServers` listing logic update (all in Phase 1)
+- **Security tests**: type-mismatch and conflict error conditions on resource status
 
 ## Documentation
 
-- `docs/arch/09-operator-architecture.md`: describe the `spec.awsStsConfigRef` field and its role in the auth pipeline
+- `docs/arch/09-operator-architecture.md`: describe the `spec.authServerRef` field and its role in the auth pipeline
 - Operator CRD reference (auto-generated): regenerated via `task gen` + `task docs`
-- `stacklok/docs-website`: update operator authentication documentation to cover the combined embedded auth server + AWS STS configuration pattern
+- `stacklok/docs-website`: update operator authentication documentation to cover the combined embedded auth server + AWS STS configuration pattern on `MCPRemoteProxy`
 
 ## References
 
@@ -355,6 +492,7 @@ None. The proxy runner's `RunConfig` already supports both `EmbeddedAuthServerCo
 | Date | Reviewer | Decision | Notes |
 |------|----------|----------|-------|
 | 2026-03-06 | TBD | Under Review | Initial submission |
+| 2026-04-06 | TBD | Revision | Reworked: authServerRef replaces awsStsConfigRef approach |
 
 ### Implementation Tracking
 
