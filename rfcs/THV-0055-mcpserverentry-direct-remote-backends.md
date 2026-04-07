@@ -523,7 +523,7 @@ external TLS support.
 |--------|-------------|------------|
 | Man-in-the-middle on remote connection | Attacker intercepts vMCP-to-remote traffic | HTTPS required by default; custom CA bundles for private CAs |
 | Credential exposure in CRD spec | Auth secrets visible in CRD manifest | Credentials stored in K8s Secrets, referenced via `externalAuthConfigRef` and `headerForward.addHeadersFromSecrets`; never inline in CRD spec |
-| SSRF via remoteURL | Operator configures URL pointing to internal services | Mitigated by RBAC (only authorized users create MCPServerEntry); annotation required for non-HTTPS; NetworkPolicy should restrict vMCP egress. Note: CEL-based IP range blocking (e.g., RFC 1918) is intentionally not applied because MCPServerEntry legitimately targets internal/corporate MCP servers. RBAC is the appropriate control layer since resource creation is restricted to trusted operators. |
+| SSRF via remoteURL | Operator configures URL pointing to internal services | Mitigated by RBAC (only authorized users create MCPServerEntry); annotation required for non-HTTPS; NetworkPolicy should restrict vMCP egress. Note: CEL-based IP range blocking (e.g., RFC 1918) is intentionally not applied because MCPServerEntry legitimately targets internal/corporate MCP servers. RBAC is the appropriate control layer since resource creation is restricted to trusted operators. **Blast radius note:** With MCPRemoteProxy, outbound calls to remote URLs originate from an isolated proxy pod. With MCPServerEntry, those calls originate from the vMCP pod itself, which means a misconfigured `remoteURL` exposes vMCP's network position rather than a disposable proxy's. This is an intentional trade-off: the proxy pod's isolation was never a security boundary (it shares the same NetworkPolicy-governed namespace), but operators should be aware that vMCP's egress surface grows with each MCPServerEntry. Restricting vMCP egress via NetworkPolicy is strongly recommended. |
 | Auth config confusion (existing issue) | Dual-boundary auth leading to wrong tokens sent to wrong endpoints | Eliminated: MCPServerEntry has exactly one auth boundary with one purpose |
 | Operator probing external URLs | Controller making network requests to untrusted URLs | Eliminated: controller performs validation only, no network probing |
 
@@ -581,6 +581,15 @@ external TLS support.
     path (e.g., `/etc/toolhive/ca-bundles/<entry-name>/ca.crt`). The
     generated backend ConfigMap includes the mount path so vMCP can
     construct the `tls.Config` at startup.
+  - **Implementation note**: The VirtualMCPServer controller does not
+    currently mount arbitrary ConfigMaps as volumes, so this introduces
+    a new operator pattern. The controller will need to generate
+    per-entry volume and volumeMount entries in the vMCP Deployment spec,
+    and handle additions/removals of `caBundleRef` across MCPServerEntry
+    resources (which triggers a Deployment update and pod restart in
+    static mode). This is non-trivial but bounded... the same pattern
+    would be required by any solution that supports custom CA bundles,
+    including a `direct: true` flag on MCPRemoteProxy.
 - Secret rotation follows existing patterns:
   - **Dynamic mode**: Watch-based propagation, no pod restart needed.
   - **Static mode**: Requires pod restart (Deployment rollout).
