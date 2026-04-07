@@ -1,4 +1,4 @@
-# THV-XXXX: MCPRemoteEndpoint CRD — Unified Remote MCP Server Connectivity
+# THV-0067: MCPRemoteEndpoint CRD — Unified Remote MCP Server Connectivity
 
 - **Status**: Draft
 - **Author(s)**: @ChrisJBurns, @jaosorior
