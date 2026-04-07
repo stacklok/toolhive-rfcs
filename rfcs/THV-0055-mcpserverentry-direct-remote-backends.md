@@ -6,7 +6,7 @@
 - **Last Updated**: 2026-03-12
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3104](https://github.com/stacklok/toolhive/issues/3104), [toolhive#4109](https://github.com/stacklok/toolhive/issues/4109)
-- **Planned Deprecation**: This CRD will be superseded by `MCPRemoteEndpoint` (see RFC-XXXX) which unifies direct and proxy remote connectivity into a single resource. MCPServerEntry ships now to unblock near-term use cases; migration guidance will accompany the MCPRemoteEndpoint RFC.
+- **Planned Deprecation**: This CRD will be superseded by `MCPRemoteEndpoint` (see [THV-0067](./THV-0067-mcpremoteendpoint-unified-remote-backends.md)) which unifies direct and proxy remote connectivity into a single resource. MCPServerEntry ships now to unblock near-term use cases; migration guidance will accompany the MCPRemoteEndpoint RFC.
 
 ## Summary
 
