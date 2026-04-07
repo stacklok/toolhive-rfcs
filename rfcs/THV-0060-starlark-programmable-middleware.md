@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
 - **Created**: 2026-03-24
-- **Last Updated**: 2026-03-27
+- **Last Updated**: 2026-04-07
 - **Target Repository**: toolhive
 - **Related Issues**: [stacklok-epics#213](https://github.com/stacklok/stacklok-epics/issues/213)
 - **Related**: [THV-0051 (Starlark Scripted Tools)](./THV-0051-starlark-scripted-tools.md) — this RFC broadens the scope of Starlark in vMCP from composite tool workflows to a unified session initialization model
@@ -298,9 +298,14 @@ The programming model makes it straightforward to add new capabilities as simple
 
 | Built-in | Signature | Description |
 |----------|-----------|-------------|
-| `current_user()` | `current_user() → struct(sub, email, groups)` | Returns the authenticated user's identity. The user is known at init time, but this built-in is deferred to a future version. |
 | `scrub_pii(text)` | `scrub_pii(text) → string` | Redacts PII patterns (emails, phones, SSNs, credit cards) from text. |
-| `check_rate_limit(key, limit, window)` | `check_rate_limit(key, limit, window) → (bool, int)` | Checks a token bucket counter in Redis. Returns `(allowed, retry_after_seconds)`. |
+
+The following built-ins are planned for Phase 2 (backwards compatibility) and Phase 1 (proof of concept) respectively:
+
+| Built-in | Signature | Phase | Description |
+|----------|-----------|-------|-------------|
+| `current_user()` | `current_user() → struct(sub, email, groups)` | Phase 2 | Returns the authenticated user's identity. Returns the same value for the lifetime of the session — the user who created it. Needed for feature parity with existing identity-aware behavior. |
+| `check_rate_limit(key, limit, window)` | `check_rate_limit(key, limit, window) → (bool, int)` | Phase 1 (POC) | Checks a token bucket counter in Redis. Returns `(allowed, retry_after_seconds)`. Used to benchmark Starlark vs. native middleware performance. |
 
 ### Presets: Making it Easy for Non-Power-Users
 
@@ -541,10 +546,14 @@ Both coexist. A request passes through webhooks first (external policy), then re
 
 #### Interaction with rate limiting
 
-THV-0057's Redis-backed token bucket is the *mechanism*. A future `check_rate_limit()` built-in could expose it to scripts. Once available, the *policy* could be:
+THV-0057's Redis-backed token bucket ships first as standalone middleware, covering both `MCPServers` and `MCPRemoteProxy` endpoints. This gives us production data on usage patterns and performance before committing to a Starlark-based approach.
 
-1. **Config-driven**: The `default` preset reads `rateLimiting` from config and applies limits internally
-2. **Script-driven**: Custom scripts implement context-aware rate limiting using the built-in
+Once the middleware is stable, a `check_rate_limit()` built-in can expose the same Redis token bucket to Starlark scripts. The plan is to benchmark both implementations — middleware vs. Starlark built-in with the same backing mechanism — to compare implementation ease and performance. The results will inform how heavily we lean on Starlark for future capabilities.
+
+Once the built-in is available, the *policy* could be:
+
+1. **Config-driven**: The `default` preset reads `rateLimiting` from config and applies limits internally (same behavior as the standalone middleware)
+2. **Script-driven**: Custom scripts implement context-aware rate limiting using the built-in (e.g., role-based limits, per-backend policies)
 
 ### API Changes
 
@@ -591,6 +600,8 @@ type SessionInitConfig struct {
 - Handlers can dispatch to any discovered tool via saved references — same trust model as composite tools today
 
 **Trust model**: Session initialization scripts are written by administrators, not end users. An administrator who can write a Starlark script already has the authority to configure vMCP.
+
+**Identity-based filtering**: With `current_user()`, scripts can filter or shape tools based on user identity (e.g., `if "admin" in current_user().groups`). This is intentional and complementary to Cedar — there is no one-size-fits-all approach. Administrators who prefer declarative access control can continue using Cedar policies. Those who need something simpler or prefer an imperative approach can express it in the script. Both are valid and coexist.
 
 ### Data Security
 
@@ -716,47 +727,39 @@ New built-in functions can be added without breaking existing scripts. New prese
 
 ### Phase 1: Proof of concept
 
-A fast, rough POC to validate the high-level design. The goal is to prove the programming model works end-to-end and surface any surprises before committing to a production implementation.
+A fast, rough POC to answer two questions: *does the programming model work end-to-end?* and *is Starlark execution fast enough?*
 
 - Implement `backends()`, `publish()`, `metadata()` built-ins in the Starlark engine
 - Session factory runs the script and constructs `MultiSession` from `publish()` results
-- Implement the `default` preset that reads existing config knobs (`aggregation`, `optimizer`, etc.)
-- Run the Starlark engine alongside existing decorators for comparison testing
-- All existing tests must pass **except** those that test legacy composite tools (`compositeTools`, `compositeToolRefs`)
-- Update this RFC with any findings — design changes, missing built-ins, edge cases discovered
+- Implement `check_rate_limit()` built-in backed by the same Redis token bucket as THV-0057
+- Benchmark native Go middleware vs. Starlark built-in for rate limiting — same mechanism, same config surface, comparing implementation ease and performance overhead
+- Update this RFC with findings — design changes, missing built-ins, performance data
 
-### Phase 2: Safe capabilities
+### Phase 2: Backwards compatibility
 
-Ship the capabilities that don't interact with the authz boundary. These are the "safe" features that can be validated independently.
+Full feature parity with the existing config-driven system. This phase is substantial and will ship incrementally.
 
 - Production-quality `backends()`, `publish()`, `metadata()` built-ins
-- Name resolution, filtering, and overrides via the `default` preset
-- Rate limiting integration
-- `thv vmcp show-preset` command to inspect built-in presets
-- Config model: `sessionInit.preset`, `sessionInit.script`, `sessionInit.scriptFile`
-- Preset equivalence tests for the capabilities in scope
-- Remove the decorator code for features replaced in this phase
-
-### Phase 3: Optimizer + authz integration
-
-Ship the optimizer and authz capabilities together so the relationship between them is explicit. Today, the optimizer bypasses Cedar because handlers dispatch directly to backends ([#4374](https://github.com/stacklok/toolhive/issues/4374), interim fix in [PR #4385](https://github.com/stacklok/toolhive/pull/4385)). By shipping them together, the script can enforce Cedar policies on the tool set before the optimizer builds its dispatch table (e.g. `enforce_cedar_policies(all_published)`).
-
+- `current_user()` built-in for identity-aware policies
+- Name resolution, filtering, overrides, conflict resolution via the `default` preset
 - `search_index()` built-in ported from current optimizer implementation
-- Authz built-in (e.g. `enforce_cedar_policies()`) that filters the `(metadata, handler)` list
+- Authz built-in (e.g. `enforce_cedar_policies()`) shipped together with optimizer to avoid the [#4374](https://github.com/stacklok/toolhive/issues/4374) bypass (interim fix in [PR #4385](https://github.com/stacklok/toolhive/pull/4385))
 - Updated `default` preset with optimizer + authz integration
-- Preset equivalence tests for optimizer behavior
-- Remove remaining decorator code
-- The exact design of the authz built-ins will be detailed in a follow-up RFC
-
-### Phase 4: Deprecate composite tools, ship and document
-
-- Mark `compositeTools` and `compositeToolRefs` as deprecated
-- Log deprecation warnings when these fields are used
-- Document migration path from declarative composite tools to Starlark scripts
+- `thv vmcp list-presets` / `show-preset` commands
+- Config model: `sessionInit.preset`, `sessionInit.script`, `sessionInit.scriptFile`
+- Preset equivalence tests — all existing behavior reproduced identically
+- Mark `compositeTools` and `compositeToolRefs` as deprecated; log warnings; document migration path
+- Remove decorator code for replaced features
+- Documentation: user guide, built-in reference, migration guide
 - E2E tests for custom scripts in K8s via ConfigMap
-- Documentation: user guide, built-in reference, migration guide, advanced use cases
 
-New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of scope for this RFC. The programming model makes them straightforward to add as follow-up work.
+### Phase 3: New functionality
+
+Capabilities enabled by the programming model that don't exist today.
+
+- `scrub_pii()` built-in for response redaction
+- Code mode: tools and skills enabling LLMs to build Starlark workflows predictably within the sandbox
+- Additional built-ins as use cases emerge
 
 
 ## Testing Strategy
@@ -776,7 +779,7 @@ New built-in functions like `scrub_pii()` and `check_rate_limit()` are out of sc
 
 ## Open Questions
 
-1. **Sessionless MCP requests**: What happens when MCP supports requests without sessions? Do we have to run this heavy script on every request? We could actually run the script once at startup, since it does not depend on request-time information. However, if we fold in authz concerns from above, then `current_user()` will be request-time information. We could cheat around this by recommending all logic which depends on `current_user()` be placed at the end of the script. When that's encountered during startup, we block and restore the state on each request. Alternatively, we could support two different scripts. One for initialization and one per-request.
+1. **Sessionless MCP requests**: What happens when MCP supports requests without sessions? The current single-script model works well for session-scoped execution, but sessionless requests would require running the script per-request or once at startup. A promising direction is a two-hook model: `on_session_init()` for tool shape and presentation (runs once), `on_request()` for per-request concerns like rate limiting and user-specific filtering. This cleanly maps to the distinction the RFC already makes and would survive the sessionless transition without script-ordering footguns. We'll design the right model when concrete requirements emerge.
 
 ## References
 
