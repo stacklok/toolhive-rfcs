@@ -6,6 +6,7 @@
 - **Last Updated**: 2026-03-12
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#3104](https://github.com/stacklok/toolhive/issues/3104), [toolhive#4109](https://github.com/stacklok/toolhive/issues/4109)
+- **Planned Deprecation**: This CRD will be superseded by `MCPRemoteEndpoint` (see RFC-XXXX) which unifies direct and proxy remote connectivity into a single resource. MCPServerEntry ships now to unblock near-term use cases; migration guidance will accompany the MCPRemoteEndpoint RFC.
 
 ## Summary
 
@@ -74,10 +75,11 @@ infrastructure cost and operational overhead.
 
 ## Non-Goals
 
-- **Deprecating MCPRemoteProxy**: MCPRemoteProxy remains valuable for
+- **Replacing MCPRemoteProxy now**: MCPRemoteProxy remains valuable for
   standalone proxy use cases with its own auth middleware, audit logging,
   and observability. MCPServerEntry is specifically for "behind vMCP" use
-  cases.
+  cases. A future `MCPRemoteEndpoint` CRD will unify both direct and
+  proxy modes under a single resource.
 - **Adding health probing from the operator**: The operator controller
   should NOT probe remote URLs. Reachability from the operator pod does not
   imply reachability from the vMCP pod, and probing expands the operator's
@@ -721,8 +723,14 @@ MCPServerEntry is a purely additive change:
   breaking changes.
 - **API versioning**: Starts at `v1alpha1`, consistent with all other
   ToolHive CRDs.
-- **Future deprecation path**: If MCPRemoteProxy use cases are eventually
-  subsumed, MCPServerEntry provides a clean migration target.
+- **Planned supersession by MCPRemoteEndpoint**: MCPServerEntry will be
+  superseded by `MCPRemoteEndpoint`, a unified CRD that combines direct
+  connectivity (equivalent to MCPServerEntry) and proxy connectivity
+  (replacing MCPRemoteProxy) under a single `type` discriminator field.
+  MCPServerEntry ships now to unblock immediate use cases. When
+  MCPRemoteEndpoint reaches GA, MCPServerEntry will enter a deprecation
+  window with migration tooling. See the MCPRemoteEndpoint RFC for the
+  full design and migration plan.
 
 ## Implementation Plan
 
