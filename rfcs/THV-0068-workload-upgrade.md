@@ -1,4 +1,4 @@
-# RFC-XXXX: Workload Upgrade
+# RFC-0068: Workload Upgrade
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@jaosorior)
