@@ -181,9 +181,11 @@ Per-user limits work identically — each user gets their own bucket, keyed by i
 - Global per-prompt: `thv:rl:{namespace}:{server}:global:prompt:{promptName}`
 - Global per-resource: `thv:rl:{namespace}:{server}:global:resource:{resourceName}`
 - Per-user: `thv:rl:{namespace}:{server}:user:{userId}`
-- Per-user per-tool: `thv:rl:{namespace}:{server}:user:{userId}:tool:{toolName}`
-- Per-user per-prompt: `thv:rl:{namespace}:{server}:user:{userId}:prompt:{promptName}`
-- Per-user per-resource: `thv:rl:{namespace}:{server}:user:{userId}:resource:{resourceName}`
+- Per-user per-tool: `thv:rl:{namespace}:{server}:user-tool:{toolName}:{userId}`
+- Per-user per-prompt: `thv:rl:{namespace}:{server}:user-prompt:{promptName}:{userId}`
+- Per-user per-resource: `thv:rl:{namespace}:{server}:user-resource:{resourceName}:{userId}`
+
+Per-user per-operation keys use distinct prefixes (`user-tool:`, `user-prompt:`, `user-resource:`) rather than nesting under `user:{userId}:tool:...` to prevent key collisions when a `userId` contains delimiter characters (e.g., `:tool:`). The operation name precedes the userId so that the variable-length userId is always the terminal component.
 
 The `{namespace}` and `{server}` components are derived from the CRD metadata at middleware initialization time, never from per-request input.
 
