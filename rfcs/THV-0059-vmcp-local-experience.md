@@ -3,7 +3,7 @@
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
 - **Created**: 2026-03-24
-- **Last Updated**: 2026-03-24
+- **Last Updated**: 2026-04-14
 - **Target Repository**: toolhive
 - **Related Issues**: N/A
 
@@ -33,7 +33,8 @@ All ToolHive users who manage more than one MCP server locally are affected. The
 
 - Add a `thv vmcp` subcommand with `serve`, `validate`, and `init` sub-commands that integrate vMCP into the main CLI
 - Support a zero-config quickstart: `thv vmcp serve --group <name>` should work without a config file for simple aggregation
-- Bring the optimizer to the local experience with managed embedding service lifecycle (`--optimizer` flag auto-manages a TEI container)
+- Bring the optimizer to the local experience with managed embedding service lifecycle (`--optimizer-embedding` flag auto-manages a TEI container)
+- Deprecate and eventually remove the legacy standalone `mcp-optimizer` Python project (`StacklokLabs/mcp-optimizer`) once the native vMCP optimizer is stable
 - Maintain full feature parity with the standalone `vmcp` binary for users who need advanced configuration
 - Include vMCP in goreleaser so it ships with every ToolHive release (embedded in `thv` as a subcommand)
 - Document the library embedding pattern used by brood-box as an officially supported integration path
@@ -137,7 +138,7 @@ Flags:
       --optimizer                Enable the tool optimizer (FTS5 keyword search)
       --optimizer-embedding      Enable the optimizer with semantic search (auto-manages TEI container)
       --embedding-model string   HuggingFace model for semantic search (default: "BAAI/bge-small-en-v1.5")
-      --embedding-port int       Port for the embedding service container (default: 8384)
+      --embedding-image string   TEI container image (default: "ghcr.io/huggingface/text-embeddings-inference:cpu-latest")
 ```
 
 Two modes of operation:
@@ -197,16 +198,9 @@ Example output:
 name: "engineering-vmcp"
 groupRef: "engineering"
 
-# Backends discovered from group "engineering":
-# (These are auto-discovered at runtime from the group.
-#  Uncomment and modify only if you need static overrides.)
-# backends:
-#   - name: "github"
-#     url: "http://localhost:8080/mcp"
-#     transport: "streamable-http"
-#   - name: "jira"
-#     url: "http://localhost:8081/mcp"
-#     transport: "streamable-http"
+# Backends are auto-discovered at runtime from the group.
+# To modify backends, use `thv run` flags or group configuration
+# rather than overriding them here.
 
 aggregation:
   conflictResolution: prefix
@@ -311,7 +305,7 @@ type ServeConfig struct {
     Optimizer          bool   // Enable FTS5-only optimizer
     OptimizerEmbedding bool   // Enable optimizer with managed TEI container
     EmbeddingModel     string // HuggingFace model ID (default: BAAI/bge-small-en-v1.5)
-    EmbeddingPort      int    // TEI container port (default: 8384)
+    EmbeddingImage     string // TEI container image (default: ghcr.io/huggingface/text-embeddings-inference:cpu-latest)
 }
 
 // Serve starts a vMCP server with the given configuration.
@@ -419,8 +413,11 @@ thv vmcp serve --group default --optimizer-embedding
 
 # With custom model:
 thv vmcp serve --group default --optimizer-embedding \
-  --embedding-model BAAI/bge-small-en-v1.5 \
-  --embedding-port 8384
+  --embedding-model BAAI/bge-small-en-v1.5
+
+# With a GPU-accelerated image:
+thv vmcp serve --group default --optimizer-embedding \
+  --embedding-image ghcr.io/huggingface/text-embeddings-inference:turing-latest
 ```
 
 Lifecycle:
@@ -435,11 +432,11 @@ sequenceDiagram
 
     User->>THV: --optimizer-embedding
     THV->>Runtime: Start TEI container<br/>(ghcr.io/huggingface/text-embeddings-inference:cpu-latest)
-    Runtime->>TEI: Running on :8384
+    Runtime->>TEI: Running on :{random port}
     THV->>TEI: GET /health (poll until ready)
     Note over THV,TEI: TEI downloads model on first start<br/>(cached in named volume)
     TEI-->>THV: 200 OK
-    THV->>VMCP: Start with optimizer.embeddingService=http://localhost:8384
+    THV->>VMCP: Start with optimizer.embeddingService=http://localhost:{port}
     VMCP-->>User: Listening on :4483/mcp
 
     Note over User,VMCP: On shutdown (Ctrl+C / SIGTERM):
@@ -450,14 +447,14 @@ sequenceDiagram
 
 Implementation details:
 
-- **Container image**: `ghcr.io/huggingface/text-embeddings-inference:cpu-latest` (same image the K8s `EmbeddingServer` CRD uses)
-- **Container name**: `thv-embedding-<group>` (predictable, enables idempotent start/stop)
+- **Container image**: `ghcr.io/huggingface/text-embeddings-inference:cpu-latest` by default (same image the K8s `EmbeddingServer` CRD uses). Configurable via `--embedding-image` to support GPU-accelerated variants (e.g., `ghcr.io/huggingface/text-embeddings-inference:turing-latest` for CUDA) or architecture-specific images.
+- **Container name**: `thv-embedding-<model-short-hash>` (e.g., `thv-embedding-bge-sm-a1b2c3`), derived from a hash of the model name. This allows multiple vMCP instances using the same embedding model to share a single TEI container, avoiding unnecessary duplication. Different models get separate containers.
 - **Model cache**: Named volume `thv-embedding-model-cache` mounted at `/data` with `HF_HOME=/data`. This avoids re-downloading the model on every start (~130MB for `bge-small-en-v1.5`).
 - **Health check**: Poll `GET /health` with backoff until the TEI server reports ready. TEI must download and load the model on first start, which can take 30-60 seconds.
-- **Port binding**: Default `127.0.0.1:8384`. Chosen to avoid conflicting with the vMCP port (4483) or common dev ports.
-- **Lifecycle coupling**: The TEI container is started before the vMCP server and stopped after it shuts down. If the TEI container fails to start or becomes unhealthy, vMCP falls back to FTS5-only mode with a warning.
-- **Idempotent start**: If a `thv-embedding-<group>` container is already running (e.g., from a previous invocation), reuse it rather than creating a new one.
-- **Platform considerations**: The TEI CPU image is amd64. On ARM64 hosts (Apple Silicon), the container runs under emulation. A future enhancement could detect architecture and select an appropriate image variant.
+- **Port binding**: A random available port is allocated using ToolHive's existing `pkg/networking.FindAvailable()` pattern (the same mechanism `thv run` uses when no explicit port is given). The allocated port is reported in the logs. This avoids conflicts when multiple vMCP instances or other services are running.
+- **Lifecycle coupling**: The TEI container is started before the vMCP server and stopped after it shuts down. If the TEI container fails to start or become healthy when `--optimizer-embedding` was explicitly requested, `thv vmcp serve` exits with a clear error message. The `--optimizer-embedding` flag is a clear signal that the user wants semantic search — silently degrading to FTS5-only would mask environment issues (Docker not running, port conflicts, etc.) and produce confusingly poor results. Users who want keyword-only search should use `--optimizer` explicitly.
+- **Idempotent start**: If a TEI container with the matching name and ToolHive labels is already running (e.g., from a previous invocation or another vMCP instance with the same model), reuse it rather than creating a new one.
+- **Platform considerations**: The TEI CPU image is amd64-only. On ARM64 hosts (Apple Silicon), Docker Desktop handles this automatically via Rosetta 2 emulation — no `--platform` flag is needed. The overhead is roughly 5-15% for CPU-bound workloads, which is acceptable for embedding generation. The `--embedding-image` flag lets users select architecture-native images when available, making architecture management the user's responsibility rather than requiring auto-detection logic.
 
 **Tier 3: Full config control**
 
@@ -496,17 +493,15 @@ A new component in `pkg/vmcp/cli/` manages the TEI container lifecycle:
 ```go
 // EmbeddingServiceConfig holds parameters for the managed embedding container.
 type EmbeddingServiceConfig struct {
-    Image    string // default: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
-    Model    string // default: BAAI/bge-small-en-v1.5
-    Port     int    // default: 8384
-    GroupRef string // used in container name: thv-embedding-<group>
+    Image string // default: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    Model string // default: BAAI/bge-small-en-v1.5
 }
 
 // EmbeddingServiceManager manages the lifecycle of a local TEI container.
 type EmbeddingServiceManager struct { ... }
 
 // Start launches (or reuses) the TEI container and waits for readiness.
-// Returns the embedding service URL.
+// Returns the embedding service URL (with a dynamically allocated port).
 func (m *EmbeddingServiceManager) Start(ctx context.Context) (string, error) { ... }
 
 // Stop gracefully stops the TEI container.
@@ -514,6 +509,8 @@ func (m *EmbeddingServiceManager) Stop(ctx context.Context) error { ... }
 ```
 
 This uses ToolHive's existing container runtime abstraction (`pkg/container/`) to manage the TEI container, keeping it consistent with how `thv run` manages MCP server containers.
+
+**Container labels for lifecycle ownership**: The TEI container is labeled using ToolHive's existing `pkg/labels/` system — specifically the `toolhive` label (marks it as ToolHive-managed) and the `toolhive-auxiliary` label (marks it as an auxiliary workload, similar to how the inspector container is labeled). This lets `thv` query by label to determine whether an existing TEI container is ToolHive-managed (safe to reuse/stop) or user-managed (hands off). On startup, the manager checks for a running container matching the expected name and labels — if one exists and is healthy, it reuses it; if one exists without the `toolhive` label, it assumes the user is managing their own TEI and does not touch it.
 
 #### API Changes
 
@@ -682,6 +679,7 @@ The `thv vmcp` subcommand introduces no new attack surface beyond what the stand
 - **Outgoing auth**: Per-backend authentication strategies (header injection, token exchange, unauthenticated) configured via the config file. Quick mode defaults to unauthenticated.
 - **Cedar authorization**: When configured, Cedar policies gate access to individual tools and resources. The library embedding path (brood-box) demonstrates this with `observe`, `safe-tools`, and `full-access` profiles.
 - **No privilege escalation**: The `thv vmcp` subcommand runs with the same privileges as the invoking user. No root or elevated permissions required.
+- **Unix socket transport (future)**: For local single-user scenarios, a Unix socket transport (similar to `thv serve --socket`) would sidestep port-binding and auth concerns entirely, relying on filesystem permissions for access control. This is a natural follow-up but out of scope for this RFC.
 
 ### Data Security
 
@@ -718,7 +716,7 @@ The `thv vmcp` subcommand introduces no new attack surface beyond what the stand
 - Quick mode generates a conservative default config (anonymous auth, prefix conflict resolution) that is safe for local single-user scenarios.
 - Library consumers are guided toward infrastructure encapsulation and anti-corruption layers, reducing the risk of misusing internal vmcp APIs.
 - The managed TEI container binds to `127.0.0.1` only, uses the same container isolation as other ToolHive workloads, and downloads models exclusively from HuggingFace Hub (verified models).
-- If the TEI container becomes unhealthy, vMCP degrades gracefully to FTS5-only search rather than failing entirely.
+- If the TEI container fails to start when `--optimizer-embedding` was explicitly requested, `thv vmcp serve` exits with a clear error rather than silently degrading. Users who want keyword-only search should use `--optimizer` instead.
 
 ## Alternatives Considered
 
@@ -783,9 +781,9 @@ The `thv vmcp` subcommand introduces no new attack surface beyond what the stand
 ### Phase 4: Local Optimizer Support
 
 - Implement `--optimizer` flag (FTS5-only, no container management — config wiring only)
-- Implement `EmbeddingServiceManager` in `pkg/vmcp/cli/` for TEI container lifecycle
-- Implement `--optimizer-embedding` flag with container start/stop, health polling, and graceful fallback
-- Add `--embedding-model` and `--embedding-port` flags
+- Implement `EmbeddingServiceManager` in `pkg/vmcp/cli/` for TEI container lifecycle with `pkg/labels/` integration for ownership tracking
+- Implement `--optimizer-embedding` flag with container start/stop, health polling, and fail-fast on TEI failure
+- Add `--embedding-model` and `--embedding-image` flags
 - Add named volume management for model caching
 - Add E2E tests for optimizer tiers (FTS5-only, managed TEI, config-file TEI)
 
@@ -815,7 +813,7 @@ The `thv vmcp` subcommand introduces no new attack surface beyond what the stand
 - **Optimizer tests**:
   - FTS5-only: `thv vmcp serve --group default --optimizer` -> client sees only `find_tool`/`call_tool` -> `find_tool` discovers backend tools by keyword
   - Managed TEI: `thv vmcp serve --group default --optimizer-embedding` -> TEI container starts -> `find_tool` performs semantic search -> on shutdown, TEI container stops
-  - Fallback: TEI container fails to start -> vMCP falls back to FTS5-only with warning
+  - Fail-fast: TEI container fails to start -> `thv vmcp serve --optimizer-embedding` exits with a clear error
   - Idempotent: Running `thv vmcp serve --optimizer-embedding` twice reuses the existing TEI container
 - **Regression tests**: Verify that the standalone `vmcp serve` command still works identically after the refactor.
 - **Security tests**: Verify that quick mode binds to `127.0.0.1` only, that strict YAML parsing rejects unknown fields, and that HMAC session binding is enforced when configured.
@@ -826,6 +824,8 @@ The `thv vmcp` subcommand introduces no new attack surface beyond what the stand
 - **Architecture documentation**: `docs/arch/vmcp-local.md` covering local deployment, `docs/arch/vmcp-library.md` covering the library embedding pattern with brood-box as reference
 - **Examples**: `examples/vmcp-local-quickstart/` with a minimal setup, `examples/vmcp-advanced/` with auth, composite tools, and telemetry
 - **Existing docs updates**: Update `docs/arch/10-virtual-mcp-architecture.md` to reference the new CLI integration and library embedding path
+- **Docs website**: Update the ToolHive docs website to reflect the new `thv vmcp` subcommand and local optimizer story
+- **Legacy mcp-optimizer**: Once the native vMCP optimizer (Phase 4) is stable and documented, deprecate and archive the standalone `mcp-optimizer` Python project (`StacklokLabs/mcp-optimizer`). Remove references from the docs website and registry.
 
 ## Open Questions
 
@@ -841,9 +841,11 @@ The `thv vmcp` subcommand introduces no new attack surface beyond what the stand
 
 6. **TEI container lifecycle on crash**: If `thv vmcp serve` is killed ungracefully (SIGKILL, OOM), the TEI container will be left running. Should a cleanup mechanism be added (e.g., check for orphaned `thv-embedding-*` containers on startup)?
 
-7. **GPU support for TEI**: The default `cpu-latest` image works everywhere but is slower. Should `--optimizer-embedding` detect GPU availability and select a GPU-accelerated TEI image variant (e.g., `ghcr.io/huggingface/text-embeddings-inference:latest` for CUDA)?
+7. **GPU support for TEI**: The `--embedding-image` flag lets users select a GPU-accelerated TEI image variant (e.g., `ghcr.io/huggingface/text-embeddings-inference:turing-latest` for CUDA). Should `thv` also auto-detect GPU availability and suggest an appropriate image?
 
 8. **Embedding model recommendations**: Should `thv vmcp init` or docs recommend specific models for different use cases (small/fast vs. large/accurate)?
+
+9. **K8s dependency isolation (optional)**: The `thv` binary already transitively pulls `k8s.io/client-go` and `sigs.k8s.io/controller-runtime` through `pkg/container/kubernetes/`, so importing `pkg/vmcp/` does not introduce new module dependencies. However, the K8s-specific vMCP packages (`pkg/vmcp/k8s/`, `pkg/vmcp/workloads/k8s.go`) include code that is never activated in CLI mode. Gating these behind build tags or interfaces could reduce dead code in the `thv` binary, but this is a cleanup item rather than a blocker.
 
 ## References
 
