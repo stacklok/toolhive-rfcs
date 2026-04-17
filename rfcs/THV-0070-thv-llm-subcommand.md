@@ -1,4 +1,4 @@
-# RFC-0058: `thv llm` Subcommand for LLM Gateway Authentication
+# RFC-0070: `thv llm` Subcommand for LLM Gateway Authentication
 
 - **Status**: Draft
 - **Author(s)**: Jeremy Drouillard (@jerm-dro)
