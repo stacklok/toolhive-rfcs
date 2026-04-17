@@ -104,16 +104,17 @@ To reverse the configuration:
 $ thv llm teardown
 ```
 
-This restores each tool's original configuration from backups, stops the background
-proxy if running, and optionally purges cached OIDC tokens with `--purge-tokens`.
-Teardown can also target specific tools: `thv llm teardown cursor`.
+This removes the LLM gateway configuration from each tool's config file, stops the
+background proxy if running, and optionally purges cached OIDC tokens with
+`--purge-tokens`. Teardown can also target specific tools:
+`thv llm teardown cursor`.
 
 ### Command Structure
 
 ```
 thv llm
 ├── setup          # Detect tools, configure them, start proxy, trigger OIDC login
-├── teardown       # Reverse setup — restore configs, stop proxy
+├── teardown       # Reverse setup — remove added config keys, stop proxy
 ├── config
 │   ├── set        # Manually adjust gateway URL, OIDC settings, ports
 │   ├── show       # Display current LLM config (text or JSON)
@@ -128,52 +129,15 @@ thv llm
 - **`setup` / `teardown`** are the primary commands most users interact with. They
   handle the full lifecycle.
 - **`config set/show/reset`** give advanced users manual control over gateway
-  connection settings without re-running setup. Useful for changing the gateway URL,
-  adjusting OIDC scopes, or switching environments.
+  connection settings. Both `setup` and `config set` write to the same config —
+  they are two paths to configure the `thv llm` commands. `config set` does not
+  modify running proxy instances or already-wired tool configs.
 - **`proxy start`** runs the proxy in the foreground with full log output. This is a
   debugging tool — when something isn't working, running the proxy interactively
   lets the developer see request/response flow and token acquisition in real time.
 - **`token`** is a hidden subcommand. It is not intended to be called by users
   directly — it exists as the target for tool-specific token helpers
   (`apiKeyHelper`, `auth.command`). It prints a single JWT to stdout and exits.
-
-### High-Level Design
-
-```mermaid
-flowchart TD
-    subgraph "thv llm setup"
-        S[Setup] --> D[Detect installed tools]
-        D --> CD[Configure Direct tools<br/>Claude Code]
-        D --> CP[Configure Proxy tools<br/>Cursor]
-        CD --> HS[Write helper script<br/>→ thv llm token]
-        CP --> SP[Start background proxy]
-        S --> OL[Trigger OIDC login]
-    end
-
-    subgraph "Token Source"
-        TS[TokenSource]
-        TS --> |1| MC[In-memory cache]
-        TS --> |2| SR[Secrets provider<br/>restore refresh token]
-        TS --> |3| BF[Browser OIDC+PKCE flow]
-    end
-
-    subgraph "Direct Mode — OIDC-capable tools"
-        CC[Claude Code] --> |apiKeyHelper| TH[thv llm token]
-        TH --> TS
-        TH --> |JWT to stdout| CC
-        CC --> |Authorization: Bearer JWT| GW[LLM Gateway]
-    end
-
-    subgraph "Proxy Mode — Static-key tools"
-        CU[Cursor] --> |static key + request| PX[Localhost Proxy :14000]
-        PX --> |strip auth| PX
-        PX --> TS
-        PX --> |inject Bearer JWT| GW
-    end
-```
-
-Both modes share the same `TokenSource` and OIDC session. A single browser login
-covers all configured tools.
 
 ### Token Source
 
@@ -183,8 +147,8 @@ strategy:
 1. **In-memory cache** — If a valid (non-expired) access token exists in memory,
    return it immediately. No I/O, no network.
 2. **Secrets provider restore** — If no in-memory token exists, attempt to load the
-   refresh token from the secrets provider (OS keyring or encrypted file, under the
-   `ScopeLLM` prefix). Use it to obtain a fresh access token from the OIDC provider.
+   refresh token from the secrets provider (OS keyring or encrypted file). Use it to
+   obtain a fresh access token from the OIDC provider.
 3. **Browser OIDC+PKCE flow** — If no refresh token is available (first login or
    revoked), launch an authorization code flow with PKCE (S256) via the system
    browser. The user authenticates, and both access and refresh tokens are returned.
@@ -246,10 +210,12 @@ exits. It is the integration point for OIDC-capable tools:
 - **Codex CLI**: configured via `auth.command` — same pattern.
 - **avante.nvim**: configured via a `cmd:` prefix in the API key field.
 
-The command runs non-interactively: it will use cached or refreshed tokens but will
-not launch a browser flow. During execution, stdout is reserved exclusively for the
-JWT — all other output (update checks, warnings, progress) is redirected to stderr
-to prevent corrupting the token value.
+The token helper is the preferred integration mode — it does not require the
+background proxy to be running and handles token lifecycle independently. The command
+runs non-interactively: it will use cached or refreshed tokens but will not launch a
+browser flow. During execution, stdout is reserved exclusively for the JWT — all
+other output (update checks, warnings, progress) is redirected to stderr to prevent
+corrupting the token value.
 
 ### Setup and Teardown
 
@@ -262,7 +228,7 @@ directories and files. Each supported tool defines:
   `~/.claude/settings.json` or `~/.claude/` exist?).
 - **Apply** — How to configure the tool to use the gateway (what config keys to set,
   what values).
-- **Revert** — How to restore the tool's original configuration on teardown.
+- **Revert** — How to remove the configuration added by setup on teardown.
 
 #### Two Tool Kinds
 
@@ -365,7 +331,6 @@ llm:
   proxy:
     listen_port: 14000
   auth:
-    cached_refresh_token_ref: "__thv_llm_llm-refresh-token"
     cached_token_expiry: "2026-04-17T12:00:00Z"
   configured_tools:
     - tool: claude-code
@@ -400,8 +365,7 @@ type LLMProxyConfig struct {
 }
 
 type LLMAuthState struct {
-    CachedRefreshTokenRef string    `yaml:"cached_refresh_token_ref"`
-    CachedTokenExpiry     time.Time `yaml:"cached_token_expiry"`
+    CachedTokenExpiry time.Time `yaml:"cached_token_expiry"`
 }
 
 type LLMToolConfig struct {
@@ -432,9 +396,6 @@ pkg/llm/
     ├── token_source.go           # 3-tier OIDC token acquisition
     ├── token_source_test.go
     └── validate.go               # Loopback address validation
-
-pkg/secrets/
-└── scoped.go                     # ScopeLLM constant (addition to existing file)
 
 cmd/thv/app/
 └── llm.go                        # CLI commands: setup, teardown, config, proxy start, token
@@ -475,8 +436,7 @@ proxy misuse. The attack surface is:
 - **Access tokens** are held in memory only and never written to disk or logged.
 - **Refresh tokens** are stored in the OS keyring (macOS Keychain, Linux
   Secret Service) via the secrets provider, falling back to AES-256-GCM encrypted
-  file storage. They are stored under the `ScopeLLM` prefix (`__thv_llm_`),
-  isolated from user-managed secrets.
+  file storage.
 - **Token values are never logged** — log messages reference token metadata (expiry,
   scope) but never the token string itself.
 
@@ -491,12 +451,21 @@ proxy misuse. The attack surface is:
 
 ### Secrets Management
 
-- Refresh tokens are stored via ToolHive's existing secrets provider under the
-  `ScopeLLM` scope, leveraging the scoped secret store (RFC-0056).
+- Refresh tokens are stored via ToolHive's existing secrets provider.
 - Tokens are revocable — `thv llm config reset` and `thv llm teardown --purge-tokens`
   delete cached tokens from the secrets provider.
 - The `thv llm token` command redirects all non-token output to stderr, preventing
   accidental token leakage into log files or terminal scrollback.
+
+### Audit and Logging
+
+Basic audit logging for security-relevant operations:
+
+- **Proxy**: Logs each proxied request (method, path, upstream status code) without
+  logging token values or request/response bodies.
+- **Token execution**: Logs token acquisition events (cache hit, refresh, browser
+  flow triggered) and failures, with token expiry metadata but never the token itself.
+- **Setup/teardown**: Logs which tools were detected, configured, and removed.
 
 ### Mitigations
 
@@ -565,7 +534,7 @@ Build the foundational components that all commands depend on:
   file locking, stored in `config.yaml` under the `llm:` key — the same persistence
   pattern used by runtime configs and registry auth.
 - **Token source** — Three-tier acquisition in `pkg/llm/internal/token_source.go`.
-  Refresh tokens stored via the secrets provider under `ScopeLLM`.
+  Refresh tokens stored via the secrets provider.
 - **Reverse proxy** — `pkg/llm/internal/proxy.go` with token injection, SSE
   streaming, loopback validation, health endpoint.
 - **CLI commands** — `config set/show/reset`, `proxy start` (foreground), `token`
@@ -589,11 +558,10 @@ Build the tool detection and auto-configuration layer on top of Phase 1:
 
 ### Dependencies
 
-- [RFC-0056: Scoped Secret Store](THV-0056-scoped-secret-store.md) — The `ScopeLLM`
-  secret scope for isolated token storage.
 - Existing `pkg/auth/oauth` — OIDC authorization code flow with PKCE.
 - Existing `pkg/secrets/` — Secrets provider (keyring + encrypted file fallback).
 - Existing `pkg/config/` — Config loading, saving, and file-locked updates.
+- Existing `pkg/client/` — Client config editing infrastructure.
 
 ## Testing Strategy
 
@@ -631,13 +599,18 @@ orchestration tests are needed when adding a new tool.
 - Setup/teardown round-trip: run setup, verify tool configs are patched, run
   teardown, verify added keys are removed.
 
+## Documentation
+
+CLI help text for all `thv llm` commands. No additional user documentation in this
+initial iteration.
+
 ## Open Questions
 
 1. What is the priority of additional tool support beyond Claude Code and Cursor?
 
 ## References
 
-- [RFC-0056: Scoped Secret Store](THV-0056-scoped-secret-store.md)
+None.
 
 ---
 
