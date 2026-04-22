@@ -64,6 +64,14 @@ developers already use. It is the natural home for solving this problem.
   illustrate the two authentication modes (direct token helper and proxy
   respectively). Support for additional tools will be evaluated on a case-by-case
   basis.
+- Unified single sign-on across MCP and LLM gateway authentication — the OIDC flows
+  for MCP tool authentication and LLM gateway access are fundamentally different.
+  Unifying them into a single login would add significant complexity. Two separate
+  logins is acceptable for now.
+- HTTP API exposure — the config model and core logic are designed to be reusable,
+  but this RFC does not define API endpoints for managing LLM gateway configuration.
+  Exposing these settings via the HTTP API (e.g., for UI-driven setup) is future
+  work.
 
 ## Proposed Solution
 
