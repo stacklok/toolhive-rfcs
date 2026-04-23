@@ -1,4 +1,4 @@
-# RFC-XXXX: Client ID Metadata Document (CIMD) Support
+# RFC-0071: Client ID Metadata Document (CIMD) Support
 
 - **Status**: Draft
 - **Author(s)**: Muhammad Amir Ejaz (@amirejaz)
