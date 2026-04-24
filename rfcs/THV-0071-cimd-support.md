@@ -152,7 +152,7 @@ The document above must be publicly reachable at `https://toolhive.dev/oauth/cli
 - `Content-Type: application/json` — `application/<custom>+json` variants are also acceptable per spec, but `application/json` is the conventional choice
 - High availability — this URL is on the authorization hot path; downtime blocks `thv run` from authenticating against any CIMD-supporting server
 
-**Note on response size:** The IETF draft recommends document producers keep responses under 5 KB. As a consumer, ToolHive's fetch code enforces a 10 KB hard cap as a defence-in-depth measure to reject maliciously large responses — these are distinct limits with different purposes.
+**Note on response size:** The IETF draft recommends document producers keep responses under 5 KB. As a consumer, ToolHive's fetch code enforces a 10 KB hard cap as a defense-in-depth measure to reject maliciously large responses — these are distinct limits with different purposes.
 
 **Note on `Cache-Control`:** The IETF draft says authorization servers SHOULD respect HTTP cache headers when present, but does not mandate any specific `Cache-Control` directive from the server side. The toolhive.dev hosting should set a reasonable `Cache-Control: max-age` (e.g. 300–3600 seconds) to reduce fetch frequency from authorization servers that honour it.
 
@@ -250,7 +250,7 @@ func ValidateClientMetadataDocument(doc *ClientMetadataDocument, fetchedFrom str
 
 **`pkg/auth/oauth/ssrf.go`** (new file):
 
-Extracts SSRF protection as a reusable utility. Resolves the hostname via DNS, then rejects if any resolved IP falls within RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8, ::1), or link-local (169.254.0.0/16, fe80::/10) ranges. The check runs against the IP used for the actual connection to block DNS-rebinding attacks. A one-hop redirect limit applies; redirect destinations are subject to the same IP validation.
+Extracts SSRF protection as a reusable utility. Resolves the hostname via DNS, then allows connections only to globally routable destination IPs — any resolved or connected IP in a non-public or special-use range is rejected. This includes RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10), and IPv6 Unique Local Addresses (fc00::/7). The check runs against the IP used for the actual connection to block DNS-rebinding attacks. A one-hop redirect limit applies; redirect destinations are subject to the same IP validation.
 
 **`pkg/authserver/storage/cimd_decorator.go`** (new file):
 
@@ -362,8 +362,8 @@ CIMD documents are intentionally public — they contain no credentials. Trust i
 ### Input Validation
 
 - CIMD URLs must use the `https` scheme. `http://` is rejected except for `http://localhost` in test/development environments.
-- Any non-200 HTTP response from the metadata URL is treated as an error and not parsed. ToolHive will not attempt to parse or cache non-200 bodies.
-- Response bodies are capped at 10 KB before any parsing occurs. The spec recommends document producers stay under 5 KB; our 10 KB cap is a consumer-side defence-in-depth measure.
+- ToolHive may follow an HTTP redirect from the metadata URL, but only up to one hop. Only the final response is parsed or cached, and it must be HTTP 200; if the redirect limit is exceeded or the final response is non-200, the fetch fails.
+- Response bodies are capped at 10 KB before any parsing occurs. The spec recommends document producers stay under 5 KB; our 10 KB cap is a consumer-side defense-in-depth measure.
 - `client_id` in the fetched document must exactly equal the URL it was fetched from — strict string comparison with no normalization.
 - JSON deserialization uses `encoding/json`; unknown fields are silently ignored.
 - `redirect_uris` must use `http://localhost`, `http://127.0.0.1`, `http://[::1]`, or `https://` schemes. Other schemes are rejected.
