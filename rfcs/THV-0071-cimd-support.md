@@ -126,8 +126,7 @@ CachedCIMDClientID string // set when CIMD was used; avoids re-detection on rest
   "client_uri": "https://github.com/stacklok/toolhive",
   "application_type": "native",
   "redirect_uris": [
-    "http://localhost/callback",
-    "http://localhost:8855/callback"
+    "http://localhost:8666/callback"
   ],
   "grant_types": ["authorization_code", "refresh_token"],
   "response_types": ["code"],
@@ -135,7 +134,7 @@ CachedCIMDClientID string // set when CIMD was used; avoids re-detection on rest
 }
 ```
 
-`application_type: "native"` correctly classifies ToolHive as a native CLI application. Two redirect URIs are included: `http://localhost/callback` for port-agnostic loopback matching (RFC 8252 §7.3) and `http://localhost:8855/callback` as a fixed-port fallback. `thv run` binds to port 8855 by default and falls back to an OS-assigned port if unavailable.
+`application_type: "native"` correctly classifies ToolHive as a native CLI application. The redirect URI uses port 8666, which is the default callback port defined in `pkg/auth/remote/config.go` (`DefaultCallbackPort = 8666`) and configurable via `--remote-auth-callback-port`. The redirect URI registered during the OAuth flow is constructed as `http://localhost:8666/callback`.
 
 #### Hosting the Client Metadata Document
 
