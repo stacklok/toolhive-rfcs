@@ -9,7 +9,7 @@
 
 ## Summary
 
-The MCP specification (2025-11-25) defines a clear client registration priority: pre-registered credentials → CIMD → DCR → user prompt. ToolHive currently supports only DCR. CIMD is the spec-preferred mechanism and eliminates the registration round-trip that DCR requires. This RFC adds CIMD support on both sides of the ToolHive proxy: as an authorization server accepting CIMD from MCP clients, and as an OAuth client preferring CIMD when connecting to remote MCP servers.
+The MCP specification (2025-11-25) defines a clear client registration priority: pre-registered credentials → CIMD → DCR → user prompt. The spec says clients supporting all options SHOULD follow this order. ToolHive currently supports only DCR. CIMD is the spec-preferred mechanism and eliminates the registration round-trip that DCR requires. This RFC adds CIMD support on both sides of the ToolHive proxy: as an authorization server accepting CIMD from MCP clients, and as an OAuth client preferring CIMD when connecting to remote MCP servers.
 
 ## Problem Statement
 
@@ -88,7 +88,7 @@ type AuthServerInfo struct {
 }
 ```
 
-`PerformOAuthFlow` is updated to follow the new registration priority:
+`PerformOAuthFlow` is updated to follow the new registration priority. All CIMD flows must use PKCE with `code_challenge_method=S256` — PKCE is mandatory per MCP 2025-11-25 and is orthogonal to the client registration method:
 
 ```go
 switch {
@@ -98,6 +98,7 @@ case hasCachedCredentials(config):
 case info.ClientIDMetadataDocumentSupported:
     // CIMD: use our metadata URL as client_id directly; no registration call needed
     config.ClientID = cimd.ToolHiveClientMetadataDocumentURL
+    // PKCE (S256) is required regardless of registration method
 
 default:
     // DCR fallback
@@ -107,9 +108,11 @@ default:
 }
 ```
 
+`client_id_metadata_document_supported` is parsed from the AS discovery document regardless of which discovery format was used to locate the AS (RFC 8414 or OIDC `.well-known/openid-configuration`).
+
 **`pkg/auth/remote/handler.go`** (modified):
 
-If the AS rejects the CIMD `client_id` with an `invalid_client` error, the handler retries the authorization flow using DCR — graceful fallback per issue #4826 acceptance criteria.
+If the AS rejects the CIMD `client_id` at the authorization request stage, the handler retries using DCR. The retry triggers on any of the following conditions: an `invalid_client` or `unauthorized_client` OAuth error code, an `invalid_request` error, or a raw HTTP 400/401 with no parseable error body. The fallback does not trigger at the token exchange stage — if authorization succeeds but token exchange fails, that is a separate error condition.
 
 **`pkg/auth/remote/config.go`** (modified):
 
@@ -243,13 +246,19 @@ type ClientMetadataDocument struct {
 func FetchClientMetadataDocument(ctx context.Context, rawURL string) (*ClientMetadataDocument, error)
 
 // ValidateClientMetadataDocument validates required fields, redirect_uri schemes,
-// and enforces self-referential binding: doc.ClientID must exactly equal fetchedFrom.
+// and enforces self-referential binding: doc.ClientID must equal fetchedFrom after
+// RFC 3986 canonical normalization (lowercase scheme/host, decode unreserved chars,
+// strip default ports).
 func ValidateClientMetadataDocument(doc *ClientMetadataDocument, fetchedFrom string) error
 ```
 
 **`pkg/auth/oauth/ssrf.go`** (new file):
 
-Extracts SSRF protection as a reusable utility. Resolves the hostname via DNS, then allows connections only to globally routable destination IPs — any resolved or connected IP in a non-public or special-use range is rejected. This includes RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10), and IPv6 Unique Local Addresses (fc00::/7). The check runs against the IP used for the actual connection to block DNS-rebinding attacks. A one-hop redirect limit applies; redirect destinations are subject to the same IP validation.
+Extracts SSRF protection as a reusable utility. Rather than maintaining a blocklist, the implementation uses `net.IP.IsGlobalUnicast()` as the primary allowlist — only globally routable IPs are permitted. This automatically covers all current and future special-use ranges without needing exhaustive enumeration. For completeness, the following ranges are explicitly blocked: RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10), IPv6 ULA (fc00::/7), shared address space (100.64.0.0/10), IPv4-mapped IPv6 addresses (::ffff:0:0/96), and documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24).
+
+The check is enforced via a custom `http.Transport` with a `DialContext` hook that validates the resolved IP before completing the connection — this is the IP actually used for the connection, not a separately-resolved address. Two additional transport settings are required: `DisableKeepAlives: true` to prevent pooled connections from bypassing the check on subsequent fetches, and the dual-stack awareness that Go's Happy Eyeballs may attempt IPv4 and IPv6 in parallel — the `DialContext` hook validates whichever IP is received before completing the dial.
+
+A one-hop redirect limit applies; redirect destinations are subject to the same IP validation.
 
 **`pkg/authserver/storage/cimd_decorator.go`** (new file):
 
@@ -303,7 +312,15 @@ authServer:
     enabled: false        # opt-in; set to true to accept HTTPS URLs as client_id
     cacheMaxSize: 256     # max number of cached CIMD entries (LRU eviction)
     cacheFallbackTTL: 5m  # TTL used when response carries no Cache-Control header
+    cacheMinTTL: 60s      # floor TTL — applied even if Cache-Control: no-store or max-age=0
+    cacheMaxTTL: 24h      # ceiling TTL — prevents stale metadata from persisting indefinitely
 ```
+
+`Cache-Control: no-store` on a CIMD response is ignored — public client metadata is not a secret and the embedded server must cache it to function. The floor TTL prevents cache stampedes; the ceiling prevents indefinitely stale entries.
+
+**Known limitation — air-gapped environments (Phase 2):**
+
+When the embedded authorization server has CIMD enabled and a connecting client presents `https://toolhive.dev/oauth/client-metadata.json` as its `client_id` (i.e., `thv run` connecting to its own embedded AS), the server will attempt to fetch that document from the public internet. In air-gapped environments this fetch will fail. Operators in air-gapped environments should either disable `authServer.cimd.enabled` or pre-register ToolHive's own `client_id` via DCR.
 
 #### API Changes
 
@@ -322,6 +339,8 @@ CachedCIMDClientID string // set when CIMD was used; avoids re-detection on rest
 ```
 
 This follows the existing persistence pattern for `CachedClientID` (DCR client ID) and `CachedRefreshTokenRef`. It is non-sensitive (a public URL).
+
+**Refresh token behavior**: during token refresh, `client_id=https://toolhive.dev/oauth/client-metadata.json` is sent to the token endpoint as required by RFC 6749. The CIMD document is not re-fetched on refresh — the client identity from the original authorization flow is reused. If the document has changed since the access token was issued, the change takes effect only on the next full authorization flow.
 
 **Phase 2** — no new data model changes; the CIMD cache is in-memory within the storage decorator and is not persisted.
 
@@ -342,13 +361,15 @@ Threats marked **Phase 2** apply only when the embedded authorization server fet
 | SSRF via redirect chain | Phase 2 | Metadata server issues redirects to an internal target | One-hop redirect limit; redirect destination subject to the same SSRF IP validation |
 | Scope escalation | Phase 2 | CIMD document claims broader scopes than server policy allows | Scopes intersected with server-configured allowed scopes at token issuance |
 | Client impersonation | Phase 1 & 2 | Attacker hosts a CIMD document mimicking a legitimate client | `client_id` self-referential binding + TLS certificate validation |
+| LRU cache flooding | Phase 2 | Attacker submits many distinct CIMD URLs to fill the 256-entry LRU, evicting legitimate entries and triggering repeated outbound fetches | LRU eviction bounds memory; consider per-source-IP rate limiting at the authorization endpoint as a follow-up hardening measure |
+| Compromised hosting | Phase 1 & 2 | Attacker gains control of the HTTPS origin serving a CIMD document (CDN, GitHub Pages, object storage) and replaces the metadata | **Accepted residual risk** — CIMD client trust is equivalent to controlling the HTTPS URL. TLS ensures transport integrity but does not prevent the legitimate host from being compromised. This is a fundamental property of the CIMD trust model. |
 
 ### Authentication and Authorization
 
 CIMD documents are intentionally public — they contain no credentials. Trust is established through:
 
 1. **TLS certificate validation** (Phase 2): All CIMD fetches use standard Go TLS verification; self-signed certificates are rejected.
-2. **Self-referential binding** (Phase 2): The `client_id` field inside the fetched document must equal the URL from which it was fetched. A document hosted at `https://example.com/client.json` claiming `"client_id": "https://attacker.com/client.json"` is rejected.
+2. **Self-referential binding** (Phase 2): The `client_id` field inside the fetched document must equal the URL from which it was fetched after RFC 3986 normalization (lowercase scheme and host, decode unreserved percent-encoded characters, strip default ports). A document hosted at `https://example.com/client.json` claiming `"client_id": "https://attacker.com/client.json"` is rejected.
 3. **Redirect URI validation** (Phase 2): Before issuing tokens, the redirect URI in the authorization request is validated against the `redirect_uris` in the fetched metadata. The embedded server does not issue tokens to URIs not listed in the document.
 4. **Scope enforcement** (Phase 2): The server enforces its own scope policy at token issuance; the CIMD document cannot grant a client access to scopes beyond what the server allows.
 
@@ -362,8 +383,9 @@ CIMD documents are intentionally public — they contain no credentials. Trust i
 
 - CIMD URLs must use the `https` scheme. `http://` is rejected except for `http://localhost` in test/development environments.
 - ToolHive may follow an HTTP redirect from the metadata URL, but only up to one hop. Only the final response is parsed or cached, and it must be HTTP 200; if the redirect limit is exceeded or the final response is non-200, the fetch fails.
+- The response `Content-Type` header must be `application/json` (or an `application/*+json` variant) before parsing begins — this rejects HTML login redirects and JSONP payloads before any JSON decoding occurs.
 - Response bodies are capped at 10 KB before any parsing occurs. The spec recommends document producers stay under 5 KB; our 10 KB cap is a consumer-side defense-in-depth measure.
-- `client_id` in the fetched document must exactly equal the URL it was fetched from — strict string comparison with no normalization.
+- `client_id` in the fetched document must equal the URL it was fetched from after RFC 3986 canonical normalization of both sides: lowercase scheme and host, decode unreserved percent-encoded characters, remove default ports (443 for HTTPS). A document at `https://EXAMPLE.COM/client.json` with `"client_id": "https://example.com/client.json"` is valid.
 - JSON deserialization uses `encoding/json`; unknown fields are silently ignored.
 - `redirect_uris` must use `http://localhost`, `http://127.0.0.1`, `http://[::1]`, or `https://` schemes. Other schemes are rejected.
 - `grant_types` and `response_types` must be non-empty subsets of server-supported values.
@@ -412,9 +434,9 @@ Delivers complete CIMD support for `thv run` as a self-contained track. ToolHive
 
 - New: `pkg/auth/oauth/cimd.go` — `ToolHiveClientMetadataDocumentURL` constant and `IsClientIDMetadataDocumentURL` helper
 - New: `toolhive-client-metadata.json` — static metadata document, served from toolhive.dev
-- Modified: `pkg/auth/discovery/discovery.go` — parse `client_id_metadata_document_supported` from remote AS metadata; update `PerformOAuthFlow` registration priority
+- Modified: `pkg/auth/discovery/discovery.go` — add `ClientIDMetadataDocumentSupported bool` to `AuthServerInfo`; parse it from both RFC 8414 and OIDC discovery documents; update `PerformOAuthFlow` registration priority to prefer CIMD; enforce PKCE S256 on CIMD flows
 - Modified: `pkg/auth/remote/config.go` — add `CachedCIMDClientID`
-- Modified: `pkg/auth/remote/handler.go` — graceful fallback to DCR when AS rejects CIMD `client_id`
+- Modified: `pkg/auth/remote/handler.go` — graceful fallback to DCR on `invalid_client`, `unauthorized_client`, `invalid_request`, or raw HTTP 400/401 at the authorization request stage
 
 ### Phase 2: Embedded auth server CIMD support — closes #4825
 
@@ -447,7 +469,7 @@ Phase 2 begins after Phase 1 is complete.
 
 ## References
 
-- [draft-ietf-oauth-client-id-metadata-document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/) — the CIMD specification this RFC implements
+- [draft-ietf-oauth-client-id-metadata-document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/) — the CIMD specification this RFC implements (draft-01 published March 2026; field names unchanged from draft-00 which MCP 2025-11-25 pins to)
 - [MCP Authorization Specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) — MCP spec that designates CIMD as the preferred registration mechanism
 - [RFC 7591 — OAuth 2.0 Dynamic Client Registration Protocol](https://www.rfc-editor.org/rfc/rfc7591) — DCR, retained as fallback
 - [RFC 8252 — OAuth 2.0 for Native Apps](https://www.rfc-editor.org/rfc/rfc8252) — loopback redirect URI matching (§7.3)
