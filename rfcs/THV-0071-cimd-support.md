@@ -312,7 +312,7 @@ None. The `client_id` field on OAuth requests is already a string; CIMD URLs are
 
 #### Configuration Changes
 
-Phase 1 requires no new configuration — CIMD is activated automatically when the remote AS advertises support. Phase 2 adds the opt-in `CIMDEnabled` flag to the embedded auth server config (see above).
+Phase 1 requires no new configuration — CIMD is activated automatically when the remote AS advertises support. Phase 2 adds the opt-in `authServer.cimd.enabled` setting to the embedded auth server config (see above).
 
 #### Data Model Changes
 
