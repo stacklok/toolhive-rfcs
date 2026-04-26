@@ -59,7 +59,7 @@ The implementation is delivered in two sequential phases:
 
 #### Phase 1 — `thv run` CIMD client
 
-**`pkg/auth/oauth/cimd.go`** (new file):
+**`pkg/oauth/cimd.go`** (new file):
 
 Phase 1 introduces the file with only what `thv run` needs — the URL constant and a helper to detect CIMD `client_id` values. The fetch and validate logic is added in Phase 2.
 
@@ -112,6 +112,8 @@ default:
 
 **`pkg/auth/remote/handler.go`** (modified):
 
+CIMD carries no credentials — the `client_id` is the URL itself and nothing expires or rotates. A rejection from the AS means the server either does not support CIMD despite advertising it, or could not fetch the metadata document. It does not indicate expired or invalid credentials.
+
 If the AS rejects the CIMD `client_id` at the authorization request stage, the handler retries using DCR. The retry triggers on any of the following conditions: an `invalid_client` or `unauthorized_client` OAuth error code, an `invalid_request` error, or a raw HTTP 400/401 with no parseable error body. The fallback does not trigger at the token exchange stage — if authorization succeeds but token exchange fails, that is a separate error condition.
 
 **`pkg/auth/remote/config.go`** (modified):
@@ -154,7 +156,9 @@ The document above must be publicly reachable at `https://toolhive.dev/oauth/cli
 - `Content-Type: application/json` — `application/<custom>+json` variants are also acceptable per spec, but `application/json` is the conventional choice
 - High availability — this URL is on the authorization hot path; downtime blocks `thv run` from authenticating against any CIMD-supporting server
 
-**Note on response size:** The IETF draft recommends document producers keep responses under 5 KB. As a consumer, ToolHive's fetch code enforces a 10 KB hard cap as a defense-in-depth measure to reject maliciously large responses — these are distinct limits with different purposes.
+**Note on response size:** The IETF draft recommends document producers keep responses under 5 KB. As a consumer, ToolHive's fetch code enforces a 10 KB hard cap as a defense-in-depth measure to reject maliciously large responses — these are distinct limits with different purposes. The `logo_uri` field is a URL reference (per RFC 7591 from which CIMD inherits metadata fields), not inline image data, so the 10 KB cap applies only to the JSON document itself.
+
+**Note on custom metadata URL:** The `ToolHiveClientMetadataDocumentURL` constant is intentionally a single canonical URL. A per-deployment override (e.g. for air-gapped or corporate environments that cannot reach `toolhive.dev`) is a follow-up enhancement and is not in scope for this RFC.
 
 **Note on `Cache-Control`:** The IETF draft says authorization servers SHOULD respect HTTP cache headers when present, but does not mandate any specific `Cache-Control` directive from the server side. The toolhive.dev hosting should set a reasonable `Cache-Control: max-age` (e.g. 300–3600 seconds) to reduce fetch frequency from authorization servers that honour it.
 
@@ -209,7 +213,7 @@ sequenceDiagram
 
 The interception happens at `GetClient` — the point fosite calls into storage to validate the client during the authorize request. The `CIMDStorageDecorator` wraps this call: if the `client_id` is an HTTPS URL and CIMD is enabled, it fetches the document instead of looking up a registered UUID.
 
-**`pkg/auth/oauth/cimd.go`** (extended from Phase 1):
+**`pkg/oauth/cimd.go`** (extended from Phase 1):
 
 Phase 2 adds the document type, fetch, and validation logic — only needed when ToolHive acts as the authorization server that receives CIMD `client_id` values from connecting clients.
 
@@ -252,13 +256,15 @@ func FetchClientMetadataDocument(ctx context.Context, rawURL string) (*ClientMet
 func ValidateClientMetadataDocument(doc *ClientMetadataDocument, fetchedFrom string) error
 ```
 
-**`pkg/auth/oauth/ssrf.go`** (new file):
+**`pkg/networking` (enhanced, existing package):**
 
-Extracts SSRF protection as a reusable utility. Rather than maintaining a blocklist, the implementation uses `net.IP.IsGlobalUnicast()` as the primary allowlist — only globally routable IPs are permitted. This automatically covers all current and future special-use ranges without needing exhaustive enumeration. For completeness, the following ranges are explicitly blocked: RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10), IPv6 ULA (fc00::/7), shared address space (100.64.0.0/10), IPv4-mapped IPv6 addresses (::ffff:0:0/96), and documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24).
+CIMD fetches reuse the existing `HttpClientBuilder` in `pkg/networking/http_client.go`, which already provides a `DialContext`-based SSRF check via `protectedDialerControl` and a `ValidatingTransport` round-tripper. No new SSRF utility file is introduced.
 
-The check is enforced via a custom `http.Transport` with a `DialContext` hook that validates the resolved IP before completing the connection — this is the IP actually used for the connection, not a separately-resolved address. Two additional transport settings are required: `DisableKeepAlives: true` to prevent pooled connections from bypassing the check on subsequent fetches, and the dual-stack awareness that Go's Happy Eyeballs may attempt IPv4 and IPv6 in parallel — the `DialContext` hook validates whichever IP is received before completing the dial.
+`pkg/networking` will be extended with the following missing IP ranges: shared address space (100.64.0.0/10 per RFC 6598), IPv4-mapped IPv6 addresses (::ffff:0:0/96), and documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24). The implementation uses `net.IP.IsGlobalUnicast()` as the primary allowlist — only globally routable IPs are permitted — covering current and future special-use ranges.
 
-A one-hop redirect limit applies; redirect destinations are subject to the same IP validation.
+The CIMD fetch transport must be constructed with `DisableKeepAlives: true` to prevent pooled connections from bypassing the SSRF check, and the `DialContext` hook validates the IP that Go's Happy Eyeballs actually dials (not a separately-resolved address). A one-hop redirect limit applies; redirect destinations are subject to the same IP validation.
+
+CIMD fetches also respect the CA certificate configured via `thv config set-ca-cert` — the `HttpClientBuilder` CA bundle loading is used, appended to the system cert pool.
 
 **`pkg/authserver/storage/cimd_decorator.go`** (new file):
 
@@ -408,14 +414,14 @@ The full CIMD document is never logged; it may contain sensitive contact or poli
 
 ### Mitigations
 
-The SSRF protection logic is extracted into `pkg/auth/oauth/ssrf.go` (introduced in Phase 2) as a standalone utility so it can be reused by any future HTTP-fetching code in the auth layer without duplicating the IP range checks.
+SSRF protection for CIMD fetches (Phase 2) reuses and extends the existing `pkg/networking.HttpClientBuilder` rather than introducing new code. Any future HTTP-fetching in the auth layer should use the same builder.
 
 ## Compatibility
 
 ### Backward Compatibility
 
 - DCR remains fully functional as a fallback for both the embedded server and the proxy. No existing configuration or deployments require changes.
-- The embedded server: CIMD is opt-in (`enabled: false` by default). Existing DCR clients connecting to the embedded server are completely unaffected.
+- The embedded server (Phase 2): CIMD is opt-in (`authServer.cimd.enabled: false` by default). Phase 2 introduces outbound HTTPS fetching from the authorization server — a new network behaviour that is intentionally gated behind an explicit opt-in. Phase 1 (`thv run`) requires no configuration flag; CIMD is activated automatically when the remote AS advertises support.
 - The proxy: CIMD is used only when the remote AS explicitly advertises `client_id_metadata_document_supported: true` in its metadata. For all other authorization servers, the existing DCR path runs unchanged.
 - The `CachedCIMDClientID` field added to `RemoteConfig` is additive; existing persisted configs without this field are loaded without error.
 
@@ -432,7 +438,7 @@ Delivers complete CIMD support for `thv run` as a self-contained track. ToolHive
 
 > **Infrastructure prerequisite**: `https://toolhive.dev/oauth/client-metadata.json` must be live and serving the correct document before this phase ships. Track via a separate infra ticket opened alongside this RFC.
 
-- New: `pkg/auth/oauth/cimd.go` — `ToolHiveClientMetadataDocumentURL` constant and `IsClientIDMetadataDocumentURL` helper
+- New: `pkg/oauth/cimd.go` — `ToolHiveClientMetadataDocumentURL` constant and `IsClientIDMetadataDocumentURL` helper
 - New: `toolhive-client-metadata.json` — static metadata document, served from toolhive.dev
 - Modified: `pkg/auth/discovery/discovery.go` — add `ClientIDMetadataDocumentSupported bool` to `AuthServerInfo`; parse it from both RFC 8414 and OIDC discovery documents; update `PerformOAuthFlow` registration priority to prefer CIMD; enforce PKCE S256 on CIMD flows
 - Modified: `pkg/auth/remote/config.go` — add `CachedCIMDClientID`
@@ -444,8 +450,8 @@ Begins after Phase 1 ships. Adds the server-side counterpart so MCP clients (VS 
 
 This phase introduces the shared CIMD fetch and validation logic (not needed by Phase 1) alongside the embedded server integration:
 
-- New: `pkg/auth/oauth/cimd.go` — extend with `FetchClientMetadataDocument`, `ValidateClientMetadataDocument`
-- New: `pkg/auth/oauth/ssrf.go` — SSRF protection utility shared across auth layer
+- New: `pkg/oauth/cimd.go` — extend with `FetchClientMetadataDocument`, `ValidateClientMetadataDocument`
+- Modified: `pkg/networking/http_client.go` — extend existing `HttpClientBuilder` with missing IP ranges (100.64.0.0/10, IPv4-mapped IPv6, documentation ranges); used by CIMD fetch transport
 - New: `pkg/authserver/storage/cimd_decorator.go` — storage decorator wrapping `GetClient`
 - Modified: `pkg/authserver/server/handlers/discovery.go` — advertise `client_id_metadata_document_supported` in both well-known endpoints
 - Modified: embedded auth server config — add `CIMDEnabled` flag (default false)
