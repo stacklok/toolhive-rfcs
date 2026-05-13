@@ -1,4 +1,4 @@
-# RFC-XXXX: Graceful Degradation for Multi-Upstream OAuth in vMCP
+# RFC-0072: Graceful Degradation for Multi-Upstream OAuth in vMCP
 
 - **Status**: Draft
 - **Author(s)**: TBD (@github-handle)
