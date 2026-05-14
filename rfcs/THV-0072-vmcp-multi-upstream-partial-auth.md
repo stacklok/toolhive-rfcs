@@ -113,27 +113,40 @@ Three concrete changes, all driven by a new per-upstream `optional` flag
    instead of tearing the whole flow down. The auth code is issued when
    every upstream has been attempted and every required upstream has a
    token.
-3. **Backend filtering, fail-closed.** vMCP aggregates capabilities
-   once per MCP session, at `initialize` time, and freezes the result
-   on the session value
-   (pkg/vmcp/session/factory.go:478-506);
+3. **Skip unauthorized backends at session init, fail-closed.** vMCP
+   aggregates capabilities once per MCP session, at `initialize`
+   time, and freezes the result on the session value
+   (pkg/vmcp/session/factory.go:420-506);
    `tools/list`, `resources/list`, `resources/templates/list`, and
    `prompts/list` later replay that cached snapshot. The filter
-   therefore runs inside the aggregation step at session creation,
-   reading the per-session set of available upstream tokens from
+   therefore runs *before* per-backend initialization, in the
+   pre-init backend filter loop of `makeBaseSession`
+   (pkg/vmcp/session/factory.go:427-435).
+   Each backend's required upstream is read off its `AuthConfig
+   *authtypes.BackendAuthStrategy`
+   (pkg/vmcp/types.go:346-349)
+   and checked against the per-session upstream-token set from
    storage — looked up by the `tsid` claim on the incoming bearer
    token, exactly as the existing TokenValidator middleware does at
-   pkg/auth/token.go:1184-1200 — and
-   excluding any backend whose required upstream is missing. Upstream
-   tokens themselves never ride in the bearer token. The dispatcher
-   re-checks per request and refuses `tools/call`, `resources/read`,
-   and `prompts/get` invocations against unavailable backends with a
-   structured `unauthorized_backend` error, so a stale or misbehaving
-   client (or an out-of-band revocation between session creation and
-   dispatch) cannot bypass the filter. Recovery against a degraded
-   session is whole-session: the client re-runs `/authorize` for a
-   new JWT and reconnects, which produces a fresh `initialize` and a
-   re-aggregated capability snapshot.
+   pkg/auth/token.go:1184-1200. Backends
+   whose required upstream is missing are dropped from the slice
+   before any `initOneBackend` goroutine runs: no HTTP connection,
+   no handshake, no capability listing, no entry into the routing
+   table or the per-session SDK tool store. Upstream tokens
+   themselves never ride in the bearer token. No new dispatcher
+   gate is added: if a stored upstream token disappears from
+   storage between `initialize` and a later call (refresh-token
+   expiry, IdP admin revoke), the existing backend auth strategies
+   already fail closed — `UpstreamInjectStrategy`,
+   `TokenExchangeStrategy`, and `AwsStsStrategy` all return
+   `ErrUpstreamTokenNotFound` when the configured provider is
+   absent from `identity.UpstreamTokens`
+   (pkg/vmcp/auth/strategies/upstream_inject.go:80-83,
+   tokenexchange.go:124-127, aws_sts.go:136-139),
+   which surfaces as the existing unauthorized error to the client.
+   Recovery against a degraded session is whole-session: the client
+   re-runs `/authorize` for a new JWT and reconnects, which produces
+   a fresh `initialize` and a re-aggregated capability snapshot.
 
 Recovery is "restart-all" from the *user's* perspective — they re-walk
 the chain end-to-end — but there is no special server-side restart
@@ -366,15 +379,19 @@ func (s *BackendAuthStrategy) RequiredUpstreamProvider() string {
 Backends whose strategy returns empty are always available — they have no
 upstream dependency.
 
-##### vMCP: backend filtering at session creation and dispatch
+##### vMCP: backend filtering at session creation
 
-A per-session filter applied at two points in the vMCP lifecycle:
-once when capabilities are aggregated and frozen onto the MCP
-session, and again on every dispatched call against a backend.
+The new filter lives at exactly one point in the vMCP lifecycle:
+the pre-init backend filter loop in `makeBaseSession`, which decides
+which backends will have their `initOneBackend` goroutine scheduled.
+There is no separate dispatcher-level re-check, because the existing
+per-call upstream-token lookup already fails closed when a token is
+missing — see "Out-of-band revocation between `initialize` and call"
+below.
 
-Both checks read the per-session upstream-token set from upstream token
-storage; the bearer token's `tsid` claim names the session, but the
-tokens themselves are loaded from storage by the existing
+The filter reads the per-session upstream-token set from upstream
+token storage; the bearer token's `tsid` claim names the session, but
+the tokens themselves are loaded from storage by the existing
 `TokenValidator` middleware
 (pkg/auth/token.go:1184-1248)
 and hydrated onto `identity.UpstreamTokens` before any vMCP handler
@@ -382,51 +399,36 @@ runs. The filter therefore consults `IdentityFromContext(ctx).UpstreamTokens`
 — a storage-backed view, not a claim-derived one — and never decodes
 or trusts upstream-token state out of the JWT itself.
 
-1. **Capability snapshot at session creation.** vMCP aggregates and
-   freezes the per-session capability set at MCP `initialize` time —
-   the session factory's `makeBaseSession` calls the aggregator once
-   via `buildRoutingTableWithAggregator`
-   (pkg/vmcp/session/factory.go:478-506)
-   and stores the resulting tools / resources / prompts on the
-   `defaultMultiSession` value
-   (pkg/vmcp/session/factory.go:496-506).
-   Those slices are read-only thereafter; subsequent `tools/list`,
-   `resources/list`, `resources/templates/list`, and `prompts/list`
-   calls replay the snapshot rather than re-aggregating, and the
-   per-session tool set is also registered with the underlying SDK's
-   tool store during `OnRegisterSession`
-   (pkg/vmcp/server/server.go:1158-1195).
-   The filter therefore has to run *inside* the aggregation step at
-   session creation, not by wrapping list-method responses. Wrapping
-   list handlers would either fight the SDK's per-session store or
-   degrade to a no-op against the cached snapshot.
-
-   The session factory already threads `*auth.Identity` into
+1. **Skip unauthorized backends during session initialization.**
+   Capabilities are aggregated and frozen at `initialize` time in
    `makeBaseSession`
-   (pkg/vmcp/session/factory.go:351-375, 423-446),
-   and the `TokenValidator` middleware has hydrated
-   `identity.UpstreamTokens` from storage before the session factory
-   runs. The aggregator (or a thin filter sitting between
-   `buildRoutingTableWithAggregator` and the `defaultMultiSession`
-   assignment) drops any tool / resource / prompt whose owning backend
-   reports a non-empty `RequiredUpstreamProvider()` not present in
-   `identity.UpstreamTokens`. The routing table, advertised tool set,
-   and per-session SDK tool registration all see the filtered view
-   uniformly.
+   (pkg/vmcp/session/factory.go:420-506)
+   and replayed thereafter; `tools/list` and friends do not
+   re-aggregate. Hook the filter in the pre-init backend filter loop
+   (pkg/vmcp/session/factory.go:427-435):
+   for each backend, if `b.AuthConfig.RequiredUpstreamProvider()`
+   (pkg/vmcp/types.go:346-349)
+   is non-empty and absent from `identity.UpstreamTokens`, drop the
+   backend before scheduling its goroutine. `initOneBackend` never
+   runs, no connection or handshake is attempted, the aggregator
+   sees a smaller backend set, and the routing table / tools /
+   resources / prompts / SDK per-session tool store all exclude the
+   backend by construction.
 
-2. **Dispatch refusal.** Before the dispatcher routes `tools/call`,
-   `resources/read`, `resources/subscribe`, or `prompts/get` to a
-   backend, it re-checks `RequiredUpstreamProvider()` against the
-   session's upstream-token map (same storage-backed source as above).
-   A miss produces a structured JSON-RPC error with `code: -32001`
-   (server-defined) and a message naming the missing upstream. This
-   is defense-in-depth: under normal flow the cached `tools/list`
-   already omits the backend, but a misbehaving client could fabricate
-   a call against a tool name it should not have, and an out-of-band
-   revocation (refresh-token expiry, IdP admin revoke) could clear an
-   upstream token in storage *after* the session snapshot was taken.
-   Dispatch reads `identity.UpstreamTokens` per request, so it catches
-   both cases.
+2. **Out-of-band revocation between `initialize` and call.** A
+   stored upstream token can disappear after the snapshot is built
+   (refresh-token expiry, IdP admin revoke). No new dispatcher gate
+   is added: the `TokenValidator` middleware re-hydrates
+   `identity.UpstreamTokens` from storage per request, and the
+   existing strategies — `UpstreamInjectStrategy`
+   (pkg/vmcp/auth/strategies/upstream_inject.go:80-83),
+   `TokenExchangeStrategy`
+   (pkg/vmcp/auth/strategies/tokenexchange.go:124-127),
+   `AwsStsStrategy`
+   (pkg/vmcp/auth/strategies/aws_sts.go:136-139)
+   — already return `ErrUpstreamTokenNotFound` when their configured
+   provider is missing. Same gate covers a misbehaving client
+   fabricating a call against a filtered tool.
 
 Filtering is structurally invisible to the MCP protocol: the client just
 sees a smaller capability set, exactly as if those backends were never
@@ -434,56 +436,6 @@ configured. We do not extend the protocol to signal degraded state. End
 users discover what they cannot do by trying to use it; the failing
 tool/resource error includes the missing upstream's name for self-service
 re-auth.
-
-##### Recovery requires a fresh MCP session
-
-Because capabilities are snapshotted at `initialize`, a client cannot
-see new capabilities (e.g. a previously-filtered backend coming back
-after the user authorizes its upstream) within the same vMCP session.
-Recovery therefore requires the client to open a *new* MCP session.
-This is naturally consistent with the re-`/authorize` flow: a fresh
-`/authorize` produces a new JWT carrying a new `tsid` (see
-*Auth server: re-authorization is a fresh session*), and changing the
-bearer token forces the client to open a new MCP session, which
-triggers a fresh `initialize`, which re-runs the aggregator with the
-new session's `identity.UpstreamTokens` view. The recovery sequence
-the user experiences is therefore: re-`/authorize` → exchange for new
-JWT at `/token` → reconnect to vMCP with the new bearer → fresh
-`initialize` → filtered capability set is recomputed against the new
-upstream-token state. No in-session capability refresh is offered.
-
-##### Refresh-token expiry and out-of-band revocation
-
-The same recovery flow covers two distinct events: an upstream refresh
-token expires, or an operator revokes a stored upstream token
-out-of-band (e.g. via the IdP admin UI). In both cases the auth server
-detects the problem *reactively*, on the next backend call that needs
-the token — there is no server-side introspection poller. The flow:
-
-1. The dependent backend's strategy fails to mint or use a fresh access
-   token (the IdP rejects refresh or returns an unauthorized response).
-2. The vMCP returns a structured auth error to the client (existing
-   path).
-3. The client re-runs `/authorize`. The handler mints a fresh
-   `SessionID` and the user walks every upstream again against that
-   new session — the user re-consents across the chain. Identity
-   consistency is verified within the new walk. The prior session's
-   stored rows are left in place and age out under their existing TTL.
-4. The client exchanges the new code at `/token` for a new JWT (with
-   a new `tsid` claim naming the new session) and reconnects to vMCP
-   with the new bearer. The new MCP connection triggers a fresh
-   `initialize`, which re-aggregates capabilities against the new
-   session's `identity.UpstreamTokens` view. The previously-filtered
-   backend reappears in the new session's capability snapshot.
-
-This is intentionally heavier than per-upstream refresh because we do not
-want a single upstream RT expiry or revocation to silently degrade the
-user's capability surface mid-conversation, and because partial re-walks
-re-introduce the identity-binding hazards that we deliberately avoid
-elsewhere in this RFC. Operators with stricter freshness requirements
-(e.g. compliance-driven sub-minute revocation detection) are out of
-scope for this RFC and would be addressed by a follow-up proposal for
-proactive introspection.
 
 #### API Changes
 
@@ -649,12 +601,14 @@ pending record.
   enumerated tools at `initialize` could still attempt to invoke a
   tool whose upstream token has since been revoked (refresh-token
   expiry, IdP admin revoke) or otherwise removed from storage.
-  Mitigation: dispatcher re-checks `RequiredUpstreamProvider()`
-  against the current `identity.UpstreamTokens` (re-hydrated from
-  storage on every request) per `tools/call`, `resources/read`,
-  `resources/subscribe`, and `prompts/get`; a miss returns a
-  structured `unauthorized_backend` error naming the missing
-  upstream. The filter is not snapshot-only.
+  Mitigation: no new code. The existing `TokenValidator` middleware
+  re-hydrates `identity.UpstreamTokens` from storage on every
+  request, and every backend auth strategy
+  (`UpstreamInjectStrategy`, `TokenExchangeStrategy`,
+  `AwsStsStrategy`) already returns `ErrUpstreamTokenNotFound`
+  when its configured provider is absent from the map. The call
+  fails closed via the existing error path; no separate dispatcher
+  gate is needed.
 - **Threat E — Information disclosure via filtered listings.** Filtered
   listings reveal which providers a session has not authorized (by
   absence). This is the same disclosure as a session that simply hasn't
@@ -666,10 +620,16 @@ pending record.
 - Authz policy evaluation is unchanged: Cedar still binds to claims from
   the primary upstream, which is guaranteed present by the new admission
   rule.
-- Backend dispatch is the new authorization gate: a session without the
-  required upstream token for a given backend cannot reach that backend.
-  This is *stricter* than today — today the session would already have
-  failed authorization entirely.
+- Per-backend initialization is the new authorization gate: a
+  session whose `identity.UpstreamTokens` lacks a backend's required
+  upstream skips that backend's `initOneBackend` entirely, so it
+  never enters the routing table or the tool list — there is nothing
+  to authorize against. Existing backend auth strategies remain the
+  call-time fail-closed for backends that *were* initialized but
+  whose token later disappeared: they already refuse to mint a
+  request when the configured upstream token is absent
+  (`ErrUpstreamTokenNotFound`). This is *stricter* than today — today
+  the session would already have failed authorization entirely.
 
 ### Data Security
 
@@ -715,25 +675,28 @@ Emit structured logs for:
 - The existing `/authorize` entry log already records each new
   `SessionID`; no separate re-authorization event is needed since
   re-`/authorize` is structurally just "another new session."
-- `backend_filtered_for_session` — `{session_id, backend_id, missing_provider}`
-  at DEBUG when the filter strips a listing entry. INFO would be too
-  noisy: every `tools/list` would emit one per filtered backend.
+- `backend_init_skipped_for_session` — `{session_id, backend_id, missing_provider}`
+  at INFO when `makeBaseSession`'s pre-init filter drops a backend
+  because its required upstream is absent from
+  `identity.UpstreamTokens`. INFO is appropriate (not DEBUG) because
+  the event fires at most once per backend per MCP session, not per
+  list call — the capability snapshot is built once.
 
 Metrics (counters, OTEL):
 
 - `authserver_chain_completions_total{mode="full|partial"}`
 - `authserver_upstream_skipped_total{provider,reason}`
-- `vmcp_backend_filtered_total{backend,missing_provider}`
+- `vmcp_backend_init_skipped_total{backend,missing_provider}`
 
-Cardinality note: `vmcp_backend_filtered_total` carries both `backend`
-and `missing_provider` labels. `missing_provider` is bounded by the
-upstream count (handful) but `backend` is bounded only by the size of
-the vMCP — a deployment aggregating hundreds of backends will produce a
-proportionally large series count. Operators running large vMCPs should
-drop the `backend` label at scrape time via Prometheus metric_relabel
-rules; we document this in the operator runbook rather than enforcing
-it server-side, so small-vMCP operators retain the per-backend
-breakdown by default.
+Cardinality note: `vmcp_backend_init_skipped_total` carries both
+`backend` and `missing_provider` labels. `missing_provider` is
+bounded by the upstream count (handful) but `backend` is bounded
+only by the size of the vMCP — a deployment aggregating hundreds of
+backends will produce a proportionally large series count. Operators
+running large vMCPs should drop the `backend` label at scrape time
+via Prometheus metric_relabel rules; we document this in the
+operator runbook rather than enforcing it server-side, so small-vMCP
+operators retain the per-backend breakdown by default.
 
 ### Mitigations Summary
 
@@ -742,7 +705,7 @@ breakdown by default.
 | Cross-identity token binding | Existing identity-consistency check, unchanged scope |
 | Cross-session identity adoption | Fresh `SessionID` on every `/authorize`; no cross-session correlation |
 | Optional primary misconfig | Admission webhook rejection + runtime guard |
-| Stale-session invocation (snapshot post-revocation) | Dispatcher re-checks storage-backed `identity.UpstreamTokens` per request |
+| Stale-session invocation (snapshot post-revocation) | Existing per-request token re-hydration + strategy `ErrUpstreamTokenNotFound` — no new gate |
 | Information disclosure | No new leak vs. status quo |
 
 ## Alternatives Considered
@@ -835,11 +798,11 @@ primary as required at runtime.
 - The `Skipped` / `SkippedReason` field shape on `UpstreamTokens` is
   internal to the auth server; storage backends can evolve the encoding
   freely.
-- The vMCP filter runs at the aggregator step during session creation
-  and at dispatch time per request — future protocol versions or new
-  capability lists slot in without reworking the filter, provided
-  they also flow through `buildRoutingTableWithAggregator` and the
-  per-session capability snapshot.
+- The vMCP filter runs in the pre-init backend filter loop of
+  `makeBaseSession`, which is upstream of every capability-aggregation
+  path. Future protocol versions or new capability lists slot in
+  without reworking the filter, provided they continue to flow
+  through per-backend initialization in the same factory pass.
 
 ## Implementation Plan
 
@@ -853,7 +816,7 @@ tested without churning the CRD surface while the design settles.
 - Extend the auth server runtime config (`Handler` constructor and
   `NamedUpstream` struct in `pkg/authserver/server/handlers/`) with a
   per-upstream `Optional` flag (default `false`). The field is populated
-  programmatically for now; CRD wiring lands in Phase 4. When every
+  programmatically for now; CRD wiring lands in Phase 3. When every
   upstream's `Optional` is `false` (i.e. unchanged manifests), the
   partial-auth code paths reduce to today's all-or-nothing behavior.
 - Extend `storage.UpstreamTokens` with `Skipped bool` and `SkippedReason
@@ -873,55 +836,56 @@ tested without churning the CRD surface while the design settles.
   optional-fail, identity-consistency under partial completion; round-
   trip tests for the new fields on both storage backends; assertion
   that `identity.UpstreamTokens` never contains skipped providers.
+  Re-authorization pinning tests (no new code, but lock in the
+  fresh-session behavior this RFC relies on):
+  - Two back-to-back `/authorize` calls from the same client produce
+    distinct `SessionID`s in `PendingAuthorization`.
+  - The second call's chain walk reads zero pre-existing upstream
+    rows under its new `SessionID`, even when the first call left
+    real tokens or skip rows behind under the old `SessionID`.
+  - Within-session identity consistency still fires when an
+    attacker-controlled second leg binds a different upstream
+    subject than the first leg of the *same* session.
 
-### Phase 2: Re-authorization tests
-
-No new code is needed for re-authorization — the existing `/authorize`
-handler already mints a fresh `SessionID` per call and does not
-correlate to prior sessions, which is exactly the behavior this RFC
-relies on. This phase only adds tests pinning that property so a
-future refactor can't quietly introduce session reuse:
-
-- Test that two back-to-back `/authorize` calls from the same client
-  produce distinct `SessionID`s in `PendingAuthorization`.
-- Test that the second call's chain walk reads zero pre-existing
-  upstream rows under its new `SessionID`, even when the first call
-  left real tokens or skip rows behind under the old `SessionID`.
-- Test that within-session identity consistency still fires when an
-  attacker-controlled second leg binds a different upstream subject
-  than the first leg of the *same* session.
-
-### Phase 3: vMCP backend filtering
+### Phase 2: vMCP backend filtering
 
 - Add `RequiredUpstreamProvider()` helper on `BackendAuthStrategy`.
-- Apply the per-session filter at session-creation time, inside or
-  immediately after `buildRoutingTableWithAggregator`
-  (pkg/vmcp/session/factory.go:478-506),
-  so the routing table, advertised tool set, all-resolved tool set,
-  resources, and prompts written onto `defaultMultiSession` already
-  exclude any backend whose `RequiredUpstreamProvider()` is not
-  present in the session's `identity.UpstreamTokens`. The cached
-  snapshot served by `tools/list`, `resources/list`,
-  `resources/templates/list`, and `prompts/list` is therefore filtered
-  by construction; no separate list-handler wrapper is needed (and
-  one would be ineffective, since the SDK serves the cached
-  per-session tool store registered during `OnRegisterSession`).
-- Add the dispatch-time refusal for `tools/call`, `resources/read`,
-  `resources/subscribe`, `prompts/get`. This re-checks
-  `RequiredUpstreamProvider()` against the *current*
-  `identity.UpstreamTokens` (re-read from storage by `TokenValidator`
-  middleware on every request), so it catches both stale-client
-  fabrications and tokens that disappeared from storage after the
-  session snapshot was taken.
-- Tests: session creation under a partially-authorized identity
-  produces a `defaultMultiSession` whose `tools`/`resources`/`prompts`
-  slices omit unauthorized backends; `tools/list` against that session
-  returns the filtered set; stale-client invocation of a filtered tool
-  yields the `unauthorized_backend` JSON-RPC error; an out-of-band
-  storage delete between session creation and dispatch is caught at
-  the dispatcher.
+- In `makeBaseSession`
+  (pkg/vmcp/session/factory.go:427-435),
+  extend the existing pre-init backend filter loop. For each
+  `b *vmcp.Backend`, after the nil-skip and before scheduling its
+  `initOneBackend` goroutine, check
+  `b.AuthConfig.RequiredUpstreamProvider()`; if non-empty and not
+  present in `identity.UpstreamTokens`, drop the backend from
+  `filtered` and emit an INFO log naming the backend and missing
+  provider. Because the goroutine for that backend never runs, no
+  HTTP connection, handshake, or capability listing is attempted —
+  the aggregator sees a strictly smaller backend set, and the
+  routing table, advertised tool set, resources, prompts, and
+  per-session SDK tool registration all exclude the backend by
+  construction. No post-aggregation filter is needed and no
+  list-handler wrapper is added.
+- No dispatcher-level changes are needed. Out-of-band revocation
+  between session creation and call is already caught by the existing
+  per-request `identity.UpstreamTokens` re-hydration plus each backend
+  auth strategy's `ErrUpstreamTokenNotFound` path; this work simply
+  confirms (via tests) that those paths fire as expected when an
+  upstream is missing.
+- Tests:
+  - Session creation under a partially-authorized identity skips
+    `initOneBackend` for unauthorized backends (assert via a mock
+    connector that no connection attempt fires for the dependent
+    backend) and produces a `defaultMultiSession` whose
+    `routingTable` / `tools` / `allTools` / `resources` / `prompts`
+    omit them.
+  - `tools/list` against that session returns the filtered set.
+  - A `tools/call` against a tool the client shouldn't have access
+    to is rejected by the existing strategy path with
+    `ErrUpstreamTokenNotFound`.
+  - Out-of-band storage delete between session creation and call is
+    caught at the strategy (same code path, no new gate).
 
-### Phase 4: CRD schema and admission
+### Phase 3: CRD schema and admission
 
 - Add the `Optional` field to `UpstreamProviderConfig` with kubebuilder
   markers and a `false` default.
@@ -936,7 +900,7 @@ future refactor can't quietly introduce session reuse:
   reconciler end-to-end test confirms field propagation into the
   running auth server.
 
-### Phase 5: Documentation and observability
+### Phase 4: Documentation and observability
 
 - New section in operator docs covering the partial-auth model, required
   vs. optional providers, and the re-auth UX.
@@ -960,16 +924,19 @@ future refactor can't quietly introduce session reuse:
   - Identity-consistency check under partial completion (skipped
     upstream contributes no record; required ones do).
   - vMCP session creation under a synthesised identity whose
-    `UpstreamTokens` map is missing one provider: the resulting
-    `defaultMultiSession`'s `tools`/`allTools`/`resources`/`prompts`
-    slices omit the dependent backend; `routingTable` does not route
-    to it.
-  - vMCP dispatcher refusal: a `tools/call` against a backend whose
-    `RequiredUpstreamProvider()` is absent from the request's
-    `identity.UpstreamTokens` yields the structured
-    `unauthorized_backend` error, even if the session snapshot was
-    built when the token was present (simulates out-of-band
-    revocation between `initialize` and the call).
+    `UpstreamTokens` map is missing one provider: the pre-init filter
+    drops the dependent backend, so the mock connector records *zero*
+    `initOneBackend` calls for it; the resulting
+    `defaultMultiSession`'s `routingTable` / `tools` / `allTools` /
+    `resources` / `prompts` all omit it.
+  - Existing strategy fail-closed under out-of-band revocation: build
+    a session while a provider's token is present, then delete the
+    row from storage and issue a `tools/call` against a backend that
+    depends on that provider. The existing `UpstreamInjectStrategy`
+    (or `TokenExchangeStrategy` / `AwsStsStrategy`) returns
+    `ErrUpstreamTokenNotFound`; the existing dispatcher error path
+    propagates that to the client. No new dispatcher gate is
+    exercised because none is added.
   - `RequiredUpstreamProvider()` over each strategy type and the
     no-binding case.
 - **Integration tests**:
@@ -1027,7 +994,8 @@ None.
 - pkg/auth/upstreamtoken/service.go — `InProcessService.GetAllValidTokens`, `GetValidToken` (filter skip rows out of the live-token map)
 - pkg/vmcp/auth/types/types.go — backend strategy → upstream binding
 - pkg/vmcp/auth/strategies/upstream_inject.go — upstream token consumption
-- pkg/vmcp/session/factory.go — `makeBaseSession`, `buildRoutingTableWithAggregator` (capability snapshot at session creation; site for the per-session filter)
+- pkg/vmcp/session/factory.go — `makeBaseSession` pre-init backend filter loop (lines 427-435) is the site for the per-session filter; `buildRoutingTableWithAggregator` consumes the already-filtered results
+- pkg/vmcp/types.go — `vmcp.Backend.AuthConfig *authtypes.BackendAuthStrategy` (carries `RequiredUpstreamProvider()` for the filter check)
 - pkg/vmcp/server/server.go — `handleSessionRegistrationImpl`, `OnRegisterSession` (where the per-session capability snapshot is registered with the SDK)
 - pkg/vmcp/discovery/middleware.go — `handleInitializeRequest` / `handleSubsequentRequest` (capabilities discovered at `initialize`, cached for session lifetime)
 - cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go — `EmbeddedAuthServerConfig`, `UpstreamProviderConfig`
