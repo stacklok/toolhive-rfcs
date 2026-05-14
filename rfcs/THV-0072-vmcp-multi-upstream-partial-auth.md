@@ -13,10 +13,12 @@ When a VirtualMCPServer's embedded authorization server fronts multiple upstream
 Identity Providers, today's chain is all-or-nothing: any one failure invalidates
 every collected upstream token and locks the user out of every backend, even
 backends that depend only on the upstreams that already succeeded. This RFC
-introduces opt-in partial-completion semantics, controlled by a new
-`partialUpstreamAuth` knob on the embedded auth server and a `required` flag
-on each upstream provider. Backends whose required upstream is missing are
-filtered out of the vMCP's exposed catalog and refused at request time;
+introduces opt-in partial-completion semantics, controlled by a single
+`optional` flag (default `false`) on each upstream provider. Marking any
+provider `optional: true` opts the deployment into partial completion for
+that provider; leaving every provider at the default reproduces today's
+all-or-nothing behavior exactly. Backends whose required upstream is missing
+are filtered out of the vMCP's exposed catalog and refused at request time;
 re-authentication is restart-all, with full identity-consistency checks
 preserved.
 
@@ -92,48 +94,69 @@ information is just not consulted when deciding how to fail.
 
 ### High-Level Design
 
-Three concrete changes, gated on a new `partialUpstreamAuth: allow` knob:
+Three concrete changes, all driven by a new per-upstream `optional` flag
+(default `false`):
 
-1. **Required vs. optional upstreams.** `UpstreamProviderConfig` gains a
-   `required` bool (default `false`). The provider named by
-   `authzConfig.inline.primaryUpstreamProvider` (explicit or auto-selected)
-   is *always* required — admission and runtime treat it that way regardless
-   of the field. Operators can configure `partialUpstreamAuth: requireAll`
-   (default — equivalent to today) or `partialUpstreamAuth: allow`, in which
-   case per-provider `required` is honored.
-2. **Skip-and-continue on optional-upstream failure.** When an optional
-   upstream returns an RFC 6749 §4.1.2.1 error (including user-declined
-   `access_denied`), the chain records the upstream as *skipped for this
-   session* and advances to the next missing upstream instead of tearing the
-   whole flow down. The auth code is issued when every upstream has been
-   attempted and every *required* upstream has a token.
-3. **Backend filtering, fail-closed.** The vMCP request pipeline reads the
-   per-session set of available upstream tokens off the bearer-token claim
-   and filters the aggregated `tools/list`, `resources/list`, and
-   `prompts/list` results to exclude backends whose required upstream is
-   missing. The dispatcher refuses `tools/call`, `resources/read`, and
-   `prompts/get` invocations against unavailable backends with a structured
-   `unauthorized_backend` error — a stale or misbehaving client cannot
-   bypass the filter.
+1. **Required vs. optional upstreams.** `UpstreamProviderConfig` gains an
+   `optional` bool (default `false`). An upstream with `optional: false` is
+   required; one with `optional: true` may be skipped. The provider named
+   by `authzConfig.inline.primaryUpstreamProvider` (explicit or
+   auto-selected) is *always* required — admission rejects a configuration
+   that sets `optional: true` on the primary, and runtime treats the
+   primary as required regardless of the field. Existing manifests that
+   never set `optional` reproduce today's behavior exactly: every upstream
+   defaults to required, so the chain is all-or-nothing.
+2. **Skip-and-continue on optional-upstream failure.** When an upstream
+   marked `optional: true` returns an RFC 6749 §4.1.2.1 error (including
+   user-declined `access_denied`), the chain records the upstream as
+   *skipped for this session* and advances to the next missing upstream
+   instead of tearing the whole flow down. The auth code is issued when
+   every upstream has been attempted and every required upstream has a
+   token.
+3. **Backend filtering, fail-closed.** vMCP aggregates capabilities
+   once per MCP session, at `initialize` time, and freezes the result
+   on the session value
+   (pkg/vmcp/session/factory.go:478-506);
+   `tools/list`, `resources/list`, `resources/templates/list`, and
+   `prompts/list` later replay that cached snapshot. The filter
+   therefore runs inside the aggregation step at session creation,
+   reading the per-session set of available upstream tokens from
+   storage — looked up by the `tsid` claim on the incoming bearer
+   token, exactly as the existing TokenValidator middleware does at
+   pkg/auth/token.go:1184-1200 — and
+   excluding any backend whose required upstream is missing. Upstream
+   tokens themselves never ride in the bearer token. The dispatcher
+   re-checks per request and refuses `tools/call`, `resources/read`,
+   and `prompts/get` invocations against unavailable backends with a
+   structured `unauthorized_backend` error, so a stale or misbehaving
+   client (or an out-of-band revocation between session creation and
+   dispatch) cannot bypass the filter. Recovery against a degraded
+   session is whole-session: the client re-runs `/authorize` for a
+   new JWT and reconnects, which produces a fresh `initialize` and a
+   re-aggregated capability snapshot.
 
-Restart-all recovery is handled by the existing client-driven `/authorize`
-flow: when an incoming `/authorize` is observed for a session that already
-holds upstream tokens, the auth server discards them and walks the chain
-again from leg one. The identity-consistency check on leg one then enforces
-that the same user is binding the session — a different user starts a fresh
-session.
+Recovery is "restart-all" from the *user's* perspective — they re-walk
+the chain end-to-end — but there is no special server-side restart
+branch. Every `/authorize` already mints a fresh `SessionID` via
+`rand.Text()`
+(pkg/authserver/server/handlers/authorize.go:73-93),
+so re-running `/authorize` simply creates a brand-new session and walks
+the chain from leg one against that new session. Prior sessions (with
+real tokens, skip rows, or a mix) sit untouched in storage and expire
+on their normal session-end paths; nothing in the server needs to
+reach across the two sessions. The identity-consistency check applies
+across legs *within* a single session's walk — its job is to catch a
+divergent upstream identity mid-chain, not to bridge two `/authorize`
+invocations.
 
 ```mermaid
 flowchart TD
-    A[Client → /authorize] --> B{Session has<br/>upstream tokens?}
-    B -- yes --> C[Discard prior tokens<br/>restart-all]
-    B -- no --> D[Start chain at leg 1]
-    C --> D
+    A[Client → /authorize] --> D[Mint fresh SessionID<br/>start chain at leg 1]
     D --> E[Leg N callback]
     E --> F{Upstream error?}
     F -- no --> G{More upstreams<br/>unattempted?}
-    F -- "yes, required" --> H[Fail entire chain<br/>delete all tokens<br/>existing handleUpstreamError]
-    F -- "yes, optional<br/>(partial=allow)" --> I[Mark upstream skipped<br/>continue chain]
+    F -- "yes, required<br/>(optional=false)" --> H[Fail entire chain<br/>delete all rows<br/>existing handleUpstreamError]
+    F -- "yes, optional<br/>(optional=true)" --> I[Write skip row<br/>continue chain]
     I --> G
     G -- yes --> J[nextUnattemptedUpstream]
     G -- no --> N{All required<br/>have tokens?}
@@ -151,66 +174,50 @@ flowchart TD
 
 ##### Operator: CRD additions
 
-Two new fields on existing types in
+One new field on an existing type in
 cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:
 
 ```go
-// EmbeddedAuthServerConfig gains a top-level mode toggle.
-type EmbeddedAuthServerConfig struct {
-    // ... existing fields ...
-
-    // PartialUpstreamAuth controls whether the embedded auth server may
-    // complete authorization with a subset of upstream providers satisfied.
-    //
-    //   requireAll (default): every configured upstream must succeed before
-    //     an authorization code is issued. Matches the historical behavior.
-    //   allow: per-provider Required flags are honored. The chain completes
-    //     when every required upstream is satisfied; optional upstreams that
-    //     fail are recorded as skipped for the session and the dependent
-    //     backends are filtered from the vMCP catalog.
-    //
-    // +kubebuilder:validation:Enum=requireAll;allow
-    // +kubebuilder:default=requireAll
-    // +optional
-    PartialUpstreamAuth string `json:"partialUpstreamAuth,omitempty"`
-}
-
-// UpstreamProviderConfig gains a Required flag.
+// UpstreamProviderConfig gains an Optional flag.
 type UpstreamProviderConfig struct {
     // ... existing fields (Name, Type, OIDCConfig, OAuth2Config) ...
 
-    // Required marks this upstream as mandatory for chain completion.
-    // Only consulted when the parent EmbeddedAuthServerConfig sets
-    // PartialUpstreamAuth: allow — in requireAll mode every upstream is
-    // implicitly required.
+    // Optional marks this upstream as eligible to be skipped during chain
+    // completion. When false (the default), the upstream is required: any
+    // failure tears the chain down with today's all-or-nothing semantics.
+    // When true, an RFC 6749 §4.1.2.1 error from the upstream (or a user
+    // declining consent) is recorded as a per-session skip and the chain
+    // continues; backends that depend on this upstream are filtered from
+    // the vMCP catalog for that session.
     //
     // The provider named by spec.incomingAuth.authzConfig.inline.primaryUpstreamProvider
-    // (or, when unset, the first upstream) is always required regardless of
-    // this field; the admission webhook rejects a configuration that
-    // explicitly sets the primary upstream's Required to false.
+    // (or, when unset, the first listed upstream) is always required
+    // regardless of this field; the admission webhook rejects a
+    // configuration that sets the primary upstream's Optional to true.
+    //
+    // Leaving Optional unset on every upstream reproduces today's
+    // all-or-nothing behavior exactly — existing manifests need no change.
     //
     // +kubebuilder:default=false
     // +optional
-    Required bool `json:"required,omitempty"`
+    Optional bool `json:"optional,omitempty"`
 }
 ```
 
-Validation extensions to `MCPExternalAuthConfig` and `VirtualMCPServer`
+Validation extension to `MCPExternalAuthConfig` and `VirtualMCPServer`
 admission webhooks:
 
-- When `partialUpstreamAuth: allow`, reject configurations where the
-  primary upstream (resolved via
+- Reject configurations where the primary upstream (resolved via
   `AuthzConfigRef.ExplicitPrimaryUpstreamProvider()` —
   cmd/thv-operator/api/v1beta1/mcpserver_types.go:657-668,
-  falling back to `upstreamProviders[0].Name`) has `Required: false`.
-- New advisory status condition
-  `ConditionTypeAuthzPartialUpstreamAuthOptionalPrimary` is unnecessary —
-  rejection at admission is the right level; degrading silently here would
-  let a misconfigured policy authorize against missing claims.
+  falling back to `upstreamProviders[0].Name`) has `Optional: true`.
+- No advisory status condition is needed; rejection at admission is the
+  right level — degrading silently here would let a misconfigured policy
+  authorize against missing claims.
 
 A new validation rule on `MCPExternalAuthConfig.validateUpstreamProvider`
 (cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go:1124)
-is not required — `Required` is a leaf bool with no cross-field semantics
+is not required — `Optional` is a leaf bool with no cross-field semantics
 at the per-provider level. Cross-field validation lives on the parent.
 
 ##### Auth server: chain completion logic
@@ -220,73 +227,117 @@ pkg/authserver/server/handlers/:
 
 1. **`nextMissingUpstream` → `nextUnattemptedUpstream`**
    (pkg/authserver/server/handlers/handler.go:118-133).
-   Return the first upstream (required or optional) that has neither a
-   stored token nor a skipped tombstone for the session. Chain completion
-   is now a two-part predicate evaluated after each successful leg:
-   `nextUnattemptedUpstream` returns empty *and* every required upstream
-   has a stored token. Optional upstreams are still walked so the user has
-   a chance to authorize them; only after they have been attempted (and
-   either succeeded or been recorded as skipped) does the chain consider
-   itself complete.
+   A single `GetAllUpstreamTokens(sessionID)` call returns every row the
+   session has — real tokens and skip rows alike — and the helper walks
+   the configured `UpstreamProviders` in order, returning the first
+   provider with no row at all. Chain completion is a two-part predicate
+   evaluated after each successful leg: `nextUnattemptedUpstream` returns
+   empty *and* every required upstream (i.e. every upstream with
+   `Optional == false`) has a stored, non-skipped token. Optional
+   upstreams are still walked so the user has a chance to authorize
+   them; only after they have been attempted (and either succeeded or
+   been recorded as skipped) does the chain consider itself complete.
+   When every upstream is required — the default for unchanged manifests
+   — the predicate reduces to "every upstream has a non-skipped token",
+   identical to today's `nextMissingUpstream` behavior, and the storage
+   call shape is the same single bulk read.
 
-2. **Skipped-upstream tombstone in storage.** Add a
-   `MarkUpstreamSkipped(sessionID, providerName, reason)` method to
-   `UpstreamTokenStorage`
-   (pkg/authserver/storage/types.go:496-516).
-   Implementations record a sentinel record (or a separate skipped-set, at
-   the backend's discretion — the interface hides the choice) so
-   `nextUnattemptedUpstream` can distinguish "never attempted" from
-   "attempted, optional, declined/errored". The tombstone carries no token
-   material; it is cleared on restart-all alongside `DeleteUpstreamTokens`.
+2. **Skipped-upstream record reuses the existing row.**
+   `storage.UpstreamTokens`
+   (pkg/authserver/storage/types.go:55-97)
+   gains two fields — `Skipped bool` and `SkippedReason string` — and a
+   "skip" is just an existing-shape row written via the existing
+   `StoreUpstreamTokens` API with `Skipped: true`, `SkippedReason` set
+   to the RFC 6749 error code (or `chain_failed`), empty token material,
+   and the same `UserID` / `UpstreamSubject` / `ClientID` binding fields
+   the row would have carried on success. No new storage-interface
+   methods are needed, the in-memory and Redis backends store the two
+   new fields as part of the row's normal serialization, and the
+   required-upstream-failure path is unchanged:
+   `handleUpstreamError`'s existing call to `DeleteUpstreamTokens`
+   already wipes every row for the session, skip rows included.
 
-3. **`handleUpstreamError` partial-mode branch**
+   Read-path call sites are updated to filter skipped rows out of any
+   map intended for token use:
+
+   - `InProcessService.GetAllValidTokens`
+     (pkg/auth/upstreamtoken/service.go:83-125)
+     skips rows where `Skipped == true` when building its
+     `map[string]string` of provider → access token. The hydration
+     downstream of this — `TokenValidator.loadUpstreamTokens` /
+     `Middleware` populating `identity.UpstreamTokens`
+     (pkg/auth/token.go:1184-1248)
+     — therefore never sees a skip entry, so the inject, token-exchange,
+     and AWS STS strategies (and Cedar's primary-upstream binding) work
+     unchanged.
+   - `InProcessService.GetValidToken` (and the singular
+     `UpstreamTokenStorage.GetUpstreamTokens` path it sits over) treats a
+     skip row as `ErrNotFound` for callers that want token material,
+     matching the existing "row absent" contract.
+   - The chain handler is the one deliberate consumer of skip state: it
+     calls `GetAllUpstreamTokens` directly and inspects `.Skipped` on the
+     returned rows.
+
+3. **`handleUpstreamError` per-upstream branch**
    (pkg/authserver/server/handlers/callback.go:325-362).
    Look up the current upstream (carried on the pending authorization via
    `PendingAuthorization.UpstreamProviderName` —
    pkg/authserver/storage/types.go:397-453)
    and decide:
 
-   - If the upstream is required (including the primary): preserve today's
-     behavior — `DeleteUpstreamTokens`, write generic `access_denied` to
-     the client.
-   - If the upstream is optional *and* `partialUpstreamAuth: allow`: call
-     `MarkUpstreamSkipped` with the upstream's RFC 6749 error code (or
-     `chain_failed` for transport-level failures), then invoke
-     `continueChainOrComplete` exactly as the success path does. The user
-     is redirected onward to the next required upstream or, if none
-     remains, sees a successful authorization at the client.
+   - If the upstream has `Optional == false` (including the primary):
+     preserve today's behavior — `DeleteUpstreamTokens`, write generic
+     `access_denied` to the client.
+   - If the upstream has `Optional == true`: write a skip row via
+     `StoreUpstreamTokens` with `Skipped: true`, `SkippedReason` set to
+     the upstream's RFC 6749 error code (or `chain_failed` for
+     transport-level failures), and the session's existing identity
+     binding fields populated; then invoke `continueChainOrComplete`
+     exactly as the success path does. The user is redirected onward to
+     the next upstream or, if none remains, sees a successful
+     authorization at the client.
 
    The handler is the single place that classifies §4.1.2.1 error codes;
    we do not propagate distinct codes to the downstream client (the
    existing generic `access_denied` posture is preserved for the
-   non-partial path).
+   required-upstream path).
 
 4. **Identity consistency on completion**
    (pkg/authserver/server/handlers/callback.go:387-410)
-   is unchanged in shape. It still walks every stored upstream token and
-   verifies the resolved subject matches; skipped upstreams have no token,
-   so they contribute no record to walk. The required-upstream subset is
-   exactly the set under consistency check.
+   is unchanged in shape. It still walks every stored upstream row and
+   verifies the resolved subject matches; the walk learns to ignore rows
+   with `Skipped == true` (no token material to compare against) so the
+   subset under consistency check is exactly the set of required, real
+   upstream tokens. Skip rows still carry the session's `UserID` /
+   `UpstreamSubject` binding so the row is auditable on its own merits.
 
-##### Auth server: restart-all on re-authorization
+##### Auth server: re-authorization is a fresh session
 
-A new path in the `/authorize` handler: if the incoming flow correlates to
-a session ID that already holds any upstream tokens (or skipped
-tombstones), the auth server first calls `DeleteUpstreamTokens` and clears
-the skipped set for that session before redirecting to the first
-upstream. The identity-consistency check at the new leg one then enforces
-that the same user binds the session — if a different user comes back, the
-existing session-binding fields
-(`UpstreamTokens.UserID`, `.UpstreamSubject`,
-pkg/authserver/storage/types.go:55-97)
-force a fresh session ID instead of letting the new identity adopt the
-old session.
+`/authorize` requires no changes for this RFC. The existing handler
+already generates a fresh `SessionID` for every call
+(pkg/authserver/server/handlers/authorize.go:73-93)
+and does not correlate the incoming request to any prior session — the
+client supplies its own `client_id`, `state`, and PKCE challenge, none
+of which name a server-side session. A user retrying after a failed or
+declined upstream therefore lands in a brand-new session and walks the
+full chain from leg one against rows that did not exist a moment ago.
 
-Session correlation: the client's `/authorize` request supplies its
-client ID and (in PKCE flows) a fresh code challenge. Session reuse is
-keyed off the existing pending-authorization correlation — no new client
-fields. If a client legitimately holds an unrelated session, the
-restart-all check is a no-op (the session has no tokens yet).
+Whatever the prior session held — real tokens, skip rows, or both —
+stays in storage at its old `SessionID` key and ages out under the
+existing TTL and `cleanupExpired` paths
+(pkg/authserver/storage/types.go:55-97,
+the existing `SessionExpiresAt` lifetime). Because the new walk never
+sees the prior session, no `DeleteUpstreamTokens` step is needed at
+`/authorize` entry, and there is no cross-session identity-takeover
+surface to defend against: the same `client_id` coming back as a
+different upstream identity simply opens a fresh session that walks
+the chain afresh, exactly as if it were a first-time client.
+
+The identity-consistency check
+(pkg/authserver/server/handlers/callback.go:387-410)
+remains a *within-session* invariant — it catches a divergent upstream
+identity across legs of the same walk. It is not asked to bridge two
+`/authorize` invocations.
 
 ##### vMCP: backend → upstream binding
 
@@ -315,27 +366,67 @@ func (s *BackendAuthStrategy) RequiredUpstreamProvider() string {
 Backends whose strategy returns empty are always available — they have no
 upstream dependency.
 
-##### vMCP: backend filtering middleware
+##### vMCP: backend filtering at session creation and dispatch
 
-A per-session filter applied at two points in the vMCP request path:
+A per-session filter applied at two points in the vMCP lifecycle:
+once when capabilities are aggregated and frozen onto the MCP
+session, and again on every dispatched call against a backend.
 
-1. **Capability listings.** Wrap the aggregator's response to
-   `tools/list`, `resources/list`, `resources/templates/list`, and
-   `prompts/list` with a filter that drops any item whose owning backend
-   reports a non-empty `RequiredUpstreamProvider()` not present in the
-   session's `IdentityFromContext(ctx).UpstreamTokens` map
-   (pkg/vmcp/auth/strategies/upstream_inject.go:44-87).
-   Listings are computed per-request, not once at server start, so the
-   filter naturally tracks per-session state. The filter never mutates
-   the backend registry; only the per-request view is altered.
+Both checks read the per-session upstream-token set from upstream token
+storage; the bearer token's `tsid` claim names the session, but the
+tokens themselves are loaded from storage by the existing
+`TokenValidator` middleware
+(pkg/auth/token.go:1184-1248)
+and hydrated onto `identity.UpstreamTokens` before any vMCP handler
+runs. The filter therefore consults `IdentityFromContext(ctx).UpstreamTokens`
+— a storage-backed view, not a claim-derived one — and never decodes
+or trusts upstream-token state out of the JWT itself.
+
+1. **Capability snapshot at session creation.** vMCP aggregates and
+   freezes the per-session capability set at MCP `initialize` time —
+   the session factory's `makeBaseSession` calls the aggregator once
+   via `buildRoutingTableWithAggregator`
+   (pkg/vmcp/session/factory.go:478-506)
+   and stores the resulting tools / resources / prompts on the
+   `defaultMultiSession` value
+   (pkg/vmcp/session/factory.go:496-506).
+   Those slices are read-only thereafter; subsequent `tools/list`,
+   `resources/list`, `resources/templates/list`, and `prompts/list`
+   calls replay the snapshot rather than re-aggregating, and the
+   per-session tool set is also registered with the underlying SDK's
+   tool store during `OnRegisterSession`
+   (pkg/vmcp/server/server.go:1158-1195).
+   The filter therefore has to run *inside* the aggregation step at
+   session creation, not by wrapping list-method responses. Wrapping
+   list handlers would either fight the SDK's per-session store or
+   degrade to a no-op against the cached snapshot.
+
+   The session factory already threads `*auth.Identity` into
+   `makeBaseSession`
+   (pkg/vmcp/session/factory.go:351-375, 423-446),
+   and the `TokenValidator` middleware has hydrated
+   `identity.UpstreamTokens` from storage before the session factory
+   runs. The aggregator (or a thin filter sitting between
+   `buildRoutingTableWithAggregator` and the `defaultMultiSession`
+   assignment) drops any tool / resource / prompt whose owning backend
+   reports a non-empty `RequiredUpstreamProvider()` not present in
+   `identity.UpstreamTokens`. The routing table, advertised tool set,
+   and per-session SDK tool registration all see the filtered view
+   uniformly.
 
 2. **Dispatch refusal.** Before the dispatcher routes `tools/call`,
    `resources/read`, `resources/subscribe`, or `prompts/get` to a
    backend, it re-checks `RequiredUpstreamProvider()` against the
-   session's upstream-token map. A miss produces a structured JSON-RPC
-   error with `code: -32001` (server-defined) and a message naming the
-   missing upstream — this matters because a stale client may have
-   cached an earlier listing.
+   session's upstream-token map (same storage-backed source as above).
+   A miss produces a structured JSON-RPC error with `code: -32001`
+   (server-defined) and a message naming the missing upstream. This
+   is defense-in-depth: under normal flow the cached `tools/list`
+   already omits the backend, but a misbehaving client could fabricate
+   a call against a tool name it should not have, and an out-of-band
+   revocation (refresh-token expiry, IdP admin revoke) could clear an
+   upstream token in storage *after* the session snapshot was taken.
+   Dispatch reads `identity.UpstreamTokens` per request, so it catches
+   both cases.
 
 Filtering is structurally invisible to the MCP protocol: the client just
 sees a smaller capability set, exactly as if those backends were never
@@ -343,6 +434,23 @@ configured. We do not extend the protocol to signal degraded state. End
 users discover what they cannot do by trying to use it; the failing
 tool/resource error includes the missing upstream's name for self-service
 re-auth.
+
+##### Recovery requires a fresh MCP session
+
+Because capabilities are snapshotted at `initialize`, a client cannot
+see new capabilities (e.g. a previously-filtered backend coming back
+after the user authorizes its upstream) within the same vMCP session.
+Recovery therefore requires the client to open a *new* MCP session.
+This is naturally consistent with the re-`/authorize` flow: a fresh
+`/authorize` produces a new JWT carrying a new `tsid` (see
+*Auth server: re-authorization is a fresh session*), and changing the
+bearer token forces the client to open a new MCP session, which
+triggers a fresh `initialize`, which re-runs the aggregator with the
+new session's `identity.UpstreamTokens` view. The recovery sequence
+the user experiences is therefore: re-`/authorize` → exchange for new
+JWT at `/token` → reconnect to vMCP with the new bearer → fresh
+`initialize` → filtered capability set is recomputed against the new
+upstream-token state. No in-session capability refresh is offered.
 
 ##### Refresh-token expiry and out-of-band revocation
 
@@ -356,10 +464,17 @@ the token — there is no server-side introspection poller. The flow:
    token (the IdP rejects refresh or returns an unauthorized response).
 2. The vMCP returns a structured auth error to the client (existing
    path).
-3. The client re-runs `/authorize`. This trips the restart-all branch,
-   wipes the session's upstream tokens and skipped tombstones, and
-   walks every upstream again — the user re-consents across the chain.
-   Identity consistency is re-verified.
+3. The client re-runs `/authorize`. The handler mints a fresh
+   `SessionID` and the user walks every upstream again against that
+   new session — the user re-consents across the chain. Identity
+   consistency is verified within the new walk. The prior session's
+   stored rows are left in place and age out under their existing TTL.
+4. The client exchanges the new code at `/token` for a new JWT (with
+   a new `tsid` claim naming the new session) and reconnects to vMCP
+   with the new bearer. The new MCP connection triggers a fresh
+   `initialize`, which re-aggregates capabilities against the new
+   session's `identity.UpstreamTokens` view. The previously-filtered
+   backend reappears in the new session's capability snapshot.
 
 This is intentionally heavier than per-upstream refresh because we do not
 want a single upstream RT expiry or revocation to silently degrade the
@@ -372,31 +487,57 @@ proactive introspection.
 
 #### API Changes
 
-No external HTTP API or MCP protocol changes. The only new internal
-storage method is `MarkUpstreamSkipped` on `UpstreamTokenStorage`:
+No external HTTP API or MCP protocol changes, and the
+`UpstreamTokenStorage` interface
+(pkg/authserver/storage/types.go:495-516)
+is unchanged. Skip rows ride on the existing `StoreUpstreamTokens` /
+`GetUpstreamTokens` / `GetAllUpstreamTokens` / `DeleteUpstreamTokens`
+methods. The only persistence-shape change is two new fields on the
+already-stored row:
 
 ```go
-// UpstreamTokenStorage interface gains:
-type UpstreamTokenStorage interface {
-    // ... existing methods ...
+// UpstreamTokens (pkg/authserver/storage/types.go:55-97) gains:
+type UpstreamTokens struct {
+    // ... existing fields (ProviderID, AccessToken, RefreshToken, IDToken,
+    // ExpiresAt, SessionExpiresAt, UserID, UpstreamSubject, ClientID) ...
 
-    // MarkUpstreamSkipped records that an optional upstream was attempted
-    // for the given session and either returned an error or was declined
-    // by the user. Subsequent calls to GetAllUpstreamTokens return the
-    // unchanged token set; the chain handler queries skipped state
-    // separately when deciding whether to advance.
-    //
-    // Skipped tombstones are cleared by DeleteUpstreamTokens.
-    MarkUpstreamSkipped(ctx context.Context, sessionID, providerName, reason string) error
+    // Skipped marks this row as a tombstone for an optional upstream that
+    // was attempted for the session and either returned an RFC 6749
+    // §4.1.2.1 error or had its consent screen declined by the user.
+    // When true, AccessToken / RefreshToken / IDToken / ExpiresAt are
+    // zero and read paths that build a live-token view (notably
+    // upstreamtoken.InProcessService.GetAllValidTokens) must skip the
+    // row. Binding fields (UserID, UpstreamSubject, ClientID) carry the
+    // session's identity so the row is auditable on its own merits.
+    Skipped bool
 
-    // IsUpstreamSkipped reports whether MarkUpstreamSkipped has been
-    // called for (sessionID, providerName) in the current session.
-    IsUpstreamSkipped(ctx context.Context, sessionID, providerName string) (bool, error)
+    // SkippedReason records why the upstream was skipped. Sourced from
+    // RFC 6749 §4.1.2.1 error codes (`access_denied`, `invalid_request`,
+    // `server_error`, `temporarily_unavailable`, …) plus a small
+    // internal allowlist (`chain_failed`, `network_error`). Empty when
+    // Skipped is false. Never set to upstream `error_description` text.
+    SkippedReason string
 }
 ```
 
-Both methods need implementations in the in-memory and Redis-backed
-stores.
+In-memory and Redis backends serialise the two new fields as part of
+the row's existing encoding; no new keys, no new TTL semantics. Read
+call sites are updated so the skip flag is observed exactly where it
+matters:
+
+- `InProcessService.GetAllValidTokens`
+  (pkg/auth/upstreamtoken/service.go:83-125)
+  drops rows with `Skipped == true` from the `map[string]string` it
+  returns to `TokenValidator.loadUpstreamTokens` — so
+  `identity.UpstreamTokens` (the storage-backed view consumed by every
+  backend auth strategy, by the vMCP filter, and by Cedar) only ever
+  contains real, live tokens.
+- The singular `GetValidToken` path treats a skip row as not-present,
+  matching its existing contract.
+- The chain handler queries `GetAllUpstreamTokens` directly and
+  inspects `.Skipped` on each row to make the
+  `nextUnattemptedUpstream` and "every required upstream satisfied"
+  decisions in a single storage call per leg.
 
 #### Configuration Changes
 
@@ -413,21 +554,24 @@ spec:
   type: embedded
   embeddedAuthServer:
     issuer: https://vmcp.example.com
-    partialUpstreamAuth: allow
     upstreamProviders:
       - name: github
         type: oidc
-        required: true      # primary identity, must always succeed
+        # optional: false (default) — primary identity, must always succeed
         oidcConfig: { ... }
       - name: slack
         type: oauth2
-        # required: false (default) — slack outage filters slack-mcp only
+        optional: true      # slack outage filters slack-mcp only
         oauth2Config: { ... }
       - name: google
         type: oidc
-        # required: false (default) — declined google consent filters gdrive-mcp only
+        optional: true      # declined google consent filters gdrive-mcp only
         oidcConfig: { ... }
 ```
+
+A manifest that leaves `optional` unset on every provider behaves
+identically to today: every upstream is required, and a single failure
+tears down the whole chain.
 
 And on the `VirtualMCPServer`:
 
@@ -436,24 +580,30 @@ spec:
   incomingAuth:
     authzConfig:
       inline:
-        primaryUpstreamProvider: github     # webhook enforces github.required==true
+        primaryUpstreamProvider: github     # webhook enforces github.optional==false
         policies: [ ... ]
 ```
 
 #### Data Model Changes
 
-Storage gains a per-session "skipped upstreams" set, addressable by
-`(sessionID, providerName)`. In-memory implementation is a `map[string]
-map[string]string` (session → provider → reason) guarded by the existing
-mutex. Redis implementation uses a hash keyed by sessionID with provider
-names as fields. The set is wiped by `DeleteUpstreamTokens` in the
-existing restart-all path.
+The only persistence-shape change is the two new fields on
+`storage.UpstreamTokens` described in *API Changes* above: `Skipped
+bool` and `SkippedReason string`. A skipped upstream is just an
+existing-shape row at the existing `(sessionID, providerName)` key with
+`Skipped == true` and empty token material; no new map, hash, key
+space, or storage object is introduced. Both backends gain the two
+fields in their existing serialization path (the in-memory store
+already holds `*UpstreamTokens` by reference; the Redis store
+serialises the struct as one value per key) and the row's existing TTL
+governs its lifetime.
 
-Tombstones have no independent TTL: they live for the lifetime of the
-session and are cleared only by restart-all. Retrying a previously
-declined upstream requires the client to re-run `/authorize`, which
-trips restart-all and walks the full chain again — consistent with the
-restart-all-only recovery model used elsewhere in this RFC.
+Skip rows have no independent retention: they live with the rest of
+the session's upstream rows and share the session's TTL, ageing out
+under the existing `cleanupExpired` and `SessionExpiresAt` paths.
+Retrying a previously declined upstream requires the client to re-run
+`/authorize`, which mints a fresh `SessionID` and walks the full
+chain again against a new, empty session — consistent with the
+whole-chain recovery model used elsewhere in this RFC.
 
 No changes to `PendingAuthorization`
 (pkg/authserver/storage/types.go:397-453).
@@ -473,26 +623,38 @@ pending record.
   `UpstreamTokens.UserID`/`UpstreamSubject` against the resolved subject;
   this check is unchanged. Skipped upstreams contribute no token and so
   cannot inject a divergent identity.
-- **Threat B — Restart-all session takeover.** A second user holding the
-  same session ID (e.g. via a stolen client artifact) could attempt to
-  restart-all and adopt the session. Mitigation: identity-consistency
-  re-evaluates at the *new* leg one — if the resolved subject differs from
-  any historic binding the auth server still has visibility into, the
-  flow fails. With partial-auth this is no weaker than today; without
-  restart-all the same threat exists.
+- **Threat B — Cross-session identity adoption on re-`/authorize`.**
+  A user (or attacker) running a second `/authorize` flow could in
+  principle try to adopt or otherwise reuse the session state of an
+  earlier flow. Mitigation: not applicable — the auth server already
+  mints a fresh `SessionID` on every `/authorize`
+  (pkg/authserver/server/handlers/authorize.go:73-93)
+  and never correlates an incoming request to a prior session. The new
+  flow's `(sessionID, providerName)` rows are disjoint from any
+  earlier session's rows; there is no overlap to attack. The prior
+  session's rows age out under their existing TTL. Within the new
+  walk, the identity-consistency check
+  (pkg/authserver/server/handlers/callback.go:387-410)
+  continues to catch a divergent upstream identity across legs of the
+  *same* session, which is the property this RFC needs.
 - **Threat C — Operator misconfiguration: optional primary.** An operator
   could mark the authz-policy primary upstream as optional, in which case
   Cedar policies would evaluate against an absent or wrong identity.
-  Mitigation: admission webhook rejects configurations where
-  `primaryUpstreamProvider`'s `required` is `false` under
-  `partialUpstreamAuth: allow`. Defense-in-depth: at runtime, the chain
-  treats the primary as required even if the field is somehow false on a
-  stored object.
-- **Threat D — Stale-client backend invocation.** A client that listed
-  tools before an upstream expired could still issue calls against a
-  filtered backend. Mitigation: dispatcher re-checks
-  `RequiredUpstreamProvider()` per request and returns a structured
-  error; the filter is not list-time-only.
+  Mitigation: admission webhook rejects configurations where the
+  `primaryUpstreamProvider` has `optional: true`. Defense-in-depth: at
+  runtime, the chain treats the primary as required even if the field is
+  somehow `true` on a stored object.
+- **Threat D — Stale-session backend invocation.** Because the
+  capability snapshot is frozen at session creation, a client that
+  enumerated tools at `initialize` could still attempt to invoke a
+  tool whose upstream token has since been revoked (refresh-token
+  expiry, IdP admin revoke) or otherwise removed from storage.
+  Mitigation: dispatcher re-checks `RequiredUpstreamProvider()`
+  against the current `identity.UpstreamTokens` (re-hydrated from
+  storage on every request) per `tools/call`, `resources/read`,
+  `resources/subscribe`, and `prompts/get`; a miss returns a
+  structured `unauthorized_backend` error naming the missing
+  upstream. The filter is not snapshot-only.
 - **Threat E — Information disclosure via filtered listings.** Filtered
   listings reveal which providers a session has not authorized (by
   absence). This is the same disclosure as a session that simply hasn't
@@ -511,25 +673,29 @@ pending record.
 
 ### Data Security
 
-- The new skipped-upstream tombstones carry only the provider name and an
-  error reason string. No tokens, claims, or PII. They expire with the
-  session.
-- Existing token storage is unchanged.
+- Skip rows reuse the existing `UpstreamTokens` row at the existing
+  `(sessionID, providerName)` key but carry no token material — the
+  `AccessToken`, `RefreshToken`, `IDToken`, and `ExpiresAt` fields are
+  zero. They retain the session's identity-binding fields (`UserID`,
+  `UpstreamSubject`, `ClientID`) for audit and for the runtime guard
+  on the consistency check. They live with the rest of the session's
+  rows and expire on the same session-end paths (TTL,
+  `SessionExpiresAt`, and the existing required-upstream-failure
+  `DeleteUpstreamTokens`).
+- The existing token-storage interface and its on-disk encoding are
+  unchanged in shape; the row simply gains two scalar fields.
 
 ### Input Validation
 
-- `partialUpstreamAuth` is enum-validated (`requireAll`|`allow`) at the
-  CRD layer.
-- `Required` is a leaf bool.
+- `Optional` is a leaf bool, kubebuilder-defaulted to `false`.
 - Cross-field rule: at admission, verify
-  `upstreamProviders[primary].Required == true` when
-  `partialUpstreamAuth == "allow"`. Implemented in the existing
-  `MCPExternalAuthConfig` and `VirtualMCPServer` admission paths, with a
-  Go-level guard in the reconciler for defense-in-depth.
-- Skipped tombstone reasons are sourced from RFC 6749 §4.1.2.1 error
-  codes and a small allowlist of internal reasons (`chain_failed`,
+  `upstreamProviders[primary].Optional == false`. Implemented in the
+  existing `MCPExternalAuthConfig` and `VirtualMCPServer` admission
+  paths, with a Go-level guard in the reconciler for defense-in-depth.
+- `SkippedReason` values are sourced from RFC 6749 §4.1.2.1 error codes
+  and a small allowlist of internal reasons (`chain_failed`,
   `network_error`); we do not echo arbitrary upstream
-  `error_description` text into stored state.
+  `error_description` text into the stored row.
 
 ### Secrets Management
 
@@ -544,9 +710,11 @@ Emit structured logs for:
   load-bearing for debugging — when a user reports a missing backend, the
   log explains which provider was skipped and why.
 - `chain_completed_partial` — `{session_id, required_count, skipped_count}`
-  at INFO once per chain completion in partial mode.
-- `chain_restart_all` — `{session_id}` at INFO when a re-`/authorize`
-  wipes prior tokens.
+  at INFO once per chain completion where at least one optional upstream
+  was skipped.
+- The existing `/authorize` entry log already records each new
+  `SessionID`; no separate re-authorization event is needed since
+  re-`/authorize` is structurally just "another new session."
 - `backend_filtered_for_session` — `{session_id, backend_id, missing_provider}`
   at DEBUG when the filter strips a listing entry. INFO would be too
   noisy: every `tools/list` would emit one per filtered backend.
@@ -572,9 +740,9 @@ breakdown by default.
 | Threat | Mitigation |
 |--------|------------|
 | Cross-identity token binding | Existing identity-consistency check, unchanged scope |
-| Restart-all session takeover | Identity check re-runs at fresh leg one |
+| Cross-session identity adoption | Fresh `SessionID` on every `/authorize`; no cross-session correlation |
 | Optional primary misconfig | Admission webhook rejection + runtime guard |
-| Stale-client invocation | Dispatcher re-check (defense in depth) |
+| Stale-session invocation (snapshot post-revocation) | Dispatcher re-checks storage-backed `identity.UpstreamTokens` per request |
 | Information disclosure | No new leak vs. status quo |
 
 ## Alternatives Considered
@@ -631,7 +799,7 @@ Rather than reading
 ### Alternative 4: Implicitly-promote optional primaries instead of rejecting
 
 Instead of admission rejection when
-`upstreamProviders[primary].Required == false`, silently treat the
+`upstreamProviders[primary].Optional == true`, silently treat the
 primary as required at runtime.
 
 - **Pros**: Configs always reconcile.
@@ -646,26 +814,32 @@ primary as required at runtime.
 
 ### Backward Compatibility
 
-- `partialUpstreamAuth` defaults to `requireAll`, exactly matching
-  today's behavior.
-- `Required` defaults to `false`; in `requireAll` mode it is ignored, so
-  existing configs that never set it work unchanged.
-- The new `MarkUpstreamSkipped`/`IsUpstreamSkipped` storage methods are
-  additive; existing tests and callers continue to compile.
+- `Optional` defaults to `false`, so an unchanged manifest treats every
+  upstream as required and reproduces today's all-or-nothing chain
+  exactly.
+- The `UpstreamTokenStorage` interface is unchanged. The new `Skipped`
+  / `SkippedReason` fields on `UpstreamTokens` deserialise to their
+  zero values from rows written before the upgrade, so existing
+  in-memory and Redis data continues to load and existing tests and
+  callers continue to compile.
 - Existing single-upstream deployments (MCPServer, MCPRemoteProxy) are
-  unaffected — the new logic only fires when `len(upstreams) > 1` and
-  `partialUpstreamAuth == "allow"`.
+  unaffected — there is no second upstream to mark optional, so the
+  partial-auth path is unreachable.
 
 ### Forward Compatibility
 
-- The `partialUpstreamAuth` enum can grow values (e.g. `quorum`, where N
-  of M required upstreams must succeed) without breaking existing
-  manifests.
-- The skipped-upstream tombstone schema is internal; storage backends can
-  evolve it freely.
-- The vMCP filter is per-request and operates on aggregator output —
-  future protocol versions or new capability lists slot in without
-  reworking the filter.
+- If more expressive quorum semantics are ever needed (e.g. "any N of
+  these M optional upstreams must succeed"), they can be layered on by
+  adding a new sibling field — the per-provider `optional` bool stays
+  meaningful and existing manifests keep working.
+- The `Skipped` / `SkippedReason` field shape on `UpstreamTokens` is
+  internal to the auth server; storage backends can evolve the encoding
+  freely.
+- The vMCP filter runs at the aggregator step during session creation
+  and at dispatch time per request — future protocol versions or new
+  capability lists slot in without reworking the filter, provided
+  they also flow through `buildRoutingTableWithAggregator` and the
+  per-session capability snapshot.
 
 ## Implementation Plan
 
@@ -678,47 +852,89 @@ tested without churning the CRD surface while the design settles.
 
 - Extend the auth server runtime config (`Handler` constructor and
   `NamedUpstream` struct in `pkg/authserver/server/handlers/`) with a
-  `PartialUpstreamAuth` mode toggle and a per-upstream `Required` flag.
-  Fields are populated programmatically for now; CRD wiring lands in
-  Phase 4.
-- Add `MarkUpstreamSkipped` / `IsUpstreamSkipped` to the storage
-  interface, in-memory implementation, and Redis implementation.
-- Implement `nextUnattemptedUpstream`, retiring `nextMissingUpstream`
-  (or wrap it; either way the original is gone after this phase).
-- Extend `handleUpstreamError` to branch on partial mode.
+  per-upstream `Optional` flag (default `false`). The field is populated
+  programmatically for now; CRD wiring lands in Phase 4. When every
+  upstream's `Optional` is `false` (i.e. unchanged manifests), the
+  partial-auth code paths reduce to today's all-or-nothing behavior.
+- Extend `storage.UpstreamTokens` with `Skipped bool` and `SkippedReason
+  string`; update the in-memory and Redis encodings to round-trip the
+  two fields. The `UpstreamTokenStorage` interface itself is unchanged.
+- Filter skip rows out of
+  `upstreamtoken.InProcessService.GetAllValidTokens` and the singular
+  `GetValidToken` so `identity.UpstreamTokens` and existing strategy
+  consumers behave exactly as today when no rows are skipped.
+- Implement `nextUnattemptedUpstream` on top of a single
+  `GetAllUpstreamTokens(sessionID)` call, retiring `nextMissingUpstream`
+  (or wrapping it; either way the original is gone after this phase).
+- Extend `handleUpstreamError` to branch on per-upstream `Optional`,
+  writing a `Skipped: true` row via the existing `StoreUpstreamTokens`
+  when the upstream is optional.
 - Tests: golden cases for partial-success, all-required-fail,
-  optional-fail, identity-consistency under partial completion.
+  optional-fail, identity-consistency under partial completion; round-
+  trip tests for the new fields on both storage backends; assertion
+  that `identity.UpstreamTokens` never contains skipped providers.
 
-### Phase 2: Restart-all on `/authorize`
+### Phase 2: Re-authorization tests
 
-- Add the prior-token check at `/authorize` entry; wipe on hit.
-- Tests: same-user restart works; different-user restart starts a fresh
-  session; identity-consistency catches a forged restart.
+No new code is needed for re-authorization — the existing `/authorize`
+handler already mints a fresh `SessionID` per call and does not
+correlate to prior sessions, which is exactly the behavior this RFC
+relies on. This phase only adds tests pinning that property so a
+future refactor can't quietly introduce session reuse:
+
+- Test that two back-to-back `/authorize` calls from the same client
+  produce distinct `SessionID`s in `PendingAuthorization`.
+- Test that the second call's chain walk reads zero pre-existing
+  upstream rows under its new `SessionID`, even when the first call
+  left real tokens or skip rows behind under the old `SessionID`.
+- Test that within-session identity consistency still fires when an
+  attacker-controlled second leg binds a different upstream subject
+  than the first leg of the *same* session.
 
 ### Phase 3: vMCP backend filtering
 
 - Add `RequiredUpstreamProvider()` helper on `BackendAuthStrategy`.
-- Add the per-session filter to the aggregator wrapper for `tools/list`,
-  `resources/list`, `resources/templates/list`, `prompts/list`.
+- Apply the per-session filter at session-creation time, inside or
+  immediately after `buildRoutingTableWithAggregator`
+  (pkg/vmcp/session/factory.go:478-506),
+  so the routing table, advertised tool set, all-resolved tool set,
+  resources, and prompts written onto `defaultMultiSession` already
+  exclude any backend whose `RequiredUpstreamProvider()` is not
+  present in the session's `identity.UpstreamTokens`. The cached
+  snapshot served by `tools/list`, `resources/list`,
+  `resources/templates/list`, and `prompts/list` is therefore filtered
+  by construction; no separate list-handler wrapper is needed (and
+  one would be ineffective, since the SDK serves the cached
+  per-session tool store registered during `OnRegisterSession`).
 - Add the dispatch-time refusal for `tools/call`, `resources/read`,
-  `resources/subscribe`, `prompts/get`.
-- Tests: filtered listings omit unauthorized backends; stale-client
-  invocations refused with structured error.
+  `resources/subscribe`, `prompts/get`. This re-checks
+  `RequiredUpstreamProvider()` against the *current*
+  `identity.UpstreamTokens` (re-read from storage by `TokenValidator`
+  middleware on every request), so it catches both stale-client
+  fabrications and tokens that disappeared from storage after the
+  session snapshot was taken.
+- Tests: session creation under a partially-authorized identity
+  produces a `defaultMultiSession` whose `tools`/`resources`/`prompts`
+  slices omit unauthorized backends; `tools/list` against that session
+  returns the filtered set; stale-client invocation of a filtered tool
+  yields the `unauthorized_backend` JSON-RPC error; an out-of-band
+  storage delete between session creation and dispatch is caught at
+  the dispatcher.
 
 ### Phase 4: CRD schema and admission
 
-- Add `PartialUpstreamAuth` and `Required` fields to
-  `EmbeddedAuthServerConfig` and `UpstreamProviderConfig` with
-  kubebuilder markers and defaults.
-- Wire the operator reconciler to translate the new fields into the
+- Add the `Optional` field to `UpstreamProviderConfig` with kubebuilder
+  markers and a `false` default.
+- Wire the operator reconciler to translate the new field into the
   auth server runtime config plumbed in Phase 1.
-- Extend admission validation for the optional-primary rule.
+- Extend admission validation for the optional-primary rejection rule.
 - Regenerate manifests, deepcopy, and API docs
   (`task operator-generate`, `task operator-manifests`,
   `task crdref-gen`).
-- Tests: webhook accepts default, rejects optional-primary, accepts
-  optional non-primary; reconciler end-to-end test confirms field
-  propagation into the running auth server.
+- Tests: webhook accepts default, rejects `optional: true` on the
+  primary upstream, accepts `optional: true` on a non-primary upstream;
+  reconciler end-to-end test confirms field propagation into the
+  running auth server.
 
 ### Phase 5: Documentation and observability
 
@@ -743,33 +959,54 @@ tested without churning the CRD surface while the design settles.
     against each RFC 6749 §4.1.2.1 error code.
   - Identity-consistency check under partial completion (skipped
     upstream contributes no record; required ones do).
-  - vMCP filter middleware against synthesized capability sets.
+  - vMCP session creation under a synthesised identity whose
+    `UpstreamTokens` map is missing one provider: the resulting
+    `defaultMultiSession`'s `tools`/`allTools`/`resources`/`prompts`
+    slices omit the dependent backend; `routingTable` does not route
+    to it.
+  - vMCP dispatcher refusal: a `tools/call` against a backend whose
+    `RequiredUpstreamProvider()` is absent from the request's
+    `identity.UpstreamTokens` yields the structured
+    `unauthorized_backend` error, even if the session snapshot was
+    built when the token was present (simulates out-of-band
+    revocation between `initialize` and the call).
   - `RequiredUpstreamProvider()` over each strategy type and the
     no-binding case.
 - **Integration tests**:
   - End-to-end chain walk against fake OIDC/OAuth2 upstreams with one
-    declining consent under `partialUpstreamAuth: allow` vs.
-    `requireAll`.
-  - Restart-all against an existing session: same-user wipes-and-rebinds
-    succeeds; different-user starts fresh.
-  - Refresh-token expiry of one provider triggers backend auth error,
-    client `/authorize` triggers restart-all, full chain re-walks.
-- **Admission webhook tests**: optional-primary rejected;
-  optional-non-primary accepted under `allow`; `Required` field ignored
-  in `requireAll` mode.
+    declining consent in two configurations: (a) every upstream has
+    `optional: false` — entire chain fails, matching today; (b) the
+    declining upstream has `optional: true` — chain completes and the
+    dependent backend is filtered.
+  - Re-`/authorize` after a partial flow: the new call mints a fresh
+    `SessionID`, walks the full chain again, and observes no state from
+    the prior session (whose rows remain at the old `SessionID` key
+    until their TTL).
+  - Refresh-token expiry of one provider triggers a backend auth
+    error; the client re-runs `/authorize`, exchanges at `/token` for
+    a new JWT (new `tsid`), reconnects to vMCP, and the resulting
+    fresh `initialize` returns a capability snapshot that includes
+    the previously-filtered backend.
+- **Admission webhook tests**: `optional: true` on the primary rejected;
+  `optional: true` on a non-primary accepted; manifests with no
+  `optional` field at all accepted and behave as required.
 - **Manual / E2E**:
-  - User declines consent on slack while github + google succeed; vMCP
-    is reachable, slack backends omitted from `tools/list`.
-  - Same session re-runs `/authorize` after slack outage recovers;
-    backend re-appears in subsequent listing.
+  - With slack and google configured `optional: true`, user declines
+    consent on slack while github + google succeed; vMCP is reachable,
+    slack backends omitted from `tools/list`.
+  - After slack outage recovers, client re-runs `/authorize`,
+    exchanges for a new JWT, and reconnects to vMCP; the new MCP
+    session's `tools/list` includes the slack backend. Confirm the
+    *original* MCP session (still holding the old JWT) continues to
+    see the filtered snapshot — recovery requires a new session.
 
 ## Documentation
 
 - New operator-facing guide section: "Partial upstream authorization for
   multi-IdP vMCPs" (motivation, config keys, admission rules,
   troubleshooting).
-- CRD reference updates (auto-regenerated): `partialUpstreamAuth` and
-  `required` field descriptions.
+- CRD reference updates (auto-regenerated): `optional` field
+  description on `UpstreamProviderConfig`.
 - Runbook update: how to identify which upstream caused a skipped
   backend (log fields, metrics).
 - `docs/arch/` update if the embedded auth server has an existing
@@ -786,8 +1023,13 @@ None.
 - pkg/authserver/server/handlers/callback.go — chain orchestration
 - pkg/authserver/server/handlers/handler.go — `nextMissingUpstream`
 - pkg/authserver/storage/types.go — `UpstreamTokens`, `UpstreamTokenStorage`
+- pkg/auth/token.go — `loadUpstreamTokens`, `TokenValidator.Middleware` (storage hydration of `identity.UpstreamTokens` via the `tsid` claim)
+- pkg/auth/upstreamtoken/service.go — `InProcessService.GetAllValidTokens`, `GetValidToken` (filter skip rows out of the live-token map)
 - pkg/vmcp/auth/types/types.go — backend strategy → upstream binding
 - pkg/vmcp/auth/strategies/upstream_inject.go — upstream token consumption
+- pkg/vmcp/session/factory.go — `makeBaseSession`, `buildRoutingTableWithAggregator` (capability snapshot at session creation; site for the per-session filter)
+- pkg/vmcp/server/server.go — `handleSessionRegistrationImpl`, `OnRegisterSession` (where the per-session capability snapshot is registered with the SDK)
+- pkg/vmcp/discovery/middleware.go — `handleInitializeRequest` / `handleSubsequentRequest` (capabilities discovered at `initialize`, cached for session lifetime)
 - cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go — `EmbeddedAuthServerConfig`, `UpstreamProviderConfig`
 - cmd/thv-operator/api/v1beta1/mcpserver_types.go — `AuthzConfigRef.ExplicitPrimaryUpstreamProvider()`
 
