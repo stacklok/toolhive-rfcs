@@ -206,6 +206,16 @@ If a future incoming-auth type uses RFC 7662 token introspection (it currently d
 - No public API change: the affected packages are all internal.
 - Legacy metadata keys remain defined for one release cycle so the migration's legacy-detection branch can read them; they are removed in the cleanup phase.
 
+### Rollback
+
+Sessions written by the new code contain only `MetadataKeyIdentityBinding` and not the legacy `MetadataKeyTokenHash` / `MetadataKeyTokenSalt`. When the prior image's session manager loads such a session, `loadSession` checks for `MetadataKeyTokenHash` before delegating to `RestoreSession`. Because the key is absent, `loadSession` returns `transportsession.ErrSessionNotFound` immediately — the session is never passed to `RestoreSession`, and the hijack-prevention decorator is never constructed without a binding. A second independent fail-closed gate inside `RestoreSession` catches any path that might somehow reach it. There is no code path that restores a session without the decorator. The client receives the standard MCP re-init signal and starts a fresh session — the same operator-visible cost as the forward-migration path.
+
+Operator consequence: rolling back to the prior image invalidates new-format sessions (one re-auth per active session) but the system is safe. There is no need to wait out the session TTL before rolling back.
+
+A defensive write of a sentinel `MetadataKeyTokenHash` from the new code is explicitly rejected. An empty sentinel would cause the prior image's `RestoreHijackPrevention` to treat the session as anonymous (`allowAnonymous=true`) — a security downgrade worse than a clean re-init.
+
+The prior image's `Terminate` uses `MetadataKeyTokenHash` presence as the Phase-1/Phase-2 discriminator. On rollback, terminating a new-format session takes the Phase-1 placeholder path (marks `terminated=true` rather than immediately deleting it), so the session lingers in Redis until its TTL expires. This is a behavioural oddity, not a security regression — both `Validate` and `loadSession` reject terminated sessions — but operators should expect rolled-back-and-terminated sessions to remain visible in Redis until TTL.
+
 ### Forward compatibility
 
 - RFC 7662 introspection-based incoming auth would require the IdP to emit `iss` and `sub` in introspection responses. A startup probe that fails fast on incompatible IdPs is recommended when that mode is added — it's not a hard precondition because the failure mode is loud (extraction errors on every request) and surfaces immediately in operator logs.
