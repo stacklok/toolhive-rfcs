@@ -154,7 +154,7 @@ The binding deliberately uses `(iss, sub)` and *only* `(iss, sub)`:
 
 ### AnonymousMiddleware scoping
 
-`AnonymousMiddleware` emits identical `(iss="toolhive-local", sub="anonymous")` for every request. Consequently every anonymous user collapses into one binding equivalence class — per-identity hijack prevention is impossible *by construction* in anonymous deployments. This is not a regression: the old token-hash scheme produced the empty-string sentinel for the same case and exhibited identical behaviour. We surface the limitation at startup with a `WARN` and document the mode as dev-only. The session decorator still defends against the *upgrade attack* — a token presented to an anonymous session is rejected.
+`AnonymousMiddleware` emits identical `(iss="toolhive-anonymous", sub="anonymous")` for every request. Consequently every anonymous user collapses into one binding equivalence class — per-identity hijack prevention is impossible *by construction* in anonymous deployments. The distinct `iss` value (`toolhive-anonymous` rather than `toolhive-local`) ensures a local user named `anonymous` produces binding `toolhive-local\x00anonymous`, structurally different from the anonymous-mode binding `toolhive-anonymous\x00anonymous` — the collision is eliminated by construction. This is not a regression versus the old token-hash scheme: the old scheme produced the empty-string sentinel for the same case and exhibited identical behaviour. We surface the limitation at startup with a `WARN` and document the mode as dev-only. The session decorator still defends against the *upgrade attack* — a token presented to an anonymous session is rejected.
 
 ### LocalUserMiddleware: a prior gap closed
 
@@ -167,6 +167,7 @@ Before this change, `LocalUserMiddleware` set `Token == ""`, which made the old 
 - `Format` rejects NUL injection in either half; `Parse` rejects trailing NULs as defence-in-depth.
 - Session creation computes the binding before any metadata write, so a failed extraction leaves no partial state.
 - Restore rejects any stored value that is neither the unauthenticated sentinel nor parseable.
+- The `iss` values `toolhive-anonymous` (AnonymousMiddleware) and `toolhive-local` (LocalUserMiddleware) are structurally distinct. A local user whose username happens to be `anonymous` produces binding `toolhive-local\x00anonymous`; the anonymous-mode binding is `toolhive-anonymous\x00anonymous`. No runtime reservation of `anonymous` as a forbidden username is required.
 
 ### Timing side channel
 
@@ -210,6 +211,7 @@ If a future incoming-auth type uses RFC 7662 token introspection (it currently d
 - RFC 7662 introspection-based incoming auth would require the IdP to emit `iss` and `sub` in introspection responses. A startup probe that fails fast on incompatible IdPs is recommended when that mode is added — it's not a hard precondition because the failure mode is loud (extraction errors on every request) and surfaces immediately in operator logs.
 - `Format` and `Parse` are total functions over their inputs; the format is fixed. Future extensions (multiple sub-claims, federated identifiers) would land as new sentinel values or a new metadata key, not changes to the existing format.
 - **Session-pinned state checkpoint:** any future RFC introducing session-pinned state at the vMCP layer (elicitation consents, long-lived tool grants, cached upstream authorizations) MUST explicitly decide whether to extend the binding to an actor-axis dimension, or pin the new state to its own identifier independent of the session-id. Adding such state without revisiting this RFC re-opens the actor-collision class noted in §Security Considerations.
+- The `toolhive-` prefix in `iss` is reserved for internal synthetic identities; any future middleware that generates identities without an external OIDC issuer MUST use a distinct `toolhive-<mode>` value rather than reusing an existing one, so each internal mode forms its own binding equivalence class by construction.
 
 ## Implementation Plan
 
