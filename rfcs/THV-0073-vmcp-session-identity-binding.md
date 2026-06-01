@@ -150,7 +150,7 @@ The binding deliberately uses `(iss, sub)` and *only* `(iss, sub)`:
 - **Token exchange (RFC 8693)**: The binding is at the front-door token, not at any upstream-exchanged token. RFC 8693 §4.1 impersonation preserves `sub`; delegation adds `act` but `sub` still describes the principal the token is *about*. No interaction with the binding.
 - **Why not `aud`**: step-up auth and audience-scoped tokens for different upstreams must not force a new vMCP session. `aud` validation belongs in the token-validation layer, one above the session boundary.
 - **Why not `acr`/`amr`**: step-up enforcement is Cedar's job (authz layer), not the session layer.
-- **Why not `act`**: describes who is using the token, not who it is about — wrong axis for session identity.
+- **Why not `act`**: Session-hijack defence is an actor-axis concern, and a session-id stolen by Agent-B from Agent-A while both legitimately hold delegated tokens for the same user is a real-but-narrow scenario the `(iss, sub)` binding does not address. The binding deliberately stays on the subject axis for three reasons. First, the `Mcp-Session-Id` is a correlation handle, not a capability handle — an attacker presenting a valid token for the same user can trivially open their own session, so the captured session-id alone yields no privilege escalation under the current feature set. Second, binding to `act` would falsely reject legitimate agent-credential rotation, re-introducing the same class of bug this RFC closes. Third, per-agent differentiation belongs at the authorization layer (Cedar policy on `act.sub`) once the planned nested-claim integration in [THV-XXXX-user-to-agent-delegation](./THV-XXXX-user-to-agent-delegation.md) lands; today the Cedar context converter drops nested-map claims, so the deferral is to a planned mechanism, not an existing one. Per RFC 8693 §4.1, nested `act` chains are "informational only" for access control, so binding chain depth would over-reach the spec.
 
 ### AnonymousMiddleware scoping
 
@@ -209,6 +209,7 @@ If a future incoming-auth type uses RFC 7662 token introspection (it currently d
 
 - RFC 7662 introspection-based incoming auth would require the IdP to emit `iss` and `sub` in introspection responses. A startup probe that fails fast on incompatible IdPs is recommended when that mode is added — it's not a hard precondition because the failure mode is loud (extraction errors on every request) and surfaces immediately in operator logs.
 - `Format` and `Parse` are total functions over their inputs; the format is fixed. Future extensions (multiple sub-claims, federated identifiers) would land as new sentinel values or a new metadata key, not changes to the existing format.
+- **Session-pinned state checkpoint:** any future RFC introducing session-pinned state at the vMCP layer (elicitation consents, long-lived tool grants, cached upstream authorizations) MUST explicitly decide whether to extend the binding to an actor-axis dimension, or pin the new state to its own identifier independent of the session-id. Adding such state without revisiting this RFC re-opens the actor-collision class noted in §Security Considerations.
 
 ## Implementation Plan
 
