@@ -89,7 +89,7 @@ graph TB
 
     SVC --> Lookup & GitRes & OCIClient & Packager & Installer & Store & MKT
     Installer --> UserPlug & ProjPlug
-    MKT -.generates marketplace.json.-> OCI
+    MKT -.->|generates marketplace.json| OCI
 
     style SVC fill:#90caf9,stroke:#1565c0,stroke-width:2px
     style Store fill:#e3f2fd
@@ -386,10 +386,10 @@ These are the skills flows with a plugin manifest in place of `SKILL.md`. The in
 
 ```mermaid
 flowchart TD
-    A[thv plugin install <src>] --> B{Reference type?}
-    B -->|git://| C[Git resolver: clone + extract subdir]
-    B -->|has / : or @| D[OCI pull]
-    B -->|plain name| E[Local store, then registry lookup]
+    A["thv plugin install (source)"] --> B{Reference type?}
+    B -->|"git:// scheme"| C["Git resolver: clone + extract subdir"]
+    B -->|"slash, colon or at"| D[OCI pull]
+    B -->|"plain name"| E[Local store, then registry lookup]
     E --> D
     C --> V[Validate plugin.json + components + fs safety]
     D --> P[Pull → verify digest → decompress → extract tar.gz]
@@ -397,8 +397,8 @@ flowchart TD
     SIG -->|yes| SV[Verify cosign signature via Referrers API]
     SIG -->|no| V
     SV --> V
-    V --> SC[Supply-chain check: manifest name == repo last component]
-    SC --> W[Write to client plugin dir, sanitize perms, no symlinks/traversal]
+    V --> SC["Supply-chain check: manifest name equals repo last component"]
+    SC --> W["Write to client plugin dir, sanitize perms, no symlinks/traversal"]
     W --> R[Create DB record]
     R --> G{--group?}
     G -->|yes| GA[Add to group]
