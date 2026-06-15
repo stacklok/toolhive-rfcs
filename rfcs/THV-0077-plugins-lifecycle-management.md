@@ -9,13 +9,15 @@
 
 ## Summary
 
-This RFC proposes adding **plugin** lifecycle management to ToolHive, mirroring the existing skills system. A *plugin* is the cross-vendor "bundle of primitives" unit pioneered by Claude Code — a directory declared by a `.claude-plugin/plugin.json` manifest that bundles any combination of slash commands, subagents, Agent Skills, hooks, MCP server configurations, and LSP servers. ToolHive will let users **build** a plugin directory into a reproducible OCI artifact, **push** it to any OCI registry, **install** it to one or more AI clients (from a registry name, OCI reference, or `git://` URL), and **list/info/uninstall** it — using the same registry, OCI, groups, and storage infrastructure that already serves skills and MCP servers. As a bridge to native client tooling, ToolHive can also generate a `marketplace.json` from a set of OCI-distributed plugins.
+This RFC proposes adding **plugin** lifecycle management to ToolHive. A *plugin* is the "bundle of primitives" unit pioneered by Claude Code — a directory declared by a `.claude-plugin/plugin.json` manifest that bundles any combination of slash commands, subagents, Agent Skills, hooks, MCP server configurations, and LSP servers. ToolHive will let users **build** a plugin directory into a reproducible OCI artifact, **push** it to any OCI registry, **install** it (from a registry name, OCI reference, or `git://` URL), and **list/info/uninstall** it — using the same registry, OCI, groups, and storage infrastructure that already serves skills and MCP servers.
+
+**A key difference from skills shapes the entire design.** Skills converged on one open standard (`SKILL.md` is read by ~30 clients), so "install to N clients" was just "drop one file in N directories." **Plugin bundle formats never converged** — every client has its own manifest *and* its own discovery rules. The design therefore splits cleanly into two layers: a **client-agnostic distribution layer** (build → OCI → push → catalog → pull → verify → inventory — the bulk of ToolHive's value, identical for every client) and a **per-client materialization layer** (turning a pulled bundle into something a specific client loads). v1 makes the distribution layer fully client-neutral and implements materialization for the `.claude-plugin/plugin.json` family that consumes it natively — **Claude Code and Codex** (which reads `.claude-plugin/plugin.json` as a fallback). Other clients are served by future materialization adapters behind a stable seam. As a bridge to native client tooling, ToolHive can also generate a `marketplace.json` from a set of OCI-distributed plugins.
 
 ## Problem Statement
 
 ToolHive already manages two of the three artifact classes an AI coding workflow consumes: **MCP servers** (as containers) and **skills** (as OCI artifacts, see [RFC-0030](./THV-0030-skills-lifecycle-management.md) and `docs/arch/12-skills-system.md`). The third class — **plugins** — is now the de-facto packaging unit across the ecosystem, and ToolHive has no story for it.
 
-- **Plugins are the industry-convergent bundle unit.** Within ~6 months of Claude Code's October 2025 launch, near-identical bundle systems shipped in Cursor (`.cursor-plugin/plugin.json`), OpenAI Codex CLI (`.codex-plugin/plugin.json` — which even falls back to reading `.claude-plugin/plugin.json`), GitHub Copilot (`.github/plugin.json`), Gemini CLI (`gemini-extension.json`), and AWS Kiro ("Powers"). The component vocabulary (`skills`, `commands`, `agents`, `hooks`, `mcpServers`) has converged even though the manifests are not interoperable.
+- **Plugins are the bundle unit every client adopted — but the format did not converge.** Within ~6 months of Claude Code's October 2025 launch, near-identical bundle systems shipped in Cursor (`.cursor-plugin/plugin.json`), OpenAI Codex CLI (`.codex-plugin/plugin.json` — which also reads `.claude-plugin/plugin.json` as a fallback), GitHub Copilot (`.github/plugin.json`), Gemini CLI (`gemini-extension.json`), and AWS Kiro ("Powers"). The *component vocabulary* (`skills`, `commands`, `agents`, `hooks`, `mcpServers`) converged, but the **manifests are not interoperable** and discovery rules differ (e.g. Gemini's slash commands are `commands/*.toml`, not `*.md`). This is the central constraint of this RFC: unlike skills, a single plugin tree does **not** install unmodified across clients. See "Design constraint: plugin formats did not converge."
 - **There is no OCI-based distribution for multi-primitive plugin bundles anywhere.** Plugins are distributed exclusively through Git/GitHub marketplaces (`marketplace.json`). Docker `cagent` packages single agents as OCI; ToolHive packages single skills as OCI; the official MCP Registry stays a metadata layer over container images. **No one packages a full multi-primitive plugin bundle as an immutable, content-addressable, signable OCI artifact.** This is an open niche ToolHive is uniquely positioned to fill.
 - **Teams cannot govern or distribute plugins.** Without ToolHive, plugin distribution means hand-curated GitHub repos with no digest pinning, no signing, no central catalog, no scoped install, and no inventory of what is installed across a fleet of developer machines.
 - **Plugins carry executable code, which raises the stakes.** Unlike skills (pure Markdown instructions), a plugin bundles **hooks** (shell commands fired on lifecycle events) and **MCP server configs** (executable processes). Installing a plugin is a code-trust decision today made with zero supply-chain tooling. ToolHive's content-addressable + signed-artifact model is exactly the missing control plane.
@@ -25,27 +27,46 @@ Skills proved the pattern. Plugins are the natural next artifact class, and the 
 ## Goals
 
 - Enable lifecycle management of plugins through dedicated `thv plugin` commands: `build`, `push`, `install`, `uninstall`, `list`, `info`, `validate`, and `builds`.
-- Package a plugin directory tree (manifest + all component directories) into a **reproducible, content-addressable OCI artifact**, distributable through any OCI-compliant registry.
-- Support installation from three sources, exactly as skills do: registry name (registry lookup), OCI reference, and `git://` URL (including `@ref` and `#subdir`).
-- Reuse — not duplicate — the skills foundation: shared OCI primitives in `toolhive-core`, the SQLite `entries` table, the registry provider seam, the groups system, the git resolver, scopes, and multi-client `PathResolver` abstraction.
+- Make the **distribution layer fully client-agnostic**: package a plugin tree (manifest + all component directories) into a **reproducible, content-addressable OCI artifact** distributable through any OCI registry, with catalog/discovery, digest pinning, and signature verification — none of which depends on the consuming client.
+- Support the same three install sources as skills: registry name (registry lookup), OCI reference, and `git://` URL (including `@ref` and `#subdir`).
+- Implement the **materialization layer for the `.claude-plugin/plugin.json` family in v1** — Claude Code and Codex (via its `.claude-plugin` fallback) — behind a per-client adapter seam that lets Cursor/Copilot/Gemini be added later without changing the service or artifact format.
+- Reuse — not duplicate — the skills foundation: shared OCI primitives in `toolhive-core`, the SQLite `entries` table, the registry provider seam, the groups system, the git resolver, and scopes. Extend the `pkg/client` abstraction with a per-client **materialization adapter** (the plugin analog of the skills `PathResolver`, but doing more than path mapping).
 - Validate a plugin bundle before packaging or installing: `plugin.json` schema, each bundled component (reusing the skills validator for bundled skills), and filesystem safety.
-- Surface the **executable surface** of a plugin (hooks, MCP server commands) to the user before install, and support digest pinning and signature verification.
-- Bridge OCI distribution to native client tooling by generating a `marketplace.json` from a set of OCI-distributed plugins.
+- Surface the **executable surface** of a plugin (hooks, MCP server commands) to the user before install.
+- Bridge OCI distribution to native client tooling by generating a `marketplace.json` from a set of OCI-distributed plugins (so even clients without a ToolHive materialization adapter can consume ToolHive-distributed plugins).
 
 ## Non-Goals
 
 - **Authoring plugins.** ToolHive packages and distributes plugins; it does not scaffold or generate plugin content. `claude plugin init` and equivalents own authoring.
 - **Running a plugin's runtime behavior.** ToolHive does not execute hooks, dispatch slash commands, or interpret the manifest at the client's runtime — the AI client does that. ToolHive's job ends at placing a validated bundle in the right location (and, optionally, managing the lifecycle of bundled MCP servers — see "Managed MCP servers from plugins" as a *forward-looking* extension, explicitly out of scope for v1 core).
-- **A cross-client plugin format.** ToolHive distributes the existing `plugin.json` bundle format; it does not define a new manifest schema. Multi-manifest fan-out (emitting `.cursor-plugin/`, `.codex-plugin/`, etc.) is a packaging-time concern that can be layered on later.
+- **A new cross-client plugin format.** ToolHive distributes the existing `plugin.json` bundle format; it does not define a new manifest schema or attempt to make one tree install everywhere.
+- **Materialization adapters for Cursor/Copilot/Gemini in v1.** These clients need their own manifest (and, for Gemini, command-format translation). They are explicitly future work behind the adapter seam. Multi-manifest fan-out (emitting `.cursor-plugin/`, `gemini-extension.json`, etc. at build time) is one way to implement them later — see Alternatives Considered and Open Questions #6.
 - **Auto-updates / daemon-driven reconciliation.** Same posture as skills; post-MVP.
 - **Kubernetes operator integration.** Plugins are client-side developer artifacts; CLI/API first. A `MCPPlugin` CRD, if ever warranted, is a separate RFC.
 - **Hosting a marketplace.** ToolHive *generates* `marketplace.json` and serves plugin metadata via its registry API; it does not run a hosted public marketplace service.
 
 ## Proposed Solution
 
+### Design constraint: plugin formats did not converge
+
+This is the fact that distinguishes plugins from skills and dictates the architecture.
+
+| | Skills | Plugins |
+|---|--------|---------|
+| Portable format? | **Yes** — one `SKILL.md` standard, read by ~30 clients | **No** — each client has its own manifest |
+| Install to N clients | drop the same file in N dirs | a per-client problem (different manifest, sometimes different component formats) |
+| ToolHive client coupling | trivial (`PathResolver` = path mapping) | real (materialization adapter = manifest selection/translation + placement) |
+
+Concretely, the same `.claude-plugin/` tree is consumed natively by **Claude Code** and **Codex** (which falls back to reading `.claude-plugin/plugin.json`), is *close* for **Cursor** (near-identical JSON, different manifest path/var), needs a different manifest for **Copilot** (`.github/plugin.json`), and needs genuine translation for **Gemini** (`gemini-extension.json` schema + `commands/*.toml` instead of `*.md`).
+
+The design responds by splitting into two layers:
+
+- **Distribution layer — client-agnostic.** Build, OCI packaging, push, registry catalog, pull, digest pinning, signature verification, and the installed-inventory database. None of it depends on the consuming client. This is where most of ToolHive's value (supply chain, governance, a single catalog alongside servers and skills) lives, and it works for *every* client equally.
+- **Materialization layer — per-client.** Taking a verified, pulled bundle and making it active in a specific client: choosing/writing the right manifest, placing the component tree where that client discovers it, and respecting that client's trust gates. v1 ships one adapter — the `.claude-plugin` family (Claude Code + Codex). The adapter is a clean interface so Cursor/Copilot/Gemini land later without touching the service or the artifact format.
+
 ### High-Level Design
 
-The design is intentionally isomorphic to the skills system. Where skills have `pkg/skills` + `pkg/skills/skillsvc` + `toolhive-core/oci/skills`, plugins gain `pkg/plugins` + `pkg/plugins/pluginsvc` + `toolhive-core/oci/plugins`, sharing the same lower-level tar/gzip/extraction primitives, the same `entries` storage parent, the same registry provider seam, and the same git resolver.
+The distribution layer is intentionally isomorphic to the skills system. Where skills have `pkg/skills` + `pkg/skills/skillsvc` + `toolhive-core/oci/skills`, plugins gain `pkg/plugins` + `pkg/plugins/pluginsvc` + `toolhive-core/oci/plugins`, sharing the same lower-level tar/gzip/extraction primitives, the same `entries` storage parent, the same registry provider seam, and the same git resolver. The materialization layer is the new, plugin-specific part — a per-client `MaterializationAdapter` (see Component Changes) in place of the skills `PathResolver`.
 
 ```mermaid
 graph TB
@@ -133,16 +154,16 @@ ToolHive treats the manifest as **opaque-but-validated**: it parses the fields i
 
 #### Installation scopes and clients
 
-Identical model to skills:
+Scope model is the same as skills:
 
 - **User scope** (default): available across all of the user's projects.
 - **Project scope** (`--scope project --project-root .` or auto-detected git root): available only within a project.
 
-A `PathResolver` maps `(client, plugin-name, scope, project-root)` → install path per client, reusing the skills `PathResolver` pattern. When no `--clients` flag is passed, all plugin-supporting clients detected on the host are targeted (matching skills behavior).
+Client targeting is **not** the same as skills. Because materialization is per-client, `--clients` selects from the clients that have a v1 **materialization adapter** — Claude Code and Codex. When `--clients` is omitted, ToolHive targets the adapter-supported clients detected on the host (v1: the `.claude-plugin` family). Requesting a client without an adapter (e.g. `--clients cursor`) fails with a clear message pointing at `thv plugin marketplace generate` as the interim path. This is deliberately narrower than skills' "all skill-supporting clients" default — see the design constraint above.
 
-#### The install-target decision (the one genuinely new problem)
+#### The materialization decision for the `.claude-plugin` family (v1 adapter)
 
-Skills have a trivial install target: drop `<name>/SKILL.md` into `~/.claude/skills/`. Plugins are harder, because Claude Code's *native* plugin install path involves a marketplace cache (`~/.claude/plugins/cache/`) plus an `enabledPlugins` entry in `settings.json` keyed `name@marketplace` — state ToolHive would have to mutate and own.
+Skills have a trivial materialization target: drop `<name>/SKILL.md` into `~/.claude/skills/`. The `.claude-plugin` family is harder, because the *native* plugin install path involves a marketplace cache (`~/.claude/plugins/cache/`) plus an `enabledPlugins` entry in `settings.json` keyed `name@marketplace` — state ToolHive would have to mutate and own.
 
 There is, however, a much cleaner mechanism that Claude Code already supports: a **skills-directory plugin**. *Any* folder under a skills directory that contains `.claude-plugin/plugin.json` is loaded in-place as a plugin (reported as `<name>@skills-dir`) with **no marketplace registration and no settings mutation** — this is exactly what `claude plugin init` produces.
 
@@ -155,7 +176,27 @@ There is, however, a much cleaner mechanism that Claude Code already supports: a
 
 For completeness, Claude Code also supports two no-settings, **session-only** mechanisms that load all components — `claude --plugin-dir ./path` and `claude --plugin-url <zip>` — and a persistent local-marketplace path (`/plugin marketplace add ./path`) that loads everything but *does* mutate settings (`extraKnownMarketplaces`). These are useful for `thv plugin` dev/test workflows but are not the managed-install target.
 
-The `PathResolver` abstracts the install target per client, so a client whose only viable target is a marketplace cache can opt into the second strategy without changing the service layer. **The per-client target choice is flagged as an open question** — see Open Questions #1.
+**Codex within the v1 adapter.** Codex consumes the *same packaged `.claude-plugin/` tree* — its plugin loader includes `.claude-plugin/plugin.json` in its discoverable manifest paths, so no separate manifest is needed. The exact placement for Codex (its own plugin cache vs. an in-place location) differs from Claude Code's skills-directory mechanism and is an implementation detail of the adapter; the artifact ToolHive distributes is identical. (If Codex's placement turns out to require settings/registration state, the adapter handles it without affecting the distribution layer.)
+
+#### The `MaterializationAdapter` seam
+
+The per-client behavior lives behind one interface, so adding Cursor/Copilot/Gemini later is additive:
+
+```go
+// pkg/plugins — implemented per client in pkg/client adapters
+type MaterializationAdapter interface {
+    // Whether this client can materialize a plugin at all (v1: claude-code, codex).
+    Supports(client MCPClient) bool
+    // Place a verified, extracted bundle so the client loads it. May translate or
+    // emit a client-specific manifest, choose the discovery location, and report
+    // which components will be trust-gated.
+    Materialize(ctx context.Context, bundle ExtractedBundle, scope Scope, projectRoot string) (MaterializeResult, error)
+    // Reverse of Materialize, for uninstall.
+    Dematerialize(ctx context.Context, name string, scope Scope, projectRoot string) error
+}
+```
+
+The v1 `.claude-plugin`-family adapter writes the tree to the skills-directory location (Claude Code) / Codex's location, performs no manifest translation (the packaged `.claude-plugin/plugin.json` is already native to both), and reports trust-gated components for project scope. A future Gemini adapter would, in `Materialize`, emit `gemini-extension.json` and transform `commands/*.md` → `commands/*.toml`. **The per-client target details remain an open question** — see Open Questions #1.
 
 ### OCI Artifact Format
 
@@ -202,7 +243,7 @@ OCI Image Index  (application/vnd.oci.image.index.v1+json, artifactType: dev.too
 
 **Refactor: extract shared OCI primitives.** The tar/gzip/extraction/validation helpers in `oci/skills` (`CreateTar`, `Compress`, `DecompressWithLimit`, `ExtractTarWithLimit`, the `validatingTarget` pull-hardening, the local-build marker `dev.stacklok.toolhive.local-build`) are already skill-agnostic and were explicitly designed to generalize. Lift them into a shared `toolhive-core/oci/internal` (or `oci/artifact`) package consumed by both `oci/skills` and `oci/plugins`. This is convergence, not duplication.
 
-**New: `pkg/plugins`** — types (`PluginManifest`, `Scope`, `PathResolver`, `InstalledPlugin`), `PluginService` interface, parser (`plugin.json`), validator, installer (extraction), options/DTOs.
+**New: `pkg/plugins`** — types (`PluginManifest`, `Scope`, `MaterializationAdapter`, `InstalledPlugin`), `PluginService` interface, parser (`plugin.json`), validator, installer (extraction), options/DTOs. The `MaterializationAdapter` (see "The `MaterializationAdapter` seam") is the per-client extension point; v1 ships one implementation for the `.claude-plugin` family.
 
 **New: `pkg/plugins/pluginsvc`** — the service implementation, structurally mirroring `pkg/skills/skillsvc`: `build.go`, `push` (in build.go), `install.go`, `install_oci.go`, `install_git.go`, `install_registry`, `uninstall.go`, `list.go`, `info`, `content.go`, `oci.go`, `local_build_marker.go`, `marketplace.go` (new — generator).
 
@@ -231,7 +272,8 @@ Selected flags (consistent with `thv skill`):
 
 ```
 thv plugin install <source> [flags]
-  --clients strings      Target client(s) (default: all plugin-supporting clients)
+  --clients strings      Target client(s) with a materialization adapter
+                         (v1: claude-code, codex; default: adapter-supported clients on host)
   --scope string         user | project (default "user")
   --project-root string  Project root for project scope
   --group string         Add plugin to a group
@@ -512,7 +554,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 - **Description**: Install exactly as native plugins do (cache dir + `enabledPlugins`).
 - **Pros**: Faithful to native lifecycle (versioned cache, enable/disable).
 - **Cons**: ToolHive must own and mutate client `settings.json` across scopes and the `name@marketplace` keying; brittle and client-specific.
-- **Why not chosen for v1**: The in-place skills-directory-plugin mechanism gives a pure-filesystem lifecycle identical to skills. Marketplace-cache install is kept as a per-client `PathResolver` strategy for later.
+- **Why not chosen for v1**: The in-place skills-directory-plugin mechanism gives a pure-filesystem lifecycle identical to skills. Marketplace-cache install is kept as a per-client `MaterializationAdapter` strategy for later.
 
 ### Alternative 5: JSON-file state instead of SQLite
 
@@ -520,6 +562,13 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 - **Pros**: Human-inspectable.
 - **Cons**: The ecosystem has since standardized on SQLite (RFC-0041, the `entries` table). Diverging would fragment storage.
 - **Why not chosen**: Reuse the `entries`/`entry_type` foundation that was built for this.
+
+### Alternative 6: Multi-manifest materialization for all clients in v1
+
+- **Description**: At build (or install) time, generate sibling manifests (`.cursor-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.github/plugin.json`, `gemini-extension.json`) from one canonical manifest, with shared component dirs, so `thv plugin install --clients cursor,gemini,...` works on day one.
+- **Pros**: True multi-client install immediately; closest to skills' "works everywhere."
+- **Cons**: Large, ongoing surface — each client's schema and discovery rules must be tracked and kept current; Gemini needs real component translation (`commands/*.md` → `commands/*.toml`), not just a manifest copy; per-client trust/enable mechanics still differ. High maintenance for a fast-moving, non-standard space.
+- **Why not chosen for v1**: The two-layer split lets us ship the full client-agnostic value (distribution, catalog, signing, inventory) plus working install for the `.claude-plugin` family *now*, and add clients incrementally through the `MaterializationAdapter` seam. Multi-manifest generation becomes the *implementation* of those later adapters, scoped per client rather than all at once. This is the option chosen for the eventual Cursor/Copilot/Gemini adapters (Open Questions #6).
 
 ## Compatibility
 
@@ -534,7 +583,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 
 - **Versioned artifact type** (`dev.toolhive.plugins.v1`) leaves room for multi-layer v2.
 - **`entry_type` discriminator** already accommodates further artifact classes.
-- **`PathResolver` per client** lets the marketplace-cache install strategy land later without service changes.
+- **`MaterializationAdapter` per client** is the primary extensibility point: Cursor/Copilot/Gemini adapters (and the marketplace-cache strategy) land later without touching the service or the artifact format. The distribution layer never changes when a client is added.
 - **Provider no-op defaults** let registries adopt plugin catalogs incrementally.
 - **Referrers-based signing** composes with future SBOM/provenance attachments on the same digest.
 - **Managed-MCP-from-plugin** can be added as an opt-in install behavior (run bundled `.mcp.json` servers through `thv` with isolation) without changing the artifact format.
@@ -553,7 +602,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 ### Phase 3: Install / list / info / uninstall
 - OCI install (`install_oci.go`), git install (reuse resolver), registry-name install.
 - `List`, `Info` (with executable-surface inventory), `Uninstall`; groups integration (`Plugins []string` + helpers).
-- Multi-client `PathResolver`: implement the in-place skills-directory-plugin strategy.
+- `MaterializationAdapter` interface + the v1 `.claude-plugin`-family adapter (Claude Code skills-directory placement; Codex placement).
 
 ### Phase 4: API + CLI + content preview
 - REST endpoints under `/api/v1beta/plugins`; HTTP client (`pkg/plugins/client`).
@@ -588,7 +637,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 
 ## Open Questions
 
-1. **Install target per client.** v1 recommends the in-place skills-directory-plugin strategy (no `settings.json` mutation). Should any v1 client instead use the marketplace-cache + `enabledPlugins` strategy, and do we need a dedicated plugins directory distinct from the skills directory to avoid `thv skill list` / `thv plugin list` overlap?
+1. **Materialization target within the v1 adapter.** v1 uses the in-place skills-directory-plugin strategy for Claude Code (no `settings.json` mutation). Two sub-questions: (a) does the skills-directory placement create confusing overlap between `thv skill list` and `thv plugin list` (both scan `~/.claude/skills/`, distinguished only by the presence of `.claude-plugin/plugin.json`), and should plugins use a dedicated directory instead? (b) What is Codex's correct placement — does it auto-discover in-place, or does it need its plugin-cache/registration, and if so does that pull `settings`-like state into the adapter?
 2. **Component-inventory diff on upgrade.** Should an upgrade that *adds* a hook or MCP server require explicit re-approval (`--accept-new-executables`) by default?
 3. **`userConfig` / sensitive options.** Plugins can declare config (some `sensitive`). Does ToolHive stay entirely hands-off (client keychain owns it), or offer to wire values from ToolHive's secrets manager at install time?
 4. **Managed MCP servers from plugins.** Out of scope for v1 core, but is it the headline v2 feature — running a plugin's bundled MCP servers through `thv` (network isolation, permission profiles, audit) instead of the client spawning them unsandboxed?
