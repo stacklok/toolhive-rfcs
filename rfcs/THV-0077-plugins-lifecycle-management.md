@@ -1,4 +1,4 @@
-# RFC-XXXX: Plugin Lifecycle Management in ToolHive
+# RFC-0077: Plugin Lifecycle Management in ToolHive
 
 - **Status**: Draft
 - **Author(s)**: Juan Antonio Osorio (@JAORMX)
