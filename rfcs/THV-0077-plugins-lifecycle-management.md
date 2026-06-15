@@ -11,7 +11,7 @@
 
 This RFC proposes adding **plugin** lifecycle management to ToolHive. A *plugin* is the "bundle of primitives" unit pioneered by Claude Code — a directory declared by a `.claude-plugin/plugin.json` manifest that bundles any combination of slash commands, subagents, Agent Skills, hooks, MCP server configurations, and LSP servers. ToolHive will let users **build** a plugin directory into a reproducible OCI artifact, **push** it to any OCI registry, **install** it (from a registry name, OCI reference, or `git://` URL), and **list/info/uninstall** it — using the same registry, OCI, groups, and storage infrastructure that already serves skills and MCP servers.
 
-**A key difference from skills shapes the entire design.** Skills converged on one open standard (`SKILL.md` is read by ~30 clients), so "install to N clients" was just "drop one file in N directories." **Plugin bundle formats never converged** — every client has its own manifest *and* its own discovery rules. The design therefore splits cleanly into two layers: a **client-agnostic distribution layer** (build → OCI → push → catalog → pull → verify → inventory — the bulk of ToolHive's value, identical for every client) and a **per-client materialization layer** (turning a pulled bundle into something a specific client loads). v1 makes the distribution layer fully client-neutral and implements materialization for the `.claude-plugin/plugin.json` family that consumes it natively — **Claude Code and Codex** (which reads `.claude-plugin/plugin.json` as a fallback). Other clients are served by future materialization adapters behind a stable seam. As a bridge to native client tooling, ToolHive can also generate a `marketplace.json` from a set of OCI-distributed plugins.
+**A key difference from skills shapes the entire design.** Skills converged on one open standard (`SKILL.md` is read by ~30 clients), so "install to N clients" was just "drop one file in N directories." **Plugin bundle formats never converged** — every client has its own manifest *and* its own discovery rules. The design therefore splits cleanly into two layers: a **client-agnostic distribution layer** (build → OCI → push → catalog → pull → verify → inventory — the bulk of ToolHive's value, identical for every client) and a **per-client materialization layer** (turning a pulled bundle into something a specific client loads). v1 makes the distribution layer fully client-neutral and implements materialization for the two clients that consume the `.claude-plugin/plugin.json` format: **Claude Code** (clean in-place install, full component set) and **Codex** (which reads `.claude-plugin/plugin.json` as a fallback, but requires a cache install + `config.toml` mutation and activates only a subset of components — skills/MCP/hooks, not commands or subagents — so the install warns about dropped components). Other clients are served by future materialization adapters behind a stable seam. As a bridge to native client tooling, ToolHive can also generate a `marketplace.json` from a set of OCI-distributed plugins.
 
 ## Problem Statement
 
@@ -57,7 +57,7 @@ This is the fact that distinguishes plugins from skills and dictates the archite
 | Install to N clients | drop the same file in N dirs | a per-client problem (different manifest, sometimes different component formats) |
 | ToolHive client coupling | trivial (`PathResolver` = path mapping) | real (materialization adapter = manifest selection/translation + placement) |
 
-Concretely, the same `.claude-plugin/` tree is consumed natively by **Claude Code** and **Codex** (which falls back to reading `.claude-plugin/plugin.json`), is *close* for **Cursor** (near-identical JSON, different manifest path/var), needs a different manifest for **Copilot** (`.github/plugin.json`), and needs genuine translation for **Gemini** (`gemini-extension.json` schema + `commands/*.toml` instead of `*.md`).
+Concretely, the same `.claude-plugin/` tree is read by **Claude Code** (in-place, full component set) and **Codex** (via its `.claude-plugin` fallback — but with a heavier install path and only a subset of components; see below), is *close* for **Cursor** (near-identical JSON, different manifest path/var), needs a different manifest for **Copilot** (`.github/plugin.json`), and needs genuine translation for **Gemini** (`gemini-extension.json` schema + `commands/*.toml` instead of `*.md`). Even the two "natively compatible" clients diverge sharply at the materialization layer — which is exactly why materialization is modeled as per-client adapters rather than one shared path.
 
 The design responds by splitting into two layers:
 
@@ -176,27 +176,47 @@ There is, however, a much cleaner mechanism that Claude Code already supports: a
 
 For completeness, Claude Code also supports two no-settings, **session-only** mechanisms that load all components — `claude --plugin-dir ./path` and `claude --plugin-url <zip>` — and a persistent local-marketplace path (`/plugin marketplace add ./path`) that loads everything but *does* mutate settings (`extraKnownMarketplaces`). These are useful for `thv plugin` dev/test workflows but are not the managed-install target.
 
-**Codex within the v1 adapter.** Codex consumes the *same packaged `.claude-plugin/` tree* — its plugin loader includes `.claude-plugin/plugin.json` in its discoverable manifest paths, so no separate manifest is needed. The exact placement for Codex (its own plugin cache vs. an in-place location) differs from Claude Code's skills-directory mechanism and is an implementation detail of the adapter; the artifact ToolHive distributes is identical. (If Codex's placement turns out to require settings/registration state, the adapter handles it without affecting the distribution layer.)
+#### Codex: a second v1 adapter, with a heavier mechanism and reduced fidelity
+
+The same packaged `.claude-plugin/` tree is *readable* by Codex — its loader supports `.claude-plugin/plugin.json` as a fallback manifest (`ALTERNATE_PLUGIN_MANIFEST_RELATIVE_PATH`), so no separate manifest is required. But — **verified against `openai/codex` source** — Codex's materialization is fundamentally different from Claude Code's, in two ways that the adapter must handle and that `thv plugin install` must surface to the user:
+
+1. **No in-place discovery — Codex requires cache install + config state.** Loading a plugin needs *both* the plugin materialized under `~/.codex/plugins/cache/<marketplace>/<name>/<version>/` *and* a `[plugins.<id>] enabled = true` entry in `~/.codex/config.toml`. A config entry without a cached install errors with `"plugin is not installed"`. There is no "drop a folder and it loads" path; even a *local* marketplace source (referenced in place, not copied) still records `[marketplaces.<name>]` in `config.toml`. So the Codex adapter implements the **cache-install + config-mutation** strategy (the one deferred for Claude Code), and ToolHive must own a slice of the user's `~/.codex/config.toml`.
+2. **Codex loads only a subset of components.** Codex's plugin manifest model supports **skills, MCP servers (`.mcp.json`), apps (`.app.json`), and hooks** — it has **no `commands` and no `agents`/subagents.** A plugin that bundles slash commands or subagents will have those **silently ignored on Codex**. The adapter therefore inspects the bundle's component inventory and **warns at install time** which components will not be active on Codex (and `thv plugin info --clients codex` reflects the reduced set).
+
+Additional verified Codex specifics the adapter encodes: single home scope (`~/.codex`, no project/repo plugin scope); CLI shape `codex plugin add|list|remove` and `codex plugin marketplace add|list|...` (marketplace nested under `plugin`); state in `config.toml` (`[marketplaces.*]` + `[plugins.*]`), not a JSON registry. (Codex's *public* plugin directory/publishing is still pre-GA, but the local install/load machinery is shipped and not feature-flag-gated.)
 
 #### The `MaterializationAdapter` seam
 
-The per-client behavior lives behind one interface, so adding Cursor/Copilot/Gemini later is additive:
+The per-client behavior lives behind one interface, so the two v1 adapters (Claude Code, Codex) coexist and Cursor/Copilot/Gemini are additive later:
 
 ```go
 // pkg/plugins — implemented per client in pkg/client adapters
 type MaterializationAdapter interface {
     // Whether this client can materialize a plugin at all (v1: claude-code, codex).
     Supports(client MCPClient) bool
-    // Place a verified, extracted bundle so the client loads it. May translate or
-    // emit a client-specific manifest, choose the discovery location, and report
-    // which components will be trust-gated.
+    // Components this client will actually activate from a bundle, so the service can
+    // warn about silently-dropped ones (e.g. Codex ignores commands/agents).
+    SupportedComponents(client MCPClient) ComponentSet
+    // Place a verified, extracted bundle so the client loads it. May write/translate a
+    // client-specific manifest, mutate client config (e.g. Codex config.toml), choose
+    // the discovery location, and report trust-gated or dropped components.
     Materialize(ctx context.Context, bundle ExtractedBundle, scope Scope, projectRoot string) (MaterializeResult, error)
-    // Reverse of Materialize, for uninstall.
+    // Reverse of Materialize, for uninstall (incl. reverting any config mutation).
     Dematerialize(ctx context.Context, name string, scope Scope, projectRoot string) error
 }
 ```
 
-The v1 `.claude-plugin`-family adapter writes the tree to the skills-directory location (Claude Code) / Codex's location, performs no manifest translation (the packaged `.claude-plugin/plugin.json` is already native to both), and reports trust-gated components for project scope. A future Gemini adapter would, in `Materialize`, emit `gemini-extension.json` and transform `commands/*.md` → `commands/*.toml`. **The per-client target details remain an open question** — see Open Questions #1.
+The two v1 adapters differ exactly where the seam expects them to:
+
+| | Claude Code adapter | Codex adapter |
+|---|---|---|
+| Placement | in-place under skills dir (`~/.claude/skills/<name>/`) | cache (`~/.codex/plugins/cache/...`) |
+| Client state mutation | none | `~/.codex/config.toml` (`[plugins.*]`, `[marketplaces.*]`) |
+| Manifest translation | none (native `.claude-plugin/`) | none (reads `.claude-plugin/` fallback) |
+| Components activated | all (commands, agents, skills, hooks, MCP, LSP) | subset (skills, MCP, apps, hooks) — **warns** on dropped commands/agents |
+| Scope | user + project (project gated) | user/home only |
+
+A future Gemini adapter would additionally, in `Materialize`, emit `gemini-extension.json` and transform `commands/*.md` → `commands/*.toml`. **Remaining per-client target details are tracked in Open Questions #1.**
 
 ### OCI Artifact Format
 
@@ -490,6 +510,7 @@ flowchart TD
 
 - Plugin artifacts and metadata are public content; no secrets are stored by the plugin manager.
 - `userConfig`-style secrets (a plugin manifest can declare config options, some `sensitive`) are **not** populated by ToolHive at install; they remain the client's keychain concern. ToolHive must never persist values for `sensitive` config options. (Open Question #3.)
+- **Client config mutation (Codex adapter).** The Codex adapter edits the user's `~/.codex/config.toml` (`[plugins.*]`/`[marketplaces.*]`). This is user-owned configuration, not a secret store, but ToolHive must edit it surgically: round-trip-preserve unrelated entries, only add/remove ToolHive-managed keys, write atomically (temp + rename), and fully revert its own additions on uninstall. A corrupted `config.toml` would break the user's Codex setup, so this is treated as a correctness-and-trust concern (Open Question #1b). The Claude Code adapter mutates no client config (pure filesystem).
 
 ### Input Validation
 
@@ -602,7 +623,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 ### Phase 3: Install / list / info / uninstall
 - OCI install (`install_oci.go`), git install (reuse resolver), registry-name install.
 - `List`, `Info` (with executable-surface inventory), `Uninstall`; groups integration (`Plugins []string` + helpers).
-- `MaterializationAdapter` interface + the v1 `.claude-plugin`-family adapter (Claude Code skills-directory placement; Codex placement).
+- `MaterializationAdapter` interface + two v1 adapters: **Claude Code** (in-place skills-directory, full component set) and **Codex** (cache install + surgical `~/.codex/config.toml` round-trip edit, subset of components, install-time warning on dropped commands/agents, revert-on-uninstall). Implement `SupportedComponents` and the dropped-component warning in the service.
 
 ### Phase 4: API + CLI + content preview
 - REST endpoints under `/api/v1beta/plugins`; HTTP client (`pkg/plugins/client`).
@@ -637,7 +658,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 
 ## Open Questions
 
-1. **Materialization target within the v1 adapter.** v1 uses the in-place skills-directory-plugin strategy for Claude Code (no `settings.json` mutation). Two sub-questions: (a) does the skills-directory placement create confusing overlap between `thv skill list` and `thv plugin list` (both scan `~/.claude/skills/`, distinguished only by the presence of `.claude-plugin/plugin.json`), and should plugins use a dedicated directory instead? (b) What is Codex's correct placement — does it auto-discover in-place, or does it need its plugin-cache/registration, and if so does that pull `settings`-like state into the adapter?
+1. **Materialization details within the v1 adapters.** (a) Claude Code: does the skills-directory placement create confusing overlap between `thv skill list` and `thv plugin list` (both scan `~/.claude/skills/`, distinguished only by the presence of `.claude-plugin/plugin.json`), and should plugins use a dedicated directory instead? (b) Codex (now resolved on mechanism — it requires cache install + `config.toml` mutation): how surgically can ToolHive edit the user's `~/.codex/config.toml` `[plugins.*]`/`[marketplaces.*]` tables without clobbering hand-maintained entries (round-trip TOML preservation), and what is the cleanest `Dematerialize` that reverts exactly ToolHive's own additions? Should the Codex adapter register a ToolHive-owned local marketplace, or write `[plugins.*]` entries directly?
 2. **Component-inventory diff on upgrade.** Should an upgrade that *adds* a hook or MCP server require explicit re-approval (`--accept-new-executables`) by default?
 3. **`userConfig` / sensitive options.** Plugins can declare config (some `sensitive`). Does ToolHive stay entirely hands-off (client keychain owns it), or offer to wire values from ToolHive's secrets manager at install time?
 4. **Managed MCP servers from plugins.** Out of scope for v1 core, but is it the headline v2 feature — running a plugin's bundled MCP servers through `thv` (network isolation, permission profiles, audit) instead of the client spawning them unsandboxed?
