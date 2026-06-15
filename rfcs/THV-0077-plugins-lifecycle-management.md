@@ -11,7 +11,9 @@
 
 This RFC proposes adding **plugin** lifecycle management to ToolHive. A *plugin* is the "bundle of primitives" unit pioneered by Claude Code — a directory declared by a `.claude-plugin/plugin.json` manifest that bundles any combination of slash commands, subagents, Agent Skills, hooks, MCP server configurations, and LSP servers. ToolHive will let users **build** a plugin directory into a reproducible OCI artifact, **push** it to any OCI registry, **install** it (from a registry name, OCI reference, or `git://` URL), and **list/info/uninstall** it — using the same registry, OCI, groups, and storage infrastructure that already serves skills and MCP servers.
 
-**A key difference from skills shapes the entire design.** Skills converged on one open standard (`SKILL.md` is read by ~30 clients), so "install to N clients" was just "drop one file in N directories." **Plugin bundle formats never converged** — every client has its own manifest *and* its own discovery rules. The design therefore splits cleanly into two layers: a **client-agnostic distribution layer** (build → OCI → push → catalog → pull → verify → inventory — the bulk of ToolHive's value, identical for every client) and a **per-client materialization layer** (turning a pulled bundle into something a specific client loads). v1 makes the distribution layer fully client-neutral and implements materialization for the two clients that consume the `.claude-plugin/plugin.json` format: **Claude Code** (clean in-place install, full component set) and **Codex** (which reads `.claude-plugin/plugin.json` as a fallback, but requires a cache install + `config.toml` mutation and activates only a subset of components — skills/MCP/hooks, not commands or subagents — so the install warns about dropped components). Other clients are served by future materialization adapters behind a stable seam. As a bridge to native client tooling, ToolHive can also generate a `marketplace.json` from a set of OCI-distributed plugins.
+**A key difference from skills shapes the entire design.** Skills converged on one open standard (`SKILL.md` is read by ~30 clients), so "install to N clients" was just "drop one file in N directories." **Plugin bundle formats never converged** — every client has its own manifest *and* its own discovery rules. The design therefore splits cleanly into two layers: a **client-agnostic distribution layer** (build → OCI → push → catalog → pull → verify → inventory — the bulk of ToolHive's value, identical for every client) and a **per-client materialization layer** (turning a pulled bundle into something a specific client loads). v1 makes the distribution layer fully client-neutral and implements materialization for the two clients that consume the `.claude-plugin/plugin.json` format: **Claude Code** (clean in-place install, full component set) and **Codex** (which reads `.claude-plugin/plugin.json` as a fallback, but requires a cache install + `config.toml` mutation and activates only a subset of components — no commands or subagents — so the install warns about dropped components). Other clients are served by future materialization adapters behind a stable seam.
+
+**Bundled MCP servers are out of scope for v1.** A plugin's `.mcp.json` is packaged verbatim but ToolHive does not run, proxy, or rewrite it in v1; the intended end state is to *reference* first-class ToolHive-managed servers via the `requires` dependency mechanism rather than execute servers bundled inside a plugin (see "MCP servers in a plugin," deferred to a follow-up RFC). As a bridge to native client tooling, ToolHive can also generate a `marketplace.json` from a set of OCI-distributed plugins.
 
 ## Problem Statement
 
@@ -32,13 +34,15 @@ Skills proved the pattern. Plugins are the natural next artifact class, and the 
 - Implement the **materialization layer for the `.claude-plugin/plugin.json` family in v1** — Claude Code and Codex (via its `.claude-plugin` fallback) — behind a per-client adapter seam that lets Cursor/Copilot/Gemini be added later without changing the service or artifact format.
 - Reuse — not duplicate — the skills foundation: shared OCI primitives in `toolhive-core`, the SQLite `entries` table, the registry provider seam, the groups system, the git resolver, and scopes. Extend the `pkg/client` abstraction with a per-client **materialization adapter** (the plugin analog of the skills `PathResolver`, but doing more than path mapping).
 - Validate a plugin bundle before packaging or installing: `plugin.json` schema, each bundled component (reusing the skills validator for bundled skills), and filesystem safety.
-- Surface the **executable surface** of a plugin (hooks, MCP server commands) to the user before install.
+- Surface the **executable surface** of a plugin (hooks, and any declared-but-unmanaged MCP servers) to the user before install.
+- **Defer bundled-MCP execution:** package `.mcp.json` verbatim but neither run nor proxy it in v1; design the `requires`-based dependency-reference seam as the path to *managed* MCP, and defer its implementation to a follow-up RFC.
 - Bridge OCI distribution to native client tooling by generating a `marketplace.json` from a set of OCI-distributed plugins (so even clients without a ToolHive materialization adapter can consume ToolHive-distributed plugins).
 
 ## Non-Goals
 
 - **Authoring plugins.** ToolHive packages and distributes plugins; it does not scaffold or generate plugin content. `claude plugin init` and equivalents own authoring.
-- **Running a plugin's runtime behavior.** ToolHive does not execute hooks, dispatch slash commands, or interpret the manifest at the client's runtime — the AI client does that. ToolHive's job ends at placing a validated bundle in the right location (and, optionally, managing the lifecycle of bundled MCP servers — see "Managed MCP servers from plugins" as a *forward-looking* extension, explicitly out of scope for v1 core).
+- **Running a plugin's runtime behavior.** ToolHive does not execute hooks, dispatch slash commands, or interpret the manifest at the client's runtime — the AI client does that. ToolHive's job ends at placing a validated bundle in the right location.
+- **Managing a plugin's bundled MCP servers (v1).** ToolHive does not run, proxy, isolate, or rewrite a plugin's `.mcp.json` servers in v1 — they are packaged verbatim and left to the client, exactly as a manual install would. The intended managed model uses dependency *references* (`requires`), not bundled execution, and is deferred to a follow-up RFC. See "MCP servers in a plugin."
 - **A new cross-client plugin format.** ToolHive distributes the existing `plugin.json` bundle format; it does not define a new manifest schema or attempt to make one tree install everywhere.
 - **Materialization adapters for Cursor/Copilot/Gemini in v1.** These clients need their own manifest (and, for Gemini, command-format translation). They are explicitly future work behind the adapter seam. Multi-manifest fan-out (emitting `.cursor-plugin/`, `gemini-extension.json`, etc. at build time) is one way to implement them later — see Alternatives Considered and Open Questions #6.
 - **Auto-updates / daemon-driven reconciliation.** Same posture as skills; post-MVP.
@@ -218,6 +222,19 @@ The two v1 adapters differ exactly where the seam expects them to:
 
 A future Gemini adapter would additionally, in `Materialize`, emit `gemini-extension.json` and transform `commands/*.md` → `commands/*.toml`. **Remaining per-client target details are tracked in Open Questions #1.**
 
+> **MCP note.** The adapter tables above describe what each *client* can load. ToolHive itself does **not** wire or run a plugin's bundled MCP servers in v1 (see the next section) — `.mcp.json` is carried verbatim and, where a client would load it, runs via that client unmanaged. The materialized inert set ToolHive is responsible for is commands/agents/skills/hooks/LSP (Claude Code) and skills/apps/hooks (Codex).
+
+### MCP servers in a plugin: deferred to a dependency-reference model
+
+A plugin's `.mcp.json` is categorically different from its other components. Commands, agents, skills, hooks, and LSP configs are **inert** — files the client reads. MCP servers are **executable workloads**, and running MCP servers (proxied, network-isolated, audited, in containers) is precisely what ToolHive exists to do. Two facts make bundled MCP servers a poor fit for v1:
+
+1. **Treating them as inert files defeats the purpose.** If ToolHive simply drops `.mcp.json` into the client's load path, the *client* spawns those servers directly — unsandboxed, unproxied, unaudited — which is the exact opposite of ToolHive's value proposition. ToolHive already solves this for standalone servers by running them as workloads and rewriting client config to point at its proxy (`pkg/client/converter.go`, `config.go` `buildMCPServer`).
+2. **Bringing them under management is genuinely hard.** Plugins declare servers as **local stdio `{command, args}`** (e.g. `node ${CLAUDE_PLUGIN_ROOT}/mcp/index.js`), but ToolHive runs **containerized or remote** workloads — it has no host-process runtime (verified: the only runtimes are Docker and Kubernetes; protocol schemes `uvx://`/`npx://`/`go://` build a container on the fly). Closing that gap — repackaging the bundled command into a container, or adding a local-process runtime — is a substantial effort with its own security trade-offs.
+
+**v1 therefore does not manage bundled MCP servers at all.** The OCI artifact carries `.mcp.json` verbatim (fidelity preserved — the plugin behaves exactly as a manual install), and ToolHive neither runs, proxies, nor isolates those servers. `thv plugin info` and the install step clearly report *"this plugin declares N MCP servers — not managed by ToolHive; they run via the client unsandboxed. Run them under ToolHive separately with `thv run`."* This is a deliberate, documented gap, not an oversight.
+
+**The intended end state is dependency *references*, not bundled execution.** Rather than burying a server's `command`/`args` inside a plugin and later teaching ToolHive to execute arbitrary local commands, a plugin should *reference* first-class MCP servers that ToolHive already knows how to distribute and run. This reuses the `requires`/dependencies seam already planned for the artifact (`dev.toolhive.plugins.requires`, mirroring `dev.toolhive.skills.requires`): a plugin declares e.g. `requires: ["ghcr.io/org/servers/foo:v1", "io.github.org/bar"]`, and a future ToolHive version resolves those to managed, proxied, isolated workloads through its existing MCP machinery and wires the client config to the proxy URLs. Servers stay independently-distributed, signable, isolated artifacts instead of opaque commands inside a bundle — strictly better than repackaging. Designing that resolution flow (what `requires` carries, how referenced servers map to workloads and permission profiles, client-config rewrite) is deferred to a follow-up RFC — see Open Questions #4 and Alternative 7.
+
 ### OCI Artifact Format
 
 Plugins reuse the skills OCI machinery with a distinct artifact type. A new `toolhive-core/oci/plugins` package mirrors its sibling `oci/skills`, and the **shared, artifact-agnostic primitives are lifted into a common subpackage** (see Component Changes) rather than copied.
@@ -253,7 +270,7 @@ OCI Image Index  (application/vnd.oci.image.index.v1+json, artifactType: dev.too
 
 **Reproducible packaging** (identical discipline to skills): deterministic tar (sorted entries, normalized mode/`ModTime` via `SOURCE_DATE_EPOCH`, UID/GID 0), deterministic gzip (`BestCompression`, OS byte 255, empty name/comment), so identical content always yields an identical digest — the precondition for digest pinning and signature verification.
 
-**Dependencies.** Plugins may declare dependencies (the manifest has a `dependencies` array). These are recorded as a `dev.toolhive.plugins.requires` annotation (JSON array of OCI references), mirroring `dev.toolhive.skills.requires`. Resolution of transitive plugin dependencies is **post-MVP** (Non-Goal-adjacent); v1 records but does not auto-install them.
+**Dependencies.** Plugins may declare dependencies (the manifest has a `dependencies` array). These are recorded as a `dev.toolhive.plugins.requires` annotation (JSON array of OCI references), mirroring `dev.toolhive.skills.requires`. The **same `requires` mechanism is the planned carrier for MCP server references** — the deferred path to managed MCP (see "MCP servers in a plugin"). v1 records `requires` but resolves nothing automatically.
 
 ### Detailed Design
 
@@ -321,7 +338,7 @@ SIGNATURE       verified (cosign, ghcr.io/org/.github)   # or: none
 COMPONENTS      commands=3  agents=1  skills=2  hooks=4  mcpServers=1
 HOOKS           PreToolUse → scripts/scan.sh
                 PostToolUse → scripts/log.sh
-MCP SERVERS     my-server → node ./mcp/index.js
+MCP SERVERS     my-server → node ./mcp/index.js   (declared; NOT managed by ToolHive in v1)
 ```
 
 #### API Changes
@@ -381,7 +398,7 @@ type Provider interface {
 
 #### Configuration Changes
 
-A bundled MCP server config inside a plugin (`.mcp.json`) is packaged verbatim; ToolHive does not rewrite it in v1. Example of what travels inside the artifact (unchanged Claude Code format):
+A bundled MCP server config inside a plugin (`.mcp.json`) is packaged verbatim and, in v1, **left untouched** — ToolHive does not rewrite, proxy, or run it (see "MCP servers in a plugin"; the future managed model rewrites such config to ToolHive proxy URLs via the `requires` reference flow). Example of what travels inside the artifact (unchanged Claude Code format):
 
 ```json
 {
@@ -488,6 +505,8 @@ flowchart TD
 
 **This is the section where plugins genuinely differ from skills.** A skill is inert Markdown read by the model. A plugin bundles **hooks** (shell commands executed deterministically by the client on lifecycle events) and **MCP server configs** (executable processes). **Installing a plugin is granting code-execution trust.** The whole point of putting plugins on ToolHive's content-addressable + signed OCI rail is to bring supply-chain controls to a decision currently made with none.
 
+**v1 scope note for MCP.** ToolHive does not run a plugin's bundled MCP servers in v1 (see "MCP servers in a plugin"); they are carried verbatim and run via the client unmanaged — the same exposure as a manual `git clone` install, neither better nor worse. This is a known v1 gap, closed later by the dependency-reference model (which brings referenced servers under ToolHive's isolation/audit). The executable surface ToolHive actively *places* in v1 is hooks and their scripts; the mitigations below focus there, and `thv plugin info` flags declared MCP servers so the trust decision is explicit.
+
 ### Threat Model
 
 | Threat | Description | Likelihood | Impact |
@@ -544,7 +563,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 | Registry compromise / tag mutation | content-addressable digests; `--require-signature` verifies cosign signatures via the **OCI Referrers API** (`subject` + `GET /v2/<name>/referrers/<digest>`) | signature required by default; org trust roots |
 | Path traversal / symlink | shared extraction hardening (reused from skills) | — |
 | Typosquatting | registry catalog is curated; supply-chain name==repo check | namespace ownership verification |
-| Managed MCP isolation | (forward-looking) running bundled MCP servers *via thv* gains network isolation + permission profiles instead of the client spawning them unsandboxed | first-class "managed MCP from plugin" |
+| Bundled MCP server runs unmanaged (v1 gap) | v1 does not run bundled servers; `thv plugin info` flags declared MCP servers so users know they run via the client unsandboxed, and can instead run them under `thv run` | dependency-reference model (`requires`) resolves servers to managed, proxied, network-isolated `thv` workloads |
 | Inventory blind spot | SQLite inventory + `thv plugin list --format json` across fleet | dashboards / cloud UI |
 
 ## Alternatives Considered
@@ -591,6 +610,13 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 - **Cons**: Large, ongoing surface — each client's schema and discovery rules must be tracked and kept current; Gemini needs real component translation (`commands/*.md` → `commands/*.toml`), not just a manifest copy; per-client trust/enable mechanics still differ. High maintenance for a fast-moving, non-standard space.
 - **Why not chosen for v1**: The two-layer split lets us ship the full client-agnostic value (distribution, catalog, signing, inventory) plus working install for the `.claude-plugin` family *now*, and add clients incrementally through the `MaterializationAdapter` seam. Multi-manifest generation becomes the *implementation* of those later adapters, scoped per client rather than all at once. This is the option chosen for the eventual Cursor/Copilot/Gemini adapters (Open Questions #6).
 
+### Alternative 7: Run a plugin's bundled MCP servers under ToolHive in v1
+
+- **Description**: Make "managed MCP from plugin" part of v1 — when a plugin declares `.mcp.json` servers (local `command`/`args`), bring them under ToolHive by either (a) repackaging the command into a container built from the bundle, or (b) adding a host-process runtime, then run them proxied/isolated and rewrite the client config to the proxy URL.
+- **Pros**: Closes the loop — the one thing a plain `git clone` install can't do; full isolation/audit for the plugin's servers.
+- **Cons**: (a) requires building containers from arbitrary `command`/`args` + bundle files (runtime detection, `${CLAUDE_PLUGIN_ROOT}` rewriting, exotic commands don't map) or (b) a brand-new host-process runtime that runs untrusted bundled code on the host with weaker isolation — against ToolHive's container-first model. Either is a large effort that would dominate v1 and entangle the otherwise-clean distribution + inert-materialization story.
+- **Why not chosen for v1**: Deferred. Bundled `command`/`args` execution is the wrong long-term primitive anyway — the **dependency-reference model** (`requires` → first-class, independently-distributed, isolated servers) is cleaner than repackaging opaque commands. v1 ships distribution + inert materialization and explicitly leaves bundled MCP unmanaged (documented gap); the reference model is a focused follow-up RFC. See "MCP servers in a plugin" and Open Questions #4.
+
 ## Compatibility
 
 ### Backward Compatibility
@@ -607,7 +633,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 - **`MaterializationAdapter` per client** is the primary extensibility point: Cursor/Copilot/Gemini adapters (and the marketplace-cache strategy) land later without touching the service or the artifact format. The distribution layer never changes when a client is added.
 - **Provider no-op defaults** let registries adopt plugin catalogs incrementally.
 - **Referrers-based signing** composes with future SBOM/provenance attachments on the same digest.
-- **Managed-MCP-from-plugin** can be added as an opt-in install behavior (run bundled `.mcp.json` servers through `thv` with isolation) without changing the artifact format.
+- **Managed MCP via `requires` references** is the planned evolution: a plugin references first-class ToolHive servers (OCI/registry) that resolve to proxied, isolated workloads with client config rewritten to the proxy — additive to the artifact (`dev.toolhive.plugins.requires`) and the registry, no format break.
 
 ## Implementation Plan
 
@@ -639,11 +665,14 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 - Existing `pkg/skills/gitresolver`, `pkg/groups`, `pkg/client`, `pkg/storage/sqlite`.
 - cosign/sigstore libraries for Phase 5 signature verification.
 
+### Deferred to a follow-up RFC
+- **Managed MCP via `requires` references**: resolving referenced servers to ToolHive workloads, rewriting client config to the proxy URL (reuse `pkg/client/converter.go` + `pkg/workloads`), default permission profiles for plugin-referenced servers, and `userConfig` `sensitive` → secrets wiring. v1 only records `requires` and reports declared-but-unmanaged MCP servers.
+
 ## Testing Strategy
 
 - **Unit**: `plugin.json` parser/validator (incl. wrong-type rejection), packager determinism (identical digest for identical input), extraction safety, component-inventory extraction, marketplace generator.
 - **Integration**: each CLI command against a mock OCI registry; build→push→install→list→uninstall round-trip; git install with subdir/ref; group membership.
-- **E2E**: full workflow against a real registry (GHCR) and verification that an installed plugin loads in Claude Code (skills-directory-plugin path).
+- **E2E**: full workflow against a real registry (GHCR) and verification that an installed plugin loads in Claude Code (skills-directory-plugin path); verify a plugin that declares `.mcp.json` servers installs and reports them as *declared, not managed* (no ToolHive workload created in v1).
 - **Compatibility**: byte-identical round-trip (native plugin → build → install → compare tree).
 - **Security**: path-traversal/symlink/oversized-archive fixtures; supply-chain name-mismatch rejection; signature-required failure paths; injection/SSRF in git refs.
 - **Performance**: large-bundle packaging within size caps; reproducibility under `SOURCE_DATE_EPOCH`.
@@ -661,7 +690,7 @@ Like skills, plugins are client-side constructs that bypass ToolHive's proxy mid
 1. **Materialization details within the v1 adapters.** (a) Claude Code: does the skills-directory placement create confusing overlap between `thv skill list` and `thv plugin list` (both scan `~/.claude/skills/`, distinguished only by the presence of `.claude-plugin/plugin.json`), and should plugins use a dedicated directory instead? (b) Codex (mechanism + safe-edit both resolved — it requires cache install + `config.toml` mutation, and ToolHive already has the round-trip TOML editor + atomic/locked write for `~/.codex/config.toml`): the one remaining choice is whether the Codex adapter registers a ToolHive-owned **local marketplace** (`[marketplaces.*]` pointing at a ToolHive-managed dir) or writes `[plugins.*]` entries **directly**. Local-marketplace is closer to Codex's intended model and may simplify `Dematerialize`; direct entries are fewer moving parts.
 2. **Component-inventory diff on upgrade.** Should an upgrade that *adds* a hook or MCP server require explicit re-approval (`--accept-new-executables`) by default?
 3. **`userConfig` / sensitive options.** Plugins can declare config (some `sensitive`). Does ToolHive stay entirely hands-off (client keychain owns it), or offer to wire values from ToolHive's secrets manager at install time?
-4. **Managed MCP servers from plugins.** Out of scope for v1 core, but is it the headline v2 feature — running a plugin's bundled MCP servers through `thv` (network isolation, permission profiles, audit) instead of the client spawning them unsandboxed?
+4. **Managed MCP via dependency references (deferred — follow-up RFC).** The intended model is for a plugin to *reference* first-class ToolHive-managed MCP servers via `requires` rather than bundle executable `command`/`args`. Open: does `requires` carry OCI image references, registry names, or both? How are referenced servers resolved to workloads and wired into the client config at the proxy URL? What default permission profile applies to a server pulled in by a plugin? (The alternative — repackaging a bundle's local `command`/`args` into a container, or adding a host-process runtime — was considered and set aside in favor of references; see Alternative 7.)
 5. **Dependency resolution.** v1 records `requires`; when do we auto-install transitive plugin/skill dependencies, and how do we avoid cycles?
 6. **Multi-manifest packaging.** Do we ever emit sibling `.cursor-plugin/` / `.codex-plugin/` manifests at build time for cross-client install, or leave that to authors?
 
