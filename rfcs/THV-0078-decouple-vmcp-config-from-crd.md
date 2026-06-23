@@ -5,7 +5,9 @@
 - **Created**: 2026-06-23
 - **Last Updated**: 2026-06-23
 - **Target Repository**: toolhive
-- **Related Issues**: [toolhive#5238](https://github.com/stacklok/toolhive/pull/5238) (implementation of Phase 1)
+- **Related Issues**: [toolhive#5238](https://github.com/stacklok/toolhive/pull/5238) (implementation of Phase 1), [toolhive#3125](https://github.com/stacklok/toolhive/issues/3125) (Simplify VMCP Configuration — cited motivation for the original unification)
+- **Related RFCs**: [THV-0023](THV-0023-crd-v1beta1-optimization.md) — its "CRD Types and Application Config Relationship" section introduced the unified-types decision this RFC revisits
+- **Supersedes**: the "CRD Types and Application Config Relationship" recommendation in [THV-0023](THV-0023-crd-v1beta1-optimization.md) (added in [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27))
 
 ## Summary
 
@@ -16,7 +18,9 @@ implementation type: any change to the on-disk/runtime config model leaks into
 the CRD. This RFC proposes an **operator-owned mirror type** plus a **converter
 seam** so the CRD schema and the internal config can evolve independently,
 delivered as an **incremental, provably non-breaking migration** guarded by
-drift tests.
+drift tests. It revisits and supersedes the unified-types recommendation from
+[THV-0023](THV-0023-crd-v1beta1-optimization.md), preserving that proposal's
+single-source-of-truth goal while removing the API coupling it introduced.
 
 ## Problem Statement
 
@@ -34,7 +38,24 @@ same Go type:
   insert behaviour between "what the user declares" and "what gets written to the
   container".
 
-A prior attempt ([toolhive#5238](https://github.com/stacklok/toolhive/pull/5238),
+**How the coupling was introduced (deliberately).** This is not accidental.
+[THV-0023](THV-0023-crd-v1beta1-optimization.md), via
+[toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27), added a
+"CRD Types and Application Config Relationship" section recommending that CRD
+spec types be **unified** with application config types — embedding the internal
+config directly into the CRD spec — to eliminate translation layers. Its
+motivation was sound: real silent bugs from broken conversions
+([toolhive#3118](https://github.com/stacklok/toolhive/pull/3118)) and
+`snake_case`/`camelCase` documentation divergence
+([toolhive#3070](https://github.com/stacklok/toolhive/pull/3070)).
+`VirtualMCPServerSpec.Config config.Config` is the direct result. (Notably, an
+earlier draft of THV-0023 proposed *removing* the embedded `Config` field; #27
+reversed that to embed it.) This RFC revisits that tradeoff — see
+[Alternative 2](#alternative-2-unified-crdconfig-types-the-status-quo-per-rfc-0023):
+it keeps THV-0023's goal of a single, non-divergent schema, but achieves it
+without welding the public API to the implementation type.
+
+A subsequent attempt ([toolhive#5238](https://github.com/stacklok/toolhive/pull/5238),
 original form) introduced a `RuntimeConfig` write-side wrapper. That solved only
 the *additive* case (tack new operator-only fields onto a wrapper the CRD does
 not reference). It could not decouple or evolve the **existing** embedded fields,
@@ -182,10 +203,37 @@ referenced by the CRD (the original #5238 design). **Rejected** because it only
 addresses additive operator-only fields; it cannot decouple or evolve the
 existing embedded fields, which remain the CRD schema.
 
-### Alternative 2: Keep the coupling (status quo)
+### Alternative 2: Unified CRD/config types (the status quo, per RFC-0023)
 
-**Rejected.** Internal changes continue to leak into the public CRD, the CRD
-cannot evolve independently, and Kubernetes-native config ergonomics stay blocked.
+This is the current design and the explicit recommendation of
+[THV-0023](THV-0023-crd-v1beta1-optimization.md)'s "CRD Types and Application
+Config Relationship" section ([toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27)):
+use one Go type for both the CRD spec and the application config.
+
+**Its motivation is legitimate.** Translation layers between distinct types have
+caused real, silent bugs (telemetry conversion breaking; `on_error.action:
+continue` dropped, [toolhive#3118](https://github.com/stacklok/toolhive/pull/3118)),
+documentation divergence (`snake_case` vs `camelCase`,
+[toolhive#3070](https://github.com/stacklok/toolhive/pull/3070)), and integration
+tests that bypass the converter and miss plumbing bugs. A single type yields one
+schema, one validation implementation, and one documented format.
+
+**Why this RFC revisits it.** The recommendation conflates *"single source of
+truth"* with *"single Go type."* Those are separable. The real requirement is
+that the CRD schema and the config must not silently diverge — and **enforced
+equivalence** (the parity + round-trip + zero-diff tests in this RFC) guarantees
+that just as well as type identity, without the cost type identity imposes:
+welding a stability-gated public API to an implementation type, so every internal
+change becomes a public API change. The unified approach also did not actually
+eliminate translation — its own example resolves a `TelemetryRef` into a
+`Telemetry` literal in the controller, which *is* a conversion step — so in
+practice `VirtualMCPServer` ended up carrying both the coupling and a converter.
+
+**Decision.** Keep THV-0023's goal (no silent divergence; one schema, validation,
+and documented format; identical field names) but **supersede its mechanism**:
+separate the types and enforce equivalence with tests rather than type identity.
+This preserves the unification's benefits while removing the API coupling and
+unblocking Kubernetes-native config.
 
 ### Alternative 3: Code-generate the mirror from the internal type
 
@@ -278,6 +326,14 @@ the toolchain.
 
 - [toolhive#5238](https://github.com/stacklok/toolhive/pull/5238) — Phase 1
   implementation.
+- [THV-0023](THV-0023-crd-v1beta1-optimization.md) — "CRD Types and Application
+  Config Relationship" (added in [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27));
+  origin of the unified-types decision this RFC revisits and supersedes.
+- [toolhive#3125](https://github.com/stacklok/toolhive/issues/3125),
+  [toolhive#3118](https://github.com/stacklok/toolhive/pull/3118),
+  [toolhive#3070](https://github.com/stacklok/toolhive/pull/3070) — the
+  configuration-pipeline bugs and documentation divergence that motivated the
+  original unification.
 - Kubernetes internal-vs-versioned API types + `conversion-gen` + round-trip fuzz
   — the established precedent this design follows.
 - `cmd/thv-operator/pkg/spectoconfig` — existing CRD-spec → runtime-config
