@@ -39,6 +39,18 @@ same Go type:
   insert behaviour between "what the user declares" and "what gets written to the
   container".
 
+**A concrete, in-flight example.**
+[toolhive#4923](https://github.com/stacklok/toolhive/pull/4923) adds a single
+operator-resolved field — the in-pod CA-bundle path the operator computes when an
+`MCPOIDCConfig` has a ConfigMap-backed `caBundleRef` — to `config.OIDCConfig`.
+Because that type is embedded in the CRD, the change **leaked 10 lines into the
+public `VirtualMCPServer` CRD schema** (and a line into `crd-api.md`) for a value
+no user should ever set by hand. It is exactly the operator-resolved/sidecar case
+the decoupling exists to keep out of the public API — the additive subset of it is
+also what the write-side `RuntimeConfig` wrapper (Alternative 1) was designed to
+absorb. Today there is no seam to put such a field anywhere other than the public
+CRD.
+
 **How the coupling was introduced (deliberately).** This is not accidental.
 [THV-0023](THV-0023-crd-v1beta1-optimization.md), via
 [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27), added a
@@ -369,6 +381,9 @@ the toolchain.
 
 - [toolhive#5238](https://github.com/stacklok/toolhive/pull/5238) — Phase 1
   implementation.
+- [toolhive#4923](https://github.com/stacklok/toolhive/pull/4923) — concrete,
+  in-flight example of the problem: an operator-resolved CA-bundle path added to
+  `config.OIDCConfig` leaks straight into the public `VirtualMCPServer` CRD schema.
 - [THV-0023](THV-0023-crd-v1beta1-optimization.md) — "CRD Types and Application
   Config Relationship" (added in [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27));
   origin of the unified-types decision this RFC revisits.
