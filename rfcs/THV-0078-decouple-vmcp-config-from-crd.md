@@ -7,7 +7,7 @@
 - **Target Repository**: toolhive
 - **Related Issues**: [toolhive#5238](https://github.com/stacklok/toolhive/pull/5238) (implementation of Phase 1), [toolhive#3125](https://github.com/stacklok/toolhive/issues/3125) (Simplify VMCP Configuration — cited motivation for the original unification)
 - **Related RFCs**: [THV-0023](THV-0023-crd-v1beta1-optimization.md) — its "CRD Types and Application Config Relationship" section introduced the unified-types decision this RFC revisits
-- **Supersedes**: the "CRD Types and Application Config Relationship" recommendation in [THV-0023](THV-0023-crd-v1beta1-optimization.md) (added in [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27))
+- **Revisits**: the "CRD Types and Application Config Relationship" recommendation in [THV-0023](THV-0023-crd-v1beta1-optimization.md) (still in Draft; added in [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27)) **and the implementation that adopted it** ([toolhive#5238](https://github.com/stacklok/toolhive/pull/5238))
 
 ## Summary
 
@@ -18,9 +18,10 @@ implementation type: any change to the on-disk/runtime config model leaks into
 the CRD. This RFC proposes an **operator-owned mirror type** plus a **converter
 seam** so the CRD schema and the internal config can evolve independently,
 delivered as an **incremental, provably non-breaking migration** guarded by
-drift tests. It revisits and supersedes the unified-types recommendation from
-[THV-0023](THV-0023-crd-v1beta1-optimization.md), preserving that proposal's
-single-source-of-truth goal while removing the API coupling it introduced.
+drift tests. It revisits the unified-types recommendation proposed in
+[THV-0023](THV-0023-crd-v1beta1-optimization.md) (which remains in Draft) and the
+implementation that adopted it, preserving that proposal's single-source-of-truth
+goal while removing the API coupling it introduced.
 
 ## Problem Statement
 
@@ -72,12 +73,17 @@ secret/config references inside `spec.config`).
 
 ## Goals
 
-- The CRD schema is generated **only** from operator-owned types; internal config
-  changes **categorically cannot** reach the CRD.
+- The CRD schema is generated **only** from operator-owned types. At the
+  end-state (after every embedded subtree is mirrored — Phases 1b/1c), internal
+  config changes **categorically cannot** reach the CRD; the no-leak boundary
+  widens one package per PR until then.
 - The mechanical decoupling is **zero user-facing change** — the generated CRD
   schema is byte-for-byte identical.
-- Divergence between the two type sets is **caught automatically** (parity,
-  round-trip, and no-leak tests), never silent.
+- **Structural and value drift** between the two type sets is caught
+  automatically (parity, round-trip, and no-leak tests). Validation-rule, default,
+  and doc-comment (OpenAPI description) parity is **not** covered by those tests —
+  it is accepted residual risk that code generation (Alternative 3) closes; see
+  Alternative 2.
 - The migration is **incremental** — one config subtree per PR, each provably
   non-breaking via a zero-diff gate — so no single large, hard-to-review change is
   required.
@@ -91,7 +97,8 @@ secret/config references inside `spec.config`).
 - Adding new Kubernetes-native fields or deprecating today's dedicated top-level
   fields **in this RFC** — that is Phase 2, covered by follow-up RFCs/PRs.
 - Migrating shared types owned by *other* CRDs in the first pass (notably
-  `RateLimitConfig`, also used by `MCPServer`); handled as a scoped later step.
+  `RateLimitConfig`, also used by `MCPServer`); handled as a scoped later step
+  (Phase 1c) that must cover both CRDs together to avoid transient divergence.
 
 ## Proposed Solution
 
@@ -191,8 +198,13 @@ No change.
 
 ### Mitigations
 
-The categorical no-leak guarantee is enforced by a reflection test that fails if
-any type reachable from the CRD spec originates in `pkg/vmcp/config`.
+The no-leak guarantee is enforced by a reflection test that fails if any type
+reachable from the CRD spec originates in a not-yet-decoupled internal package.
+After Phase 1a it bars `pkg/vmcp/config`; each subsequent PR widens it to the
+package it mirrors (`pkg/audit`, `pkg/ratelimit/types`, `pkg/telemetry`,
+`pkg/vmcp/auth/types`), so the guarantee is *fully* categorical only at the
+end-state. Until a package is mirrored, `controller-gen` still walks it and a
+change there can still reach the CRD.
 
 ## Alternatives Considered
 
@@ -220,28 +232,46 @@ schema, one validation implementation, and one documented format.
 
 **Why this RFC revisits it.** The recommendation conflates *"single source of
 truth"* with *"single Go type."* Those are separable. The real requirement is
-that the CRD schema and the config must not silently diverge — and **enforced
-equivalence** (the parity + round-trip + zero-diff tests in this RFC) guarantees
-that just as well as type identity, without the cost type identity imposes:
-welding a stability-gated public API to an implementation type, so every internal
-change becomes a public API change. The unified approach also did not actually
-eliminate translation — its own example resolves a `TelemetryRef` into a
-`Telemetry` literal in the controller, which *is* a conversion step — so in
-practice `VirtualMCPServer` ended up carrying both the coupling and a converter.
+that the CRD schema and the config must not silently diverge, and the
+enforced-equivalence tests in this RFC cover most of that risk — **structural
+drift** (parity) and **value-loss drift** (round-trip) — without the cost type
+identity imposes: welding a stability-gated public API to an implementation type,
+so every internal change becomes a public API change.
+
+There is, however, an honest gap. Those tests do **not** compare the
+kubebuilder/CEL markers, enums, defaults, or doc comments, which become the
+OpenAPI validation and description. A maintainer who edits an enum, CEL rule,
+default, or comment on one side but not the other passes all the tests while
+CRD-admission validation drifts from runtime validation — a hole that type
+identity (one struct, one set of markers) does **not** have. We accept this as
+residual risk with two mitigations: the mirror's markers are the **single source
+of truth** for the CRD's validation/description, and **code generation
+(Alternative 3)** — generating the mirror from the internal source — closes the
+gap completely, which is the strongest reason to adopt it as the end-state.
+
+The unified approach also did not actually eliminate translation — its own
+example resolves a `TelemetryRef` into a `Telemetry` literal in the controller,
+which *is* a conversion step — so in practice `VirtualMCPServer` ended up carrying
+both the coupling and a converter.
 
 **Decision.** Keep THV-0023's goal (no silent divergence; one schema, validation,
-and documented format; identical field names) but **supersede its mechanism**:
-separate the types and enforce equivalence with tests rather than type identity.
-This preserves the unification's benefits while removing the API coupling and
-unblocking Kubernetes-native config.
+and documented format; identical field names) but **revise its mechanism**:
+separate the types and enforce equivalence with tests (plus code generation at
+the end-state) rather than type identity. This preserves the unification's
+benefits while removing the API coupling and unblocking Kubernetes-native config.
 
-### Alternative 3: Code-generate the mirror from the internal type
+### Alternative 3: Code-generate the mirror from the internal type (recommended end-state)
 
-Generate the mirror (and/or the conversion functions) so the copy is mechanical
-and drift is impossible by construction. **Deferred, not rejected** — it is the
-strongest anti-drift option and can be layered on later without changing the
-architecture (see Open Questions). Phase 1 hand-writes the mirror and relies on
-drift tests.
+Generate the mirror (and/or the conversion functions) from the internal types so
+the copy — **including kubebuilder/CEL markers, enums, defaults, and doc
+comments** — is mechanical and drift is **impossible by construction**. This is
+the only option that closes the marker/validation-parity gap called out in
+Alternative 2 (the reflection tests cannot see comment-based markers). It is
+**recommended as the end-state**, deliberately sequenced *after* Phase 1: the
+hand-written mirror + drift tests are sufficient to land the decoupling
+incrementally and prove the pattern, and code generation can be layered on
+without changing the architecture. Until then, marker parity is accepted residual
+risk per Alternative 2.
 
 ## Compatibility
 
@@ -268,11 +298,15 @@ enforces it, so every step is provably non-breaking.
 - **1a — config-owned tree** (DONE; [toolhive#5238](https://github.com/stacklok/toolhive/pull/5238)):
   mirror the `pkg/vmcp/config`-owned types, retype the CRDs, add the converter
   transcode, add parity / round-trip / no-leak tests.
-- **1b — external types**, one PR each: mirror `audit`, `ratelimit/types`,
-  `vmcp/auth/types`, and `telemetry` into the mirror; extend the no-leak boundary
-  to each package.
-- **1c — cross-CRD `RateLimitConfig`**: reconcile the type shared with
-  `MCPServer` so it is decoupled consistently across both CRDs.
+- **1b — external types**, one PR each: mirror `audit`, `vmcp/auth/types`, and
+  `telemetry` into the mirror; extend the no-leak boundary to each package.
+- **1c — `RateLimitConfig` (cross-CRD, single PR)**: this type is embedded by
+  **both** `VirtualMCPServer` and `MCPServer`. Mirroring it for vMCP alone would
+  leave the two CRDs generating the same schema from two sources — a *new*
+  transient divergence that per-CRD drift tests cannot detect. So cut over
+  **both** CRDs' rate-limit subtree in the **same** PR (or, if they must be
+  split, add a cross-CRD parity test holding the two schemas identical until both
+  are mirrored).
 - **1d — docs**: make `crd-ref-docs` render the mirror so `crd-api.md` is clean.
 
 ### Phase 2: API evolution (deliberate, separate RFCs/PRs)
@@ -293,13 +327,22 @@ the toolchain.
 ## Testing Strategy
 
 - **Structural parity:** the mirror and internal type must have identical JSON
-  leaf-path sets; failures name the drifted field.
+  leaf-path sets; failures name the drifted field. (Covers field names/shape, not
+  markers/validation — see Alternative 2.)
 - **Round-trip transcode fuzz:** randomly populate the mirror, transcode to the
   internal type and back, assert value preservation (catches converter loss).
 - **No-leak boundary:** reflection walk asserting no CRD-reachable type lives in
-  `pkg/vmcp/config`.
-- **Zero-diff gate:** `task operator-manifests` + `task crdref-gen` must produce
-  no diff — the per-PR non-breaking guarantee.
+  a not-yet-decoupled internal package (widens one package per PR; see Goals).
+- **Zero-diff gate:** `task operator-manifests` + `task operator-generate`
+  (deepcopy) + `task crdref-gen` must produce no diff. This proves **schema +
+  generated-code** stability — a mis-tagged mirror field can deepcopy wrong
+  without changing the OpenAPI, so deepcopy must be in the gate — but it does
+  **not** prove **converter behaviour** (covered by the round-trip fuzz and
+  envtest/e2e). Note the manifest diff is marker-order-sensitive, so
+  semantically-null reorders also trip it (acceptable: it errs toward catching
+  changes).
+- **Not yet covered (residual risk):** marker/CEL/enum/default/doc-comment parity
+  between the two type sets — closed by code generation (Alternative 3).
 - Existing operator unit and envtest/e2e suites continue to gate behaviour.
 
 ## Documentation
@@ -328,16 +371,20 @@ the toolchain.
   implementation.
 - [THV-0023](THV-0023-crd-v1beta1-optimization.md) — "CRD Types and Application
   Config Relationship" (added in [toolhive-rfcs#27](https://github.com/stacklok/toolhive-rfcs/pull/27));
-  origin of the unified-types decision this RFC revisits and supersedes.
+  origin of the unified-types decision this RFC revisits.
 - [toolhive#3125](https://github.com/stacklok/toolhive/issues/3125),
   [toolhive#3118](https://github.com/stacklok/toolhive/pull/3118),
   [toolhive#3070](https://github.com/stacklok/toolhive/pull/3070) — the
   configuration-pipeline bugs and documentation divergence that motivated the
   original unification.
-- Kubernetes internal-vs-versioned API types + `conversion-gen` + round-trip fuzz
-  — the established precedent this design follows.
-- `cmd/thv-operator/pkg/spectoconfig` — existing CRD-spec → runtime-config
-  conversion with a drift test (telemetry), the template for this approach.
+- `cmd/thv-operator/pkg/spectoconfig` — the **precise in-repo precedent**: an
+  existing CRD-spec → runtime-config converter (`MCPTelemetryConfigSpec` →
+  `telemetry.Config`) with a drift test. This design generalizes it.
+- Kubernetes internal-vs-versioned API types (conversion + round-trip fuzz) —
+  **loosely analogous**: that machinery converts between API *versions* of one
+  object via `conversion-gen`, whereas here the two types are the same version in
+  different ownership domains (public API vs on-disk file) bridged by a
+  hand-written transcode. The round-trip-fuzz *methodology* is borrowed from there.
 
 ## RFC Lifecycle
 
