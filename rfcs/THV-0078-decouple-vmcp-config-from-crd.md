@@ -1,4 +1,4 @@
-# RFC-0078: Decouple the VirtualMCPServer CRD schema from the internal vMCP config model
+# RFC-0078: Decouple the VirtualMCPServer CRD schema from the vMCP config model
 
 - **Status**: Draft
 - **Author(s)**: Chris Burns (@ChrisJBurns)
@@ -11,12 +11,15 @@
 
 ## Summary
 
-The `VirtualMCPServer` CRD's `spec.config` is currently typed as the internal
-`pkg/vmcp/config.Config` Go struct, so `controller-gen` walks the entire
-internal config tree into the public CRD schema. This welds the public API to an
-implementation type: any change to the on-disk/runtime config model leaks into
-the CRD. This RFC proposes an **operator-owned mirror type** plus a **converter
-seam** so the CRD schema and the internal config can evolve independently,
+The `VirtualMCPServer` CRD's `spec.config` is typed as `pkg/vmcp/config.Config`,
+so `controller-gen` walks that entire config tree into the public CRD schema. But
+`config.Config` is **itself a public surface** — it is the schema of the on-disk
+`config.yaml` and the type that consumers embedding vMCP as a library configure
+directly. Embedding it in the CRD welds **two distinct public contracts** (the
+Kubernetes CRD and the library/runtime config API) into one Go type, forcing them
+to evolve in lockstep: any change to the config API also changes the CRD. This
+RFC proposes an **operator-owned mirror type** plus a **converter seam** so the
+CRD schema and the config API can evolve independently,
 delivered as an **incremental, provably non-breaking migration** guarded by
 drift tests. It revisits the unified-types recommendation proposed in
 [THV-0023](THV-0023-crd-v1beta1-optimization.md) (which remains in Draft) and the
@@ -28,10 +31,10 @@ goal while removing the API coupling it introduced.
 `VirtualMCPServerSpec.Config` is `config.Config` by value. Because they are the
 same Go type:
 
-- **Internal changes leak into the public API.** Renaming a field, changing a
+- **Config-API changes leak into the CRD API.** Renaming a field, changing a
   YAML/JSON tag, or adding a validation rule on `config.Config` changes the
-  `VirtualMCPServer` CRD schema — a user-facing change triggered by an internal
-  refactor.
+  `VirtualMCPServer` CRD schema — a CRD-user-facing change triggered by work on
+  the (separately public) library/runtime config API.
 - **You cannot add file-only / operator-resolved fields** to the config without
   them appearing in the CRD (the embedding forces it).
 - **You cannot change existing fields at all** without leaking, because the file
@@ -66,7 +69,7 @@ earlier draft of THV-0023 proposed *removing* the embedded `Config` field; #27
 reversed that to embed it.) This RFC revisits that tradeoff — see
 [Alternative 2](#alternative-2-unified-crdconfig-types-the-status-quo-per-rfc-0023):
 it keeps THV-0023's goal of a single, non-divergent schema, but achieves it
-without welding the public API to the implementation type.
+without welding the two public contracts into one Go type.
 
 A subsequent attempt ([toolhive#5238](https://github.com/stacklok/toolhive/pull/5238),
 original form) introduced a `RuntimeConfig` write-side wrapper. That solved only
@@ -74,14 +77,24 @@ the *additive* case (tack new operator-only fields onto a wrapper the CRD does
 not reference). It could not decouple or evolve the **existing** embedded fields,
 which remained the CRD's schema.
 
-**Who is affected:** operator maintainers (blocked from evolving the config
-model or adopting Kubernetes-native config without API churn), and users (at risk
-of unintended CRD changes shipped as a side effect of internal work).
+**Who is affected:** operator maintainers (blocked from evolving the config model
+or adopting Kubernetes-native config without CRD churn); CRD users (at risk of
+unintended CRD changes shipped as a side effect of config work); and **consumers
+that embed vMCP as a library**, for whom `config.Config` *is* the configuration
+API but who have no public documentation of it distinct from the Kubernetes CRD —
+and the CRD is not even 1:1 with the on-disk `config.yaml` (the operator's
+converter resolves references, overrides from dedicated fields, and computes
+defaults), so following the CRD docs to configure the library is actively
+misleading.
 
-**Why it's worth solving:** the CRD is a stability-gated public API. The internal
-config is an implementation detail that should be free to change. Coupling them
-makes both harder to evolve and blocks Kubernetes-native ergonomics (e.g.
-secret/config references inside `spec.config`).
+**Why it's worth solving:** the CRD and `config.Config` are **two public contracts
+with different audiences** — Kubernetes users vs. direct library/CLI consumers —
+and different natural shapes (the CRD wants secret/config *references* and CEL; the
+config API wants plain, self-contained values). Welding them into one Go type
+forces lockstep evolution, pollutes each with the other's concerns, and blocks
+Kubernetes-native ergonomics (e.g. references inside `spec.config`). Decoupling
+lets each be documented and versioned for its own audience; it does **not** make
+either side a throwaway internal detail — both remain public and stable.
 
 ## Goals
 
@@ -101,6 +114,9 @@ secret/config references inside `spec.config`).
   required.
 - Establish the foundation for future **Kubernetes-native config** (references
   inside `spec.config`) and for **retiring duplicate dedicated fields**.
+- Treat `config.Config` as a **first-class public configuration schema** in its
+  own right — documented and versioned for direct library/CLI consumers — rather
+  than as a Kubernetes implementation detail (cf. ToolHive's `RunConfig`).
 
 ## Non-Goals
 
@@ -130,12 +146,13 @@ flowchart LR
     A --> C["converter<br/>(crdToRuntime + resolution)"]
     D --> C
     R --> C
-    C --> F["config.Config<br/>(internal, on-disk file)"]
+    C --> F["config.Config<br/>(config API + on-disk file)"]
     F --> V["vMCP container reads config.yaml"]
 ```
 
-The internal `config.Config` stays exactly as it is. `controller-gen` can no
-longer reach it, because nothing in the CRD type graph references it.
+`config.Config` (the library/runtime config API) stays exactly as it is.
+`controller-gen` can no longer reach it, because nothing in the CRD type graph
+references it.
 
 ### Detailed Design
 
@@ -168,8 +185,9 @@ longer reach it, because nothing in the CRD type graph references it.
 
 #### Data Model Changes
 
-- `config.Config` (internal) is **unchanged**. A parallel mirror type tree is
-  added on the operator side. The converter maps mirror → internal.
+- `config.Config` (the public library/runtime config API) is **unchanged**. A
+  parallel mirror type tree is added on the operator side. The converter maps
+  mirror → config API.
 
 ## Security Considerations
 
@@ -247,8 +265,8 @@ truth"* with *"single Go type."* Those are separable. The real requirement is
 that the CRD schema and the config must not silently diverge, and the
 enforced-equivalence tests in this RFC cover most of that risk — **structural
 drift** (parity) and **value-loss drift** (round-trip) — without the cost type
-identity imposes: welding a stability-gated public API to an implementation type,
-so every internal change becomes a public API change.
+identity imposes: welding two public contracts with different audiences into one
+Go type, so every config-API change is forced to also be a CRD change.
 
 There is, however, an honest gap. Those tests do **not** compare the
 kubebuilder/CEL markers, enums, defaults, or doc comments, which become the
