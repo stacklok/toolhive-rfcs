@@ -285,6 +285,41 @@ incrementally and prove the pattern, and code generation can be layered on
 without changing the architecture. Until then, marker parity is accepted residual
 risk per Alternative 2.
 
+### Alternative 4: Composable shared components (deliberate granular sharing)
+
+Rather than sharing the whole config tree (Alternative 2) or duplicating it whole
+(this RFC's mirror), factor the config into shared **component** types (e.g.
+`OIDCConfig`, `AggregationConfig`, `TimeoutConfig`) reused verbatim by both the CRD
+spec and the internal config, and let only the larger **assembling** structs differ
+— each adding or omitting fields. So the shared `OIDCConfig` is the same type on
+both sides; the CRD assembly adds an `oidcConfigRef`, and the internal assembly
+adds an operator-resolved `caBundlePath`. The translation layer then shrinks to
+only the fields that genuinely differ (refs in, resolved values out); the shared
+components need no conversion and cannot suffer a marker-parity gap (same type,
+same markers). (Raised by the THV-0023 author during review.)
+
+**Pros:** minimal translation; far less duplication than a full mirror; preserves
+a single source of truth for the shared components — which are also the public
+library config API that direct consumers (e.g. the vMCP library) depend on; no
+marker gap for shared parts; cleanly keeps *additive* operator-resolved fields
+(e.g. the [toolhive#4923](https://github.com/stacklok/toolhive/pull/4923) CA path)
+off the CRD by composing them onto the internal assembly rather than the shared
+leaf.
+
+**Cons:** it is **not categorical**. A shared leaf type embedded in the CRD is
+still walked by `controller-gen`, so a change to a shared component still reaches
+the CRD schema — the no-leak boundary test would (correctly) fail for shared
+leaves. It delivers "no *unnecessary* translation" but not "the internal config is
+never embedded in the CRD."
+
+**Status: under active consideration — largely compatible with this RFC, not
+opposed to it.** The additive-field technique (compose operator-resolved fields
+onto the internal struct, never the shared leaf) should be adopted regardless. The
+likely end-state is a **hybrid**: share deliberately-public, stable component
+types, but give the CRD its own assembly carrying the Kubernetes-native fields
+(refs, secrets) and keep operator-resolved fields off it. The choice between this
+and a full mirror hinges on the first Open Question below.
+
 ## Compatibility
 
 ### Backward Compatibility
@@ -366,6 +401,17 @@ the toolchain.
 
 ## Open Questions
 
+- **Zero coupling vs. zero *unintentional* coupling (the central decision).** This
+  RFC's "categorical no-leak" goal assumes the CRD should embed *nothing* from the
+  config package. Alternative 4 instead treats shared component types as a
+  *deliberate joint public contract* and forbids only *accidental* leaks
+  (operator-resolved / sidecar fields). Which is the real goal? If the shared
+  components are genuinely a public config API that library consumers depend on
+  (they are), then "zero unintentional coupling" via a **hybrid** (Alternative 4)
+  may be a better end-state than a full mirror — less duplication, fewer
+  translation layers, one documented schema for the shared parts — at the cost of
+  the strict guarantee. This decision drives whether the end-state is the full
+  mirror or the hybrid.
 - **Mirror location:** `cmd/thv-operator/pkg/vmcpcrd` vs a sub-package under
   `api/v1beta1/`. The mirror is CRD API surface, which argues for under `api/`;
   current placement is a leftover from a `crd-ref-docs` rendering experiment.
