@@ -1,15 +1,11 @@
-# RFC-XXXX: Identity-Assertion JWT Authorization Grant (ID-JAG) Support
+# RFC-0079: Identity-Assertion JWT Authorization Grant (ID-JAG) Support
 
 - **Status**: Draft
 - **Author(s)**: Jakub Hrozek (@jhrozek)
 - **Created**: 2026-04-28
-- **Last Updated**: 2026-06-25
+- **Last Updated**: 2026-06-26
 - **Target Repository**: toolhive
 - **Related Issues**: [stacklok/toolhive#5218](https://github.com/stacklok/toolhive/issues/5218)
-
-> **Note on numbering**: this file uses the placeholder `THV-XXXX` until the
-> PR is opened, at which point the number will be set to the PR number per
-> the [naming convention](../CONTRIBUTING.md#rfc-file-naming-format).
 
 ## Summary
 
