@@ -140,7 +140,7 @@ This RFC uses "front-door IdP" rather than "user IdP" or "primary IdP" to emphas
 
 ### 2.2 Non-Goals
 
-- **Interactive step-up re-authentication.** The IdP may return `insufficient_user_authentication` from Step A (RFC 8693 §2.2.2.1 / RFC 9470). vMCP detects this error, logs it distinctly, and surfaces it to the IDE as a `401` with an RFC 9470 `WWW-Authenticate: Bearer error="insufficient_user_authentication"` challenge header (including any `acr_values`/`max_age` parameters from the IdP response). The interactive re-auth loop — where the IDE pauses the MCP session, opens a browser redirect, and retries — is out of scope: it requires MCP client support that does not yet exist and MCP spec work to standardise the mid-session re-auth mechanism.
+- **Interactive step-up re-authentication.** The IdP may return `insufficient_user_authentication` from Step A (RFC 8693 §2.2.2.1 / RFC 9470). The strategy propagates this error code verbatim like any other Step A error (§3.5) rather than detecting or specially surfacing it — distinct WARN logging and an RFC 9470 `WWW-Authenticate` challenge header (carrying any IdP-supplied `acr_values`/`max_age`) were planned but are **not yet implemented** ([toolhive#5695](https://github.com/stacklok/toolhive/issues/5695) item A tracks adding this). The interactive re-auth loop itself — where the IDE pauses the MCP session, opens a browser redirect, and retries — is out of scope regardless: it requires MCP client support that does not yet exist and MCP spec work to standardise the mid-session re-auth mechanism.
 - **`client_assertion` (private_key_jwt) at Step A or Step B.** Both steps use `client_secret_basic` for the initial implementation. The draft explicitly permits both methods and defers the choice to AS policy; some deployments may require `client_assertion`. Adding an `authMethod` field to support it is a known follow-up.
 - **Multi-actor chaining (`act.act…`).** Out of scope — this RFC carries one user identity and one agent identity per token, and ID-JAG itself does not specify chained-actor semantics.
 - **CLI mode (`thv proxy`, `thv run`).** Like [THV-0053](./THV-0053-vmcp-embedded-authserver.md), ID-JAG is a vMCP feature; the standalone CLI does not run an embedded auth server and has no upstream ID token to start from.
@@ -524,7 +524,7 @@ When `idpClientId` equals `targetClientId` (the xaa.dev custom-clients case), St
 
 ### 4.4 Scope Enforcement
 
-The `scope` and `resource`/`audience` parameters constrain what Step B is permitted to issue, but vMCP is not the authority that enforces them. The resource AS validates the ID-JAG, applies its own consent and admin policy, and decides which scopes the returned access token carries. vMCP does **not** inspect, parse, or validate the returned access token — it is opaque to vMCP and is validated by the backend, which has its own auth middleware. ToolHive's role is to *materialise* the token, not to second-guess the resource AS's contract. The strategy does flatten and validate the configured scope list against the RFC 6749 scope-token grammar before joining, so a malformed scope value cannot inject form data into the request body.
+The `scope` and `resource`/`audience` parameters constrain what Step B is permitted to issue, but vMCP is not the authority that enforces them. The resource AS validates the ID-JAG, applies its own consent and admin policy, and decides which scopes the returned access token carries. vMCP does **not** inspect, parse, or validate the returned access token — it is opaque to vMCP and is validated by the backend, which has its own auth middleware. ToolHive's role is to *materialise* the token, not to second-guess the resource AS's contract. **Not yet implemented:** the strategy should flatten and validate the configured scope list against the RFC 6749 §3.3 scope-token grammar before joining, so a malformed scope value cannot inject form data into the request body — today `parseXAAConfig` copies `cfg.Scopes` verbatim into the Step A/B requests ([toolhive#5695](https://github.com/stacklok/toolhive/issues/5695) item B tracks adding this defense-in-depth check).
 
 ### 4.5 Upstream ID Token at Rest
 
@@ -591,8 +591,8 @@ Branch: `xaa-test-outgoing-strategy`. Goal: end-to-end flow against a fake IdP a
 - `TokenTypeIDJAG` URN constant added to `pkg/oauthproto`. (The other token-type/grant-type URN constants, the `tokenexchange.ExchangeConfig.RequestedTokenType`/`Resource` fields, and the `pkg/oauthproto/jwtbearer` RFC 7523 client are foundation work already merged to `main`; this PR consumes them.)
 - `StrategyTypeXAA`, `XAAConfig`, and the new `BackendAuthStrategy.XAA` field; `zz_generated.deepcopy.go` regenerated.
 - `pkg/vmcp/auth/strategies/xaa.go` with the two-step flow, validation, and the draft §5.2 `token_type=N_A` / `typ` checks.
-- RFC 9470 `insufficient_user_authentication` detection in `performStepA`: distinct WARN log with error code and IdP-supplied `acr_values`/`max_age`; `WWW-Authenticate` challenge header on the resulting 401 so MCP clients that implement RFC 9470 can act on it.
 - Strategy registered in the vMCP auth factory; `SubjectProviderName` defaulting added.
+- **Not included in this PR, tracked separately:** RFC 9470 `insufficient_user_authentication` detection in `performStepA` (distinct WARN log, `WWW-Authenticate` challenge header) — see §2.2 and [toolhive#5695](https://github.com/stacklok/toolhive/issues/5695) item A.
 
 ### 6.3 PR 3 — CRD and Operator Support
 
