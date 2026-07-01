@@ -367,7 +367,9 @@ type XAAConfig struct {
 registry.RegisterStrategy(authtypes.StrategyTypeXAA, strategies.NewXAAStrategy(envReader))
 ```
 
-The vMCP config defaulting is extended to default `XAA.SubjectProviderName` to the configured upstream provider name when empty, the same way it already defaults `token_exchange.SubjectProviderName`. With one upstream provider — the common case — the operator can omit the field entirely.
+The vMCP config defaulting is extended to default `XAA.SubjectProviderName` to the configured upstream provider name when empty, mirroring `token_exchange.SubjectProviderName`'s defaulting in the single-upstream case. With one upstream provider — the common case — the operator can omit the field entirely.
+
+When more than one upstream provider is configured under `authServerConfig.upstreamProviders` and `XAA.SubjectProviderName` is omitted, configuration validation fails explicitly, requiring the field to be set — unlike `token_exchange`, which today still silently defaults to the first configured upstream in this case ([toolhive#5687](https://github.com/stacklok/toolhive/issues/5687) tracks consolidating this defaulting behavior across strategies). `xaa` adopts the stricter, fail-closed behavior from the start since it has no existing deployments to break ([toolhive#5697](https://github.com/stacklok/toolhive/issues/5697)).
 
 `SubjectProviderName` is the only field in `XAAConfig` without an equivalent in any other open-source ID-JAG implementation. All other implementations pass the subject token directly; ToolHive's multi-upstream architecture requires a *selector* that identifies which of the configured upstream providers' ID tokens to use as the Step A subject. With a single upstream — the common case — the operator can omit the field and rely on the default.
 
