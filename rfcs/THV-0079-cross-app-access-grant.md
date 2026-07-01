@@ -536,6 +536,8 @@ Both the ID-JAG and the backend access token are bearer credentials, and the des
 
 Neither artefact outlives the process, and both are gated by short TTLs, so a memory-disclosure window is small and self-healing.
 
+Replay prevention within the `exp` window is a trust assumption ToolHive makes on the resource AS implementing `jti` tracking, consistent with RFC 7523's inherent bearer-assertion replay exposure — the draft itself is silent on replay and does not assign this responsibility explicitly. vMCP's own handling (no persistence, direct pass-through to Step B) minimises the interception surface but does not substitute for AS-side `jti` enforcement.
+
 ### 4.3 Cross-Domain Client Mapping Risks
 
 When `idpClientId` equals `targetClientId` (the xaa.dev custom-clients case), Step A and Step B authenticate as the same client and there is no mapping to get wrong. When they differ (the cross-domain mapping case, where the IdP maps the ID-JAG's `client_id` to a distinct Step B client), a misconfigured `targetClientSecretRef` or `targetTokenUrl` could deliver a Step B request — carrying a valid ID-JAG — to the wrong resource AS or under the wrong client identity. The mitigating trust assumption is structural: ID-JAG only works when the agent application and the resource application share the *same* front-door IdP for SSO, and the IdP mints the ID-JAG with an `aud` bound to a specific resource AS. A token minted for one resource AS will be rejected by another. The configuration risk is therefore one of *delivery* (wrong endpoint), not of *forgery*; `targetAudience` and `targetResource` are required, validated, and kept as separate fields precisely so the AS-vs-API distinction cannot be conflated.
