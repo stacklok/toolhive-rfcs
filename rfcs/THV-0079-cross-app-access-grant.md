@@ -35,7 +35,6 @@ The outgoing-auth layer also provides three pieces of shared plumbing that any n
 
 - **Strategy registry.** Named strategies are registered in the vMCP auth factory; per-backend config in `BackendAuthStrategy` selects which one runs.
 - **Identity enrichment.** The auth middleware loads `Identity.UpstreamTokens map[string]string` (provider → access token) before the strategy runs. Strategies are stateless reads against the identity.
-- **Token cache.** Backend access tokens obtained by a strategy are cached *outside* the strategy in `TokenCache`, keyed by identity + backend name.
 - **CRD plumbing.** Each strategy has a converter under `pkg/vmcp/auth/converters/` that maps an `MCPExternalAuthConfig` to a `BackendAuthStrategy`, plus a `ResolveSecrets` step that pulls client secrets from Kubernetes into the proxy runner pod's environment.
 
 ### 1.2 The Eager-Chaining Problem
@@ -154,7 +153,7 @@ This RFC uses "front-door IdP" rather than "user IdP" or "primary IdP" to emphas
 
 ### 3.1 Architecture Overview
 
-The front-door identity (a TH-JWT) is validated by the existing auth middleware. The middleware now additionally projects the user's stored upstream **ID token** into `Identity.UpstreamIDTokens[providerName]`. The `xaa` strategy reads it from there. Two RFC 8693 / 7523 round trips later, the strategy has a backend-bound access token; it sets `Authorization: Bearer …` and lets the request proceed. The `TokenCache` caches the final access token so most calls skip both steps entirely.
+The front-door identity (a TH-JWT) is validated by the existing auth middleware. The middleware now additionally projects the user's stored upstream **ID token** into `Identity.UpstreamIDTokens[providerName]`. The `xaa` strategy reads it from there. Two RFC 8693 / 7523 round trips later, the strategy has a backend-bound access token; it sets `Authorization: Bearer …` and lets the request proceed. No caching layer sits above the strategy today, so every call performs both round trips fresh — this is the steady-state per-request cost, not just a cold-start one.
 
 ```mermaid
 sequenceDiagram
@@ -171,12 +170,11 @@ sequenceDiagram
     Note over vMCP: Identity.UpstreamIDTokens[idp] = id_token
 
     IDE->>vMCP: tools/call<br>Authorization: Bearer TH-JWT
-    Note over vMCP: TokenCache miss → xaa strategy
+    Note over vMCP: xaa strategy invoked (every call)
     vMCP->>IdP: POST /token (Step A)<br>grant=token-exchange<br>subject_token=id_token<br>requested_token_type=id-jag<br>audience=Resource AS<br>resource=Backend API
     IdP-->>vMCP: ID-JAG (typ: oauth-id-jag+jwt, exp: 5m)
     vMCP->>Res: POST /token (Step B)<br>grant=jwt-bearer<br>assertion=ID-JAG<br>scope=…
     Res-->>vMCP: access_token (aud=Backend API)
-    Note over vMCP: TokenCache.Set(backend, access_token, ttl)
     vMCP->>Backend: tools/call<br>Authorization: Bearer access_token
     Backend-->>vMCP: response
     vMCP-->>IDE: response
@@ -192,40 +190,23 @@ The end-to-end behaviour was confirmed by a proof of concept driven against the 
 - Both `audience` (the AS URL) **and** `resource` (the API URL) are required at Step A — they are different values, and an earlier design draft that conflated them did not work.
 - `client_secret_basic` was sufficient at both steps in the sandbox; the draft explicitly permits both `client_secret_basic` and `client_assertion`, deferring the choice to AS policy.
 
-The PoC also identified a concrete plumbing gap inside ToolHive: the auth-server storage layer already retains the upstream ID token, but the auth middleware only projects the *access* token to `Identity.UpstreamTokens`. Step A of the ID-JAG flow needs the ID token. Closing this gap is §3.4.
+The PoC also identified a concrete plumbing gap inside ToolHive: the auth-server storage layer already retains the upstream ID token, but the auth middleware only projects the *access* token to `Identity.UpstreamTokens`. Step A of the ID-JAG flow needs the ID token. Closing this gap is §3.3.
 
-### 3.3 Cached-Token Fast Path
+There is no caching layer above the strategy today: no shared `TokenCache` (or equivalent) exists anywhere in `pkg/vmcp`, for `xaa` or for any other outgoing-auth strategy. Every proxied call re-runs both Step A and Step B in full — the two back-channel calls each take tens of milliseconds, so the added latency is modest per call, but it is paid on every call, not just a cold first one. Adding a shared cache (keyed by identity + backend, respecting the access token's own `expires_in`) is a natural follow-up but is out of scope for this RFC.
 
-The expected steady state, after one initial cold call, is a clean cache hit:
-
-```mermaid
-sequenceDiagram
-    participant IDE
-    participant vMCP
-    participant Backend
-
-    Note over vMCP: TokenCache hit for (identity, backend)
-    IDE->>vMCP: tools/call (Bearer TH-JWT)
-    vMCP->>Backend: tools/call (Bearer cached access_token)
-    Backend-->>vMCP: response
-    vMCP-->>IDE: response
-```
-
-The **`TokenCache`** sits outside the strategy and applies to every strategy that returns an access token. It is keyed by identity + backend and respects the access token's `expires_in` (typically one to two hours). On a miss — access token expired — the strategy runs both Step A and Step B. The two back-channel calls each take tens of milliseconds and fire at most once per backend per active session in every multi-hour access-token cycle, so no intermediate cache is warranted.
-
-### 3.4 ID Token Plumbing (`Identity.UpstreamIDTokens`)
+### 3.3 ID Token Plumbing (`Identity.UpstreamIDTokens`)
 
 ID-JAG Step A consumes the user's *ID token*. The auth-server storage already retains it, but the in-process token-reader projects only access tokens to the caller. The changes:
 
 - `TokenReader.GetAllUpstreamCredentials` already returns both artefacts together per provider — `UpstreamCredential{AccessToken, IDToken}` — from a single storage call. No second bulk-read method is added; the auth middleware projects that one call's result into two separate maps instead of one.
 - `Identity` (in `pkg/auth/identity.go`) gains `UpstreamIDTokens map[string]string`. Its `MarshalJSON` is updated to redact this field exactly the way `UpstreamTokens` is redacted (see §4.1).
-- The auth middleware populates both maps from that single call. This is a fail-closed path, not a soft degrade: a storage/infrastructure error surfaces as `503 authentication service temporarily unavailable`, and a refresh failure for *any* configured upstream provider surfaces as `401 invalid_token` — both abort the request before any outgoing-auth strategy runs. (A key simply being absent from the map — e.g. the user never configured or consented to that provider — is a separate, non-error case; that is what the strategy's own missing-token branch in §3.6 handles.)
+- The auth middleware populates both maps from that single call. This is a fail-closed path, not a soft degrade: a storage/infrastructure error surfaces as `503 authentication service temporarily unavailable`, and a refresh failure for *any* configured upstream provider surfaces as `401 invalid_token` — both abort the request before any outgoing-auth strategy runs. (A key simply being absent from the map — e.g. the user never configured or consented to that provider — is a separate, non-error case; that is what the strategy's own missing-token branch in §3.5 handles.)
 
 A second parallel `map[string]string` is preferred over folding both tokens into a per-provider struct (e.g. `map[string]UpstreamCredential`). The map shape keeps the change purely additive — no existing reader of `Identity.UpstreamTokens` changes — whereas a struct upgrade would touch every current consumer of the access-token map. If a third per-provider credential ever materialises (refresh token, expiry, scope metadata), the struct consolidation can happen then, behind the same projection step.
 
 ID tokens are *not* refreshed. The strategy treats a missing key in `UpstreamIDTokens` (or an ID token expired by `iat`/`exp`) as terminal: it returns an error, which surfaces as `401 invalid_token` to the IDE and forces a re-login.
 
-### 3.5 OAuth Protocol Primitives
+### 3.4 OAuth Protocol Primitives
 
 A shared package surface (`pkg/oauthproto`) already holds the URN constants and the RFC 7523 client, so the new strategy and any future grant-related code can share them without circular imports.
 
@@ -264,7 +245,7 @@ type ExchangeConfig struct {
 }
 ```
 
-The Step A response carries `token_type: N_A` and `issued_token_type` equal to the id-jag URN per the draft (§5.2); the strategy validates both (see §3.6).
+The Step A response carries `token_type: N_A` and `issued_token_type` equal to the id-jag URN per the draft (§5.2); the strategy validates both (see §3.5).
 
 **Step B uses the `pkg/oauthproto/jwtbearer` package** (already on `main`) implementing the RFC 7523 client:
 
@@ -289,7 +270,7 @@ func (c *Config) Validate() error
 
 The implementation mirrors `pkg/oauthproto/tokenexchange`: HTTP Basic client auth, form-encoded body, structured response decode, error mapping. The `AssertionProvider` callback lets the caller (the `xaa` strategy) supply the ID-JAG obtained from Step A without `jwtbearer` needing to know how it was minted. Because `Authenticate` always runs Step A before constructing the `jwtbearer.Config`, the assertion is always fresh for that invocation.
 
-### 3.6 The `xaa` Outgoing-Auth Strategy
+### 3.5 The `xaa` Outgoing-Auth Strategy
 
 The strategy lives in `pkg/vmcp/auth/strategies/xaa.go`. It is a stateless struct — it holds no session state and no intermediate cache:
 
@@ -323,7 +304,7 @@ The `Authenticate` algorithm:
 
 Errors at either step surface the RFC 8693 / 7523 error codes verbatim (`invalid_grant`, `invalid_request`, `insufficient_user_authentication`). Network errors get a wrapped sentinel. The ID-JAG returned by Step A is opaque to vMCP beyond the `token_type`/`typ` checks — vMCP holds no JWKS for the IdP and is not in the trust chain; the resource AS validates the assertion's signature, `aud`, `resource`, `iat`, and `exp`.
 
-### 3.7 Strategy Types and Registration
+### 3.6 Strategy Types and Registration
 
 The strategy type constant `StrategyTypeXAA = "xaa"` and the `XAAConfig` struct are added to the vMCP auth types:
 
@@ -372,7 +353,7 @@ The vMCP config defaulting is extended to default `XAA.SubjectProviderName` to t
 
 `SubjectProviderName` is the only field in `XAAConfig` without an equivalent in any other open-source ID-JAG implementation. All other implementations pass the subject token directly; ToolHive's multi-upstream architecture requires a *selector* that identifies which of the configured upstream providers' ID tokens to use as the Step A subject. With a single upstream — the common case — the operator can omit the field and rely on the default.
 
-### 3.8 Operator and CRD Integration
+### 3.7 Operator and CRD Integration
 
 The CRD type lives in `cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go`. It adds the type constant `ExternalAuthTypeXAA = "xaa"` and a spec struct `XAASpec` carrying the same Step A / Step B fields as `XAAConfig`, with secret references (`IDPClientSecretRef`, `TargetClientSecretRef`) instead of inline secrets. The value `"xaa"` is intentionally identical on both the snake_case vMCP strategy surface (`StrategyTypeXAA`) and the camelCase CRD surface (`ExternalAuthTypeXAA`); as an acronym it carries no compound to case-fold, matching the existing `ExternalAuthTypeOBO = "obo"` precedent.
 
@@ -383,7 +364,7 @@ The converter lives in `pkg/vmcp/auth/converters/xaa.go` and implements the stan
 
 The converter is registered in the converter registry alongside the existing entries. CRD manifests and API docs are regenerated via the standard operator codegen tasks.
 
-### 3.9 Configuration
+### 3.8 Configuration
 
 A `VirtualMCPServer` configures an upstream front-door IdP and points a backend at an `xaa` `MCPExternalAuthConfig`:
 
@@ -531,9 +512,9 @@ The new `Identity.UpstreamIDTokens` field carries the user's upstream ID token i
 Both the ID-JAG and the backend access token are bearer credentials, and the design bounds their blast radius by lifetime and by never persisting them.
 
 - The **ID-JAG** is short-lived — 300 s typical in the sandbox — and held only in process memory for the duration of the `Authenticate` call; it is passed directly to Step B and not retained afterward. It is never written to disk, to a ConfigMap, to a RunConfig file, or to operator status.
-- The **backend access token** is cached per identity + backend in the existing `TokenCache`, which is in-memory with the access token's own `expires_in` as its TTL.
+- The **backend access token** is not persisted or reused between calls either — there is no caching layer above the strategy today (§3.2), so the access token is held only for the duration of the single request it authenticates before being discarded.
 
-Neither artefact outlives the process, and both are gated by short TTLs, so a memory-disclosure window is small and self-healing.
+Neither artefact outlives a single request, so a memory-disclosure window is small and self-healing.
 
 Replay prevention within the `exp` window is a trust assumption ToolHive makes on the resource AS implementing `jti` tracking, consistent with RFC 7523's inherent bearer-assertion replay exposure — the draft itself is silent on replay and does not assign this responsibility explicitly. vMCP's own handling (no persistence, direct pass-through to Step B) minimises the interception surface but does not substitute for AS-side `jti` enforcement.
 
@@ -550,21 +531,17 @@ The `scope` and `resource`/`audience` parameters constrain what Step B is permit
 This RFC does not introduce new at-rest storage of the ID token. The embedded auth server already captures and persists the upstream `id_token` in `storage.UpstreamTokens` as part of [THV-0053](./THV-0053-vmcp-embedded-authserver.md) / [THV-0031](./THV-0031-auth-server-integration.md); this RFC only adds a read path that projects the already-stored value to request-time code. The at-rest protections are therefore inherited from the existing upstream-token storage: the same backend (in-memory or Redis), the same `SessionExpiresAt` lifetime bound, and the same access scoping that already applies to stored refresh tokens. Two points are worth making explicit:
 
 - The practical sensitivity of that storage is higher than the schema implies. An `id_token` directly identifies the user; it is audience-restricted to the vMCP client, so its blast radius is bounded, but a disclosed ID token paired with the Step A client credentials is a usable Step A subject until it expires. Deployments that persist upstream tokens in Redis should hold that backend to the same encrypted-at-rest and access-scoped bar already expected for refresh tokens.
-- ID tokens are bound by `SessionExpiresAt`. An expired or evicted row yields the §3.4 terminal "missing ID token" path and forces a re-login; there is no separate ID-token TTL to tune.
+- ID tokens are bound by `SessionExpiresAt`. An expired or evicted row yields the §3.3 terminal "missing ID token" path and forces a re-login; there is no separate ID-token TTL to tune.
 
-### 4.6 Backend Token Cache Isolation
-
-The `TokenCache` (§3.3) returns a previously issued backend access token without re-running Step A/Step B, so its key must isolate users: an entry minted for one front-door identity must never be served to another. The identity component of the key is the validated `sub` claim (`Identity.Subject`), which ToolHive requires on every token per OIDC Core 1.0 §5.1 — an IdP-assigned, immutable per-user identifier, not a mutable attribute such as email or display name. The cache key is a SHA-256 digest over the subject and the backend identifiers, so raw identity and token values never appear in the key itself. Because the cache is in-memory and process-local, a disclosure is bounded to one proxy runner and one access-token TTL.
-
-### 4.7 Audit Logging of Token Issuance
+### 4.6 Audit Logging of Token Issuance
 
 Materialising a backend credential on the user's behalf is a privilege-relevant event that should be observable independently of debug logging. Each Step A and Step B outcome — success, or failure with its OAuth error code — should emit a structured audit event carrying the front-door identity (`sub`), the target resource AS, the resource API, and the requested scopes, and never the ID token, the ID-JAG, or the access token. This answers "which user obtained a token for which backend, and when" without exposing credential material; because the event is built only from non-secret fields, it cannot leak token bytes even if the sink is misconfigured. This is net-new wiring: today `pkg/audit` runs only as inbound HTTP middleware and no outgoing-auth strategy emits audit events, so `xaa` would be the first consumer on this path — the event must be emitted from within the strategy's `Authenticate` call or from the composition root that invokes it. It is called out here so the work is not assumed to come for free.
 
-### 4.8 Client Secret Handling and Rotation
+### 4.7 Client Secret Handling and Rotation
 
-The Step A (IdP) and Step B (resource AS) client secrets are supplied as Kubernetes secret references; `ResolveSecrets` (§3.8) reads them and resolves the plaintext values directly into the `BackendAuthStrategy` struct at conversion time — unlike `token_exchange`'s and the OIDC client-secret path's env-var injection into the proxy runner pod, `xaa`'s secrets never pass through `SecretKeyRef` pod environment variables. They are never written to RunConfig, CRD status, or logs. Neither the `MCPRemoteProxy` nor the `VirtualMCPServer` reconciler watches `Secret` objects, so a secret rotation is not picked up automatically by either mechanism — but because `xaa`'s resolution happens in-process at conversion time rather than at pod start, the exact trigger that picks up a new value (next reconcile of the owning CR vs. a `kubectl rollout restart`) differs from the env-var strategies' and needs verifying rather than assuming parity. Operators should treat secret rotation as not yet automatic either way and schedule accordingly.
+The Step A (IdP) and Step B (resource AS) client secrets are supplied as Kubernetes secret references; `ResolveSecrets` (§3.7) reads them and resolves the plaintext values directly into the `BackendAuthStrategy` struct at conversion time — unlike `token_exchange`'s and the OIDC client-secret path's env-var injection into the proxy runner pod, `xaa`'s secrets never pass through `SecretKeyRef` pod environment variables. They are never written to RunConfig, CRD status, or logs. Neither the `MCPRemoteProxy` nor the `VirtualMCPServer` reconciler watches `Secret` objects, so a secret rotation is not picked up automatically by either mechanism — but because `xaa`'s resolution happens in-process at conversion time rather than at pod start, the exact trigger that picks up a new value (next reconcile of the owning CR vs. a `kubectl rollout restart`) differs from the env-var strategies' and needs verifying rather than assuming parity. Operators should treat secret rotation as not yet automatic either way and schedule accordingly.
 
-### 4.9 Operator-Configured Token Endpoint SSRF Exposure
+### 4.8 Operator-Configured Token Endpoint SSRF Exposure
 
 `idpTokenUrl` and `targetTokenUrl` are operator-supplied endpoints; `xaa` inherits the same SSRF exposure and validation posture as the existing `token_exchange` strategy's `TokenURL` (URL-parse only, no host allow-listing). This is an accepted risk in ToolHive's threat model for admin-supplied configuration, not a `xaa`-specific gap.
 
