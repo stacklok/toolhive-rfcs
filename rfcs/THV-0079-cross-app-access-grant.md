@@ -563,6 +563,10 @@ Materialising a backend credential on the user's behalf is a privilege-relevant 
 
 The Step A (IdP) and Step B (resource AS) client secrets are supplied as Kubernetes secret references and resolved into the proxy runner pod's environment by `ResolveSecrets` (§3.8); they are never written to RunConfig, CRD status, or logs. Secrets are injected as pod environment variables via `SecretKeyRef`, which Kubernetes snapshots at pod start, and neither the `MCPRemoteProxy` nor the `VirtualMCPServer` reconciler watches `Secret` objects or triggers a rollout when a referenced secret changes. Rotating a client secret therefore requires a proxy-runner restart (e.g. `kubectl rollout restart`) before the new value takes effect — the same behaviour as the existing `token_exchange` and OIDC client-secret env injection. Operators should schedule secret rotations accordingly.
 
+### 4.9 Operator-Configured Token Endpoint SSRF Exposure
+
+`idpTokenUrl` and `targetTokenUrl` are operator-supplied endpoints; `xaa` inherits the same SSRF exposure and validation posture as the existing `token_exchange` strategy's `TokenURL` (URL-parse only, no host allow-listing). This is an accepted risk in ToolHive's threat model for admin-supplied configuration, not a `xaa`-specific gap.
+
 ---
 
 ## 5. Compatibility
