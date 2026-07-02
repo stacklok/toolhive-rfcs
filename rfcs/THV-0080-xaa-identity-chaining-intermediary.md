@@ -3,13 +3,13 @@
 - **Status**: Draft
 - **Author(s)**: Jakub Hrozek (@jhrozek)
 - **Created**: 2026-07-01
-- **Last Updated**: 2026-07-01
+- **Last Updated**: 2026-07-02
 - **Target Repository**: toolhive
 - **Related Issues**: [stacklok/toolhive#5218](https://github.com/stacklok/toolhive/issues/5218)
 
 ## Summary
 
-[THV-0079](./THV-0079-cross-app-access-grant.md) makes the vMCP an XAA *client*: it holds the user's upstream ID token from the embedded auth server's SSO login and uses it to obtain backend access tokens via the two-step ID-JAG protocol. This RFC addresses a different scenario: an external client — an AI agent, an automation pipeline, or another application — already holds an ID-JAG and wants to call ToolHive's vMCP *without* a browser redirect.
+[THV-0079](./THV-0079-cross-app-access-grant.md) makes the vMCP an XAA *client*: the user authenticates interactively at ToolHive's embedded AS (one browser login at ToolHive, separate from any login the MCP client already required), and ToolHive holds the captured upstream ID token to perform the two-step ID-JAG protocol on every backend call. This RFC addresses a different topology: the MCP client — an AI agent, an automation pipeline, or an application like Claude.ai — already holds the user's ID token from its own login and wants to present it directly to ToolHive's vMCP token endpoint. Under this model the user logs in once (to the MCP client); the client forwards the identity to ToolHive programmatically, with no second browser redirect at ToolHive.
 
 This RFC is split into two independent phases:
 
@@ -27,7 +27,7 @@ This section describes what exists in ToolHive and in the OAuth ecosystem today.
 
 [THV-0079](./THV-0079-cross-app-access-grant.md) establishes the `xaa` outgoing-auth strategy for the vMCP. When a user authenticates via a browser OIDC flow, the embedded auth server ([THV-0053](./THV-0053-vmcp-embedded-authserver.md)) captures their upstream ID token. The `xaa` strategy reads that ID token and performs the two-step ID-JAG protocol on every backend call: Exchange-THV at the front-door IdP to mint an ID-JAG, Grant-THV at the resource AS to redeem it for a backend access token.
 
-This path requires a prior browser login to seed the upstream ID token. It covers the interactive user case but leaves a gap: automated clients — AI agents, CI pipelines, service-to-service calls — cannot drive a browser redirect. They already hold an identity credential from their own IdP, and they want to present that credential directly to ToolHive's vMCP token endpoint, with no redirect, and receive a session token they can use to call tools.
+This path requires a browser login at ToolHive to seed the upstream ID token — a second authentication step that occurs after any login the MCP client already required of the user. It covers the interactive user case but leaves two gaps: (1) users must authenticate twice (once to the MCP client, once to ToolHive), and (2) automated clients — AI agents, CI pipelines, service-to-service calls — cannot drive a browser redirect at all. They already hold an identity credential from their own IdP, and they want to present that credential directly to ToolHive's vMCP token endpoint, with no redirect, and receive a session token they can use to call tools.
 
 ### 1.2 The Inbound Gap
 
@@ -95,15 +95,15 @@ Phase 1 alone is useful and safe to ship. Phase 2 is an additive extension and c
 - Validate ID-JAG-THV against a configurable per-issuer JWKS trust registry so the AS can trust assertions from multiple IdPs without trusting all of them.
 - Enforce `jti` replay prevention on accepted ID-JAGs₁ so that a single assertion cannot be reused within its validity window.
 - Expose Phase 1 acceptance in the AS discovery document so that clients can discover the supported grant types.
-- Enable the full Identity Chaining Intermediary topology for backends using the `xaa` outgoing strategy by deriving a valid subject token for Exchange-SaaS from the inbound session, using one of the three mechanisms described in §3.3 (Phase 2).
+- Enable the full Identity Chaining Intermediary topology for backends using the `xaa` outgoing strategy by deriving a valid subject token for Exchange-SaaS from the inbound session, using one of the mechanisms described in §3.3 (Phase 2).
 - Preserve the full identity chain in all derived tokens via the `act` claim (RFC 8693 §4.1), so that every downstream AS can observe "user X via agent Y via ToolHive".
 - Stay strictly additive with respect to [THV-0079](./THV-0079-cross-app-access-grant.md): the browser-login path is unchanged, and the `xaa` outgoing strategy continues to work without modification for vMCP sessions seeded by a browser login.
 
 ### 2.2 Non-Goals
 
 - **Replacing the browser-login path.** The OIDC authorization code flow and the `xaa` outgoing strategy for browser-seeded sessions ([THV-0079](./THV-0079-cross-app-access-grant.md)) are unchanged. This RFC adds a *parallel* entry point, not a replacement.
-- **Supporting Entra user-delegated chaining.** Microsoft Entra requires an interactive user consent step for delegated on-behalf-of flows. Machine-to-machine chaining through Entra is restricted to app-only tokens, which do not carry user identity. This use case is out of scope.
-- **Implementing a full OIDC provider.** Phase 1 adds one new grant type to the existing token endpoint. The AS does not gain userinfo, dynamic client registration, or any endpoint beyond what it already exposes. Phase 2 Solution B issues short-lived internal ID tokens for the purpose of Exchange-SaaS only; this does not make ToolHive a general-purpose OIDC provider.
+- **User-delegated chaining that requires interactive consent.** Some IdPs restrict delegated identity flows to interactive grant types where the user must be present. This RFC targets non-interactive clients; any chaining path that requires a browser redirect at Phase 2 is out of scope.
+- **Implementing a full OIDC provider.** Phase 1 adds one new grant type to the existing token endpoint. The AS does not gain userinfo, dynamic client registration, or any endpoint beyond what it already exposes. Phase 2 Direct Backend Trust mints RFC 7523 assertions, not OIDC ID tokens; ToolHive does not become a general-purpose OIDC provider.
 - **Client cooperation (forwarding credentials from the inbound client).** The external client presents ID-JAG-THV and nothing more. Phase 2 must work without the client supplying a refresh token, a second ID token, or any additional credential beyond what ID-JAG-THV already asserts.
 - **Interactive step-up re-authentication.** Out of scope for the same reasons given in [THV-0079](./THV-0079-cross-app-access-grant.md) §2.2.
 - **Multi-actor chaining beyond one delegation level.** This RFC carries one user identity and one agent identity per inbound token. Nested `act.act…` chains are not modelled.
@@ -135,13 +135,22 @@ sequenceDiagram
     TH_AS->>TH_AS: Validate ID-JAG-THV signature (IdP JWKS)<br>Check aud, exp, jti (replay cache)
     TH_AS-->>Agent: vMCP session token (JWT)
 
+    Note over Agent,Backend: Diagram shows the generic Phase 1 path. Okta Agent-to-Agent (§3.3.1)<br>replaces Phase 1 entirely: the Agent obtains T3 from the IdP's custom AS<br>directly, and TH_AS validates T3 via OIDC middleware — it never issues a<br>vMCP session token from the flow above for that path.
+
     Note over Agent,Backend: Phase 2: identity chaining on tool call
     Agent->>TH_AS: tools/call<br>Authorization: Bearer vMCP session token
-    TH_AS->>TH_AS: Derive subject token from session<br>(Solution A / B / C — see §3.3)
-    TH_AS->>IdP: POST /token (Exchange-SaaS)<br>grant=token-exchange<br>subject_token=derived token<br>requested_token_type=id-jag<br>audience=Backend AS
-    IdP-->>TH_AS: ID-JAG-SaaS (aud=Backend AS)
-    TH_AS->>Backend_AS: POST /token (Grant-SaaS)<br>grant=jwt-bearer<br>assertion=ID-JAG-SaaS
-    Backend_AS-->>TH_AS: backend access token
+
+    alt Okta Agent-to-Agent (§3.3.1)
+        TH_AS->>IdP: POST /token (Exchange-SaaS)<br>grant=token-exchange<br>subject_token=T3 (obtained in §3.3.1's Phase 1)<br>requested_token_type=id-jag<br>audience=Backend AS
+        IdP-->>TH_AS: ID-JAG-SaaS (aud=Backend AS)
+        TH_AS->>Backend_AS: POST /token (Grant-SaaS)<br>grant=jwt-bearer<br>assertion=ID-JAG-SaaS
+        Backend_AS-->>TH_AS: backend access token
+    else Direct Backend Trust (§3.3.2)
+        TH_AS->>TH_AS: Mint RFC 7523 assertion<br>(sub=user, aud=backend token endpoint)
+        TH_AS->>Backend_AS: POST /token<br>grant=jwt-bearer<br>assertion=ToolHive-minted JWT
+        Backend_AS-->>TH_AS: backend access token
+    end
+
     TH_AS->>Backend: tools/call<br>Authorization: Bearer backend access token
     Backend-->>TH_AS: tool result
     TH_AS-->>Agent: tool result
@@ -170,11 +179,11 @@ The handler performs the following validation steps before issuing any token:
 5. **Validate `aud`.** Performed by fosite's `rfc7523.Handler` against `AuthorizationServerConfig.GetTokenURLs()`. Fosite's default `GetTokenURLs()` returns only the AS's token endpoint URL (`<issuer>/oauth/token`); this RFC overrides it (§3.2.2) to also accept the bare AS issuer URI, since that is the value this RFC documents external IdPs should use for `aud`. Reject with `invalid_grant` (fosite's built-in behavior) if the audience matches neither.
 6. **Check `jti` replay.** Look up `jti` in the replay-prevention cache (§3.5). Reject with `invalid_grant` if the `jti` has been seen before. Insert on first acceptance, with TTL equal to the assertion's `exp − now`.
 7. **Extract identity.** Read `sub` and `iss` from the validated claims. Optionally read an email claim if the IdP includes one.
-8. **Issue vMCP session token.** Mint a standard signed JWT using the embedded AS's signing key, with `sub` from the assertion, `iss` equal to the AS issuer URI, `aud` equal to the configured MCP resource URL, and `exp` equal to `min(ID-JAG-THV.exp, now + configured_session_lifetime)`. Include an `act` claim recording the original IdP `iss` and `sub`. Mint a fresh `tsid` (token-session-id) claim, matching the shape used for OIDC-callback sessions, and write a session record to the same session storage backend (§3.6) keyed by that `tsid`, with `ExpiresAt` equal to the token's own `exp`. Phase 2 §3.3.1 (Solution A) extends this record with the raw ID-JAG-THV.
+8. **Issue vMCP session token.** Mint a standard signed JWT using the embedded AS's signing key, with `sub` from the assertion, `iss` equal to the AS issuer URI, `aud` equal to the configured MCP resource URL, and `exp` equal to `min(ID-JAG-THV.exp, now + configured_session_lifetime)`. Include an `act` claim recording the original IdP `iss` and `sub`. Mint a fresh `tsid` (token-session-id) claim, matching the shape used for OIDC-callback sessions, and write a session record to the same session storage backend (§3.6) keyed by that `tsid`, with `ExpiresAt` equal to the token's own `exp`.
 
-No upstream ID token is stored in session storage for Phase 1 sessions. The session record exists only to validate subsequent incoming bearer tokens; the `UpstreamIDTokens` map is empty for Phase 1 sessions (relevant to Phase 2 — see §3.3).
+No upstream ID token is stored in session storage for Phase 1 sessions. The session record exists only to validate subsequent incoming bearer tokens; the `UpstreamIDTokens` map is empty for Phase 1 sessions (relevant to Phase 2 — see §3.3). ID-JAG-THV itself is never written to session storage: it is validated in process memory and discarded once the vMCP session token is issued. This RFC initially considered persisting it (referenced by `tsid`) to support the Audience Alignment mechanism (§3.3.4), but that mechanism is invalidated and no other Phase 2 solution needs a stored copy of ID-JAG-THV, so no such field exists.
 
-The existing fosite-based token endpoint ([THV-0053](./THV-0053-vmcp-embedded-authserver.md)) gains a new `Factory` (§3.2.2) registered alongside the existing ones in `pkg/authserver/server/provider.go`'s `NewAuthorizationServer(..., factories...)` call. Phase 1 does **not** register `compose.RFC7523AssertionGrantFactory` unmodified — two of the validation steps above (the `typ` check in step 1 and the `allowedClientIDs` filtering in step 2) are not reachable through fosite's `rfc7523.Handler` as shipped: its storage callbacks receive only `(issuer, subject, keyId)`, never the raw assertion, and it performs no `typ` check at all. §3.2.2 describes the integration this RFC actually implements.
+The existing fosite-based token endpoint ([THV-0053](./THV-0053-vmcp-embedded-authserver.md)) gains a new fosite `compose.Factory` (§3.2.2), added to the `compose.Compose(...)` call in `pkg/authserver/server_impl.go`'s `createProvider()`, alongside the factories that construct the AS's other grant handlers today (`compose.OAuth2AuthorizeExplicitFactory`, `compose.OAuth2RefreshTokenGrantFactory`, `compose.OAuth2PKCEFactory`). Note this is `pkg/authserver/server_impl.go`, not `pkg/authserver/server/provider.go`'s `NewAuthorizationServer(..., factories...)` — that function and its own `Factory` type exist in the codebase but are exercised only by `provider_test.go`; the AS actually served in production is constructed by `createProvider()`'s direct call to fosite's own `compose.Compose`. Phase 1 does **not** register `compose.RFC7523AssertionGrantFactory` unmodified — two of the validation steps above (the `typ` check in step 1 and the `allowedClientIDs` filtering in step 2) are not reachable through fosite's `rfc7523.Handler` as shipped: its storage callbacks receive only `(issuer, subject, keyId)`, never the raw assertion, and it performs no `typ` check at all. §3.2.2 describes the integration this RFC actually implements.
 
 The AS discovery document (`/.well-known/oauth-authorization-server`) is updated to include `urn:ietf:params:oauth:grant-type:jwt-bearer` in the `grant_types_supported` array.
 
@@ -202,14 +211,16 @@ JWKS content is fetched at registration time and cached with a configurable TTL 
 
 #### 3.2.2 Fosite Integration
 
-Phase 1 registers a custom `Factory` (matching the `Factory func(config *AuthorizationServerConfig, storage fosite.Storage, strategy any) any` signature `pkg/authserver/server/provider.go` already uses for the other grant handlers) built from two pieces:
+Phase 1 registers a custom fosite `compose.Factory` (matching the `func(config fosite.Configurator, storage interface{}, strategy interface{}) interface{}` signature `pkg/authserver/server_impl.go`'s `createProvider()` already passes to `compose.Compose(...)` for the other grant handlers) built from two pieces:
 
 1. **`InboundTrustKeyStorage`** implements fosite's `rfc7523.RFC7523KeyStorage` interface against the trust registry (§3.4):
    - `GetPublicKey`/`GetPublicKeys(ctx, issuer, subject, ...)` ignore `subject` entirely and resolve the cached JWKS by `issuer` alone. This is a deliberate mismatch with `rfc7523`'s original design target (per-subject pre-registered service-account keys): ID-JAG-THV is trusted by *issuer*, not by an individually registered subject, so `subject` carries no meaning here. Unconfigured issuers return an error, which fosite maps to `invalid_grant`.
-   - `GetPublicKeyScopes` is unreachable in practice: fosite only calls it when `request.GetRequestedScopes()` is non-empty, and Phase 1's Grant-THV wire format (§3.2) never includes a `scope` parameter — Phase 1 explicitly rejects any Grant-THV request that supplies one, with `invalid_scope`. This is dead code by construction, not an unspecified behavior; it is implemented to satisfy the interface and never meaningfully invoked.
+   - `GetPublicKeyScopes` is called unconditionally by fosite, but its result is only consulted inside a loop over `request.GetRequestedScopes()`, and Phase 1's Grant-THV wire format (§3.2) never includes a `scope` parameter — Phase 1 explicitly rejects any Grant-THV request that supplies one, with `invalid_scope`. The method's return value is therefore dead by construction, not an unspecified behavior; it is implemented to satisfy the interface and its result never meaningfully affects a Phase 1 request.
    - `IsJWTUsed`/`MarkJWTUsedForTime` **are** the `jti` replay-prevention cache described in §3.5 — fosite's `rfc7523.Handler.validateTokenClaims` calls these two methods directly. §3.5 is not a separate hook layered on top of the fosite integration; it is this interface, backed by the storage described there (in-memory LRU or Redis).
 
 2. **A thin `fosite.TokenEndpointHandler` decorator** wrapping a `*rfc7523.Handler{Storage: InboundTrustKeyStorage{...}}`. Before delegating, the decorator re-parses the `assertion` form parameter — the same string fosite's own handler parses internally — to check: (a) the JWT `typ` header equals `oauth-id-jag+jwt` (step 1 of §3.2), rejecting with `invalid_grant` if not; (b) if the resolved trust entry's `allowedClientIDs` is non-empty, the assertion's `client_id` claim is a member (step 2), rejecting with `invalid_grant` if not. Both checks run on unverified claims purely to fail fast before the more expensive JWKS/signature path; the decorator then delegates to the wrapped `*rfc7523.Handler`, which performs the security-critical checks (signature, `aud`, `exp`/`nbf`/`iat`, `jti`) using fosite's own, already-reviewed validation logic. `CanHandleTokenEndpointRequest` and `CanSkipClientAuth` on the decorator pass through to the wrapped handler unchanged.
+
+`compose.Compose(...)` passes a single opaque `storage interface{}` argument to every factory in its call list; each factory type-asserts out the interface it needs (`compose.RFC7523AssertionGrantFactory` itself does `storage.(rfc7523.RFC7523KeyStorage)`). Consequently, whatever storage value `createProvider()` currently passes to `compose.Compose` must additionally satisfy `rfc7523.RFC7523KeyStorage` for this factory to type-assert successfully — either by implementing the interface directly on the existing storage type, or by composing a small wrapper that embeds the existing storage and adds the `InboundTrustKeyStorage` methods. This RFC does not require changing what storage backend the other grant handlers use; it only requires that backend to additionally answer the five `RFC7523KeyStorage` methods.
 
 This is more implementation work than "register a factory," but it is the only way to enforce `typ` and `allowedClientIDs` given that fosite's storage callbacks never expose the raw assertion. The checks that are security-critical — signature verification, `aud`, `exp`/`nbf`/`iat`, `jti` replay — still run entirely inside fosite's own `rfc7523.Handler`; the decorator only adds two additional fast-fail checks in front of it, matching the same shape fosite already uses for pluggable client-authentication and scope-strategy hooks elsewhere in the provider.
 
@@ -217,71 +228,81 @@ This is more implementation work than "register a factory," but it is the only w
 
 When the `xaa` outgoing strategy runs for a Phase 1 session, `Identity.UpstreamIDTokens` is empty: no browser login captured an upstream ID token. Exchange-SaaS of the outgoing `xaa` strategy requires a `subject_token` (§4.3 of the draft) — typically an ID token. Without one, the strategy returns `ErrUpstreamTokenNotFound` and the call fails.
 
-Phase 2 introduces a **subject token derivation** hook invoked between session validation and outgoing-strategy execution for Phase 1 sessions. The hook produces a subject token that the `xaa` strategy can present at Exchange-SaaS without any additional credential from the external client. Three mechanisms are supported, chosen per-deployment by operator configuration:
+Phase 2 introduces a **subject token derivation** hook invoked between session validation and outgoing-strategy execution for Phase 1 sessions. The hook produces a subject token that the `xaa` strategy can present at Exchange-SaaS without any additional credential from the external client. The supported mechanisms are §3.3.1 and §3.3.2 below; two earlier candidates were evaluated and dropped — see §3.3.4.
 
-#### 3.3.1 Solution A — Audience Alignment (Generic RFC 8693 IdPs)
+#### 3.3.1 Okta Agent-to-Agent (IdP-Specific EA Feature)
 
-**Mechanism.** ToolHive's OAuth client registration at the IdP uses a `client_id` equal to ToolHive's AS issuer URI. Under this condition, §4.3.3 of the draft is satisfied when ToolHive presents ID-JAG-THV as the `subject_token` at Exchange-SaaS: the `aud` of ID-JAG-THV equals ToolHive's issuer URI, which equals ToolHive's `client_id` at the IdP, which is the credential used to authenticate the Exchange-SaaS token-exchange request.
+**Mechanism.** Certain IdPs provide an Early Access "agent-to-agent" capability in which an AI agent application is registered with a dedicated custom authorization server hosted by the IdP. Under this model, Phase 1 proceeds entirely between the MCP client and the IdP's endpoints — ToolHive's embedded Fosite AS plays no role in Phase 1.
 
-This resolves the §9.3 concern as well. Section 9.3 prohibits forwarding ID-JAG-THV as an *authorization grant* at a downstream AS (Grant-SaaS). Presenting it as a `subject_token` in an RFC 8693 token-exchange at Exchange-SaaS is not a jwt-bearer grant; it is input to a token exchange where the IdP validates and transforms it, producing a new ID-JAG-SaaS. The ID-JAG-THV is consumed, not forwarded.
+The MCP client calls the IdP's custom AS provisioned for ToolHive's agent registration to obtain T3 — a standard access token bound to ToolHive's resource and carrying the full `act` chain (`sub=user`, `act={ client_id=<MCP client app> }`). The Grant-THV step in Phase 1 targets the IdP's custom AS URL (`https://{idp-domain}/oauth2/{thv-as-id}/v1/token`), not ToolHive's embedded AS token endpoint. ToolHive acts as a pure OAuth resource server in Phase 1: its OIDC middleware validates incoming Bearer T3 against the IdP custom AS's JWKS.
 
-**IdP support requirements.** The IdP must support `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` (RFC 8693) and must accept the `id-jag` token type as a subject token type. Not all IdPs that issue ID-JAGs also accept them as exchange inputs; operator testing is required.
-
-**Configuration signal.** The outgoing `xaa` strategy configuration on the backend gains a `subjectTokenSource: audience_alignment` field. When this value is set, the strategy reads the Phase 1 session record via the identity's `tsid` claim — the same lookup path used for `Identity.UpstreamTokens`/`UpstreamIDTokens` — and retrieves ID-JAG-THV from a new `InboundAssertionJWT` field on that record. The record's TTL matches ID-JAG-THV's own `exp`, so it never outlives the assertion it holds. It is passed directly as `subject_token` with `subject_token_type=urn:ietf:params:oauth:token-type:id-jag` at Exchange-SaaS.
-
-**ID-JAG-THV is never embedded in the vMCP session token itself** — only referenced by `tsid`. A leaked or stolen vMCP session token therefore does not by itself disclose ID-JAG-THV; disclosure additionally requires access to the session store. This mirrors how upstream OIDC tokens are already kept server-side rather than round-tripped through the client-visible token (see §4.5).
-
-#### 3.3.2 Solution B — ToolHive-Issued Internal ID Token (Generic IdPs)
-
-**Mechanism.** ToolHive's embedded AS issues a short-lived OIDC ID token for the user derived from the validated ID-JAG-THV. The claims are:
-
-- `sub`: the `sub` from ID-JAG-THV (preserving user identity).
-- `iss`: ToolHive's AS issuer URI (ToolHive is the issuer).
-- `aud`: ToolHive's `client_id` at the backend IdP (satisfying §4.3.3 for Exchange-SaaS).
-- `exp`: `min(ID-JAG-THV.exp, now + 60 s)` — hard-bound to ID-JAG-THV's remaining validity, capped at 60 seconds.
-- `iat`, `jti`: standard; `jti` is a fresh random UUID per issuance.
-- `act`: `{ "iss": ID-JAG-THV.iss, "sub": ID-JAG-THV.sub }` — RFC 8693 §4.1 actor claim recording the original identity assertion's issuer, so the backend IdP can observe the full chain.
-- Optional domain claim (e.g. `hd` or `email_domain`) if the IdP requires per-tenant claim validation in multi-tenant deployments.
-
-This token is used as `subject_token` at Exchange-SaaS. The backend IdP must be configured to trust ToolHive's issuer URI as an OIDC upstream (JWKS discovery via `<issuer>/.well-known/openid-configuration`). In effect, ToolHive becomes a trusted upstream for the backend IdP — but only for the specific `aud` of the token.
-
-**Security requirements (all mandatory for Solution B deployments):**
-- The `act` claim MUST be present and MUST carry the original IdP `iss` and `sub`. A token without `act` MUST NOT be issued.
-- `exp` MUST be `min(ID-JAG-THV.exp, now + 60 s)`. A token whose `exp` exceeds ID-JAG-THV's `exp` MUST NOT be issued.
-- Multi-tenant deployments MUST include a per-tenant domain claim and the backend IdP MUST enforce it. The alternative is per-tenant signing keys; operators MUST choose one of the two mitigations.
-- All issued tokens MUST carry a unique `jti`. The backend IdP SHOULD maintain a short-window use cache to prevent replay within `exp`.
-- The JWKS used for these tokens SHOULD be distinct from the JWKS used for vMCP session tokens to limit blast radius if a signing key is compromised.
-
-**Configuration signal.** `subjectTokenSource: th_issued_id_token` on the `xaa` backend config, plus a `backendIdpClientId` field identifying ToolHive's `client_id` at the backend IdP.
-
-#### 3.3.3 Solution C — Okta Agent-to-Agent (Okta-Specific)
-
-**Mechanism.** Okta's Early Access "agent-to-agent" feature allows an AI agent (registered as `test-cwo-app` type with its own custom AS) to obtain access tokens scoped to another application. ToolHive is registered in the Okta org as an AI agent application with its own custom AS. The inbound Phase 1 path issues a vMCP session token from ToolHive's custom Okta AS (T3 — a standard Okta access token). T3 carries the full `act` chain (`sub=user`, `act={ client_id=<Claude app> }`).
-
-At Exchange-SaaS, ToolHive presents T3 as the `subject_token` with `subject_token_type=urn:ietf:params:oauth:token-type:access_token` (RFC 8693 §2.1). Because T3 is issued by ToolHive's Okta custom AS and ToolHive is registered as a cross-app grant source for the backend resource application, the Okta AS accepts T3 and mints ID-JAG-SaaS scoped to the backend.
+At Exchange-SaaS, ToolHive presents T3 as `subject_token` with `subject_token_type=urn:ietf:params:oauth:token-type:access_token` (RFC 8693 §2.1) at the IdP's org AS. Because T3 is signed by the IdP's own infrastructure, the org AS accepts it and mints ID-JAG-SaaS scoped to the backend — no external trust configuration is required.
 
 **Requirements:**
-- ToolHive registered as `test-cwo-app` in the Okta org with a custom AS.
-- Cross-app delegation link configured between the external client's Okta app and ToolHive's Okta app.
-- Resource connection configured between ToolHive's Okta app and the backend resource application.
-- After initial admin configuration and user consent, subsequent calls require no user interaction.
+- ToolHive registered as an AI agent application at the IdP with a dedicated custom AS.
+- Delegation link configured at the IdP between the MCP client's application and ToolHive's application.
+- Resource connection configured at the IdP between ToolHive's application and the backend resource application.
+- `client_assertion` (signed JWT) required on every IdP token endpoint call.
+- The IdP's org AS (`/oauth2/v1/token`) handles Exchange-SaaS steps; the IdP's custom AS (`/oauth2/{id}/v1/token`) handles Grant-THV.
 
-**Limitation.** Okta's client IDs are not URIs; they are opaque strings (`client_id ≠ issuer URI`). Solution A's §4.3.3 audience-alignment trick does not apply directly to Okta without testing against the specific Okta AS version in use (`integrator-3683736.okta.com`).
+**Operational constraints:**
+- Requires the agent-to-agent EA feature enabled on the IdP org; no GA equivalent exists.
+- Four admin configurations required: AI agent app registration, backend resource app registration, delegation link (MCP client → ToolHive), and resource connection (ToolHive → backend).
+- T3 lifetime is fixed by the IdP at token issuance time and is not configurable by ToolHive. After T3 expires, the full Phase 1 exchange must be re-run; tool calls attempted with an expired T3 fail with `invalid_grant`.
+- Entirely specific to IdPs that support this EA capability; does not generalize to other IdPs.
 
 **Configuration signal.** `subjectTokenSource: okta_agent_to_agent` on the `xaa` backend config.
 
-#### 3.3.4 Solution Selection Summary
+#### 3.3.2 Direct Backend Trust (Gateway-as-OAuth-AS, RFC 7523)
 
-| IdP | Phase 1 works? | Phase 2 path | Notes |
+**Mechanism.** ToolHive's embedded AS mints a short-lived JWT assertion directly for each configured backend at call time. The backend resource server is configured out-of-band to trust ToolHive's JWKS as a trusted issuer — the same trust establishment used for any OIDC issuer. No Exchange-SaaS step is involved: ToolHive makes a single RFC 7523 `jwt-bearer` call per tool call directly to the backend resource AS. The IdP AS is not involved in Phase 2.
+
+**JWT assertion claims (ToolHive-minted):**
+
+| Claim | Value |
+|-------|-------|
+| `iss` | ToolHive AS issuer URI |
+| `sub` | User subject from the validated Phase 1 session |
+| `aud` | Backend RS token endpoint URL — the RS must accept its own token endpoint URL as audience (RFC 7523 §3); do not use the issuer URI |
+| `act` | `{ "sub": "<ToolHive AS client identifier>" }` — identifies ToolHive as the delegating actor (RFC 8693 §4.4) |
+| `scope` | Backend-specific scopes from `MCPExternalAuthConfig` — REQUIRED; omitting scope may cause the RS to grant full access or reject the request |
+| `exp` | `now + 60s` |
+| `jti` | Random UUID — RS SHOULD track used values within the assertion's validity window (RFC 7523 §3) |
+
+**Security properties:**
+- ToolHive becomes the root of trust for all backends configured for this solution. A signing key compromise affects every backend that trusts that key.
+- **Mitigation:** use a distinct signing key pair per backend, each with its own JWKS endpoint. This limits the blast radius of a key compromise to a single backend.
+- There is no cryptographic binding between the vMCP session and the minted assertion. A subject-injection bug in session handling is indistinguishable from key compromise at the backend; the backend cannot detect it independently.
+- The `act` claim makes the delegation chain visible in the assertion, but most resource server implementations do not enforce actor restrictions. Backend-side actor policy must be implemented explicitly if actor restriction is required.
+
+**Operational properties:**
+- Works with any backend that supports RFC 7523 `jwt-bearer` grant.
+- No IdP-specific requirements; no EA features or custom AS registrations needed.
+- Backend configuration: register ToolHive's JWKS endpoint once per ToolHive deployment, or once per backend if using per-backend signing keys.
+- Key rotation: publish the new key in the JWKS before first use; retain the old key in the JWKS until RS JWKS caches have expired (typically 24 h). SHOULD use `kid`-keyed overlap rotation to avoid verification failures during cache refresh windows.
+- Phase 1 is independent — any login mechanism works (browser OIDC flow or the jwt-bearer grant described in §3.2).
+
+**Configuration signal.** `subjectTokenSource: gateway_direct_trust` on the `xaa` backend config.
+
+#### 3.3.3 Solution Selection Summary
+
+| Deployment context | Phase 1 works? | Phase 2 path | Notes |
 |-----|----------------|--------------|-------|
-| Generic RFC 8693 AS (e.g. xaa.dev) | Yes | Solution A or B | A preferred if `client_id = issuer URI` is achievable at the IdP |
-| Okta | Yes | Solution C (agent-to-agent EA) | Solution A may work pending §9.2 open-question testing |
-| Keycloak | Yes | Solution B | Keycloak does not issue ID-JAGs — its token exchange returns a regular access token; Solution B's ToolHive-issued ID token path applies |
-| Microsoft Entra | Yes | App-only via WIF only | User-delegated chain requires interactive Entra flow; out of scope per §2.2 |
+| Any IdP; backend supports RFC 7523 | Yes | Direct Backend Trust (§3.3.2) | No IdP involvement in Phase 2; ToolHive holds root of trust for backends |
+| IdP with agent-to-agent EA feature | Yes | Okta Agent-to-Agent (§3.3.1) | IdP-specific; requires four admin configurations |
+| External IdP (user-delegated chain) | Yes | Not yet supported | User-delegated chain via interactive flow; out of scope per §2.2 |
+
+#### 3.3.4 Alternatives Considered
+
+Two mechanisms were evaluated and dropped before the solutions above. Neither is retained as a reserved, forward-compatible config surface: both fail for structural reasons — a spec design choice in one case, a federation-architecture mismatch in the other — that no near-term draft revision or IdP feature is likely to change, so there is no credible trigger that would ever move either from "invalidated" to "operational." Carrying a reserved enum value or a dedicated session-storage field for either is complexity paid against a mechanism with no activation path; if the standards or vendor landscape ever does shift here, the resulting design would need its own follow-up RFC informed by whatever the new mechanism actually looks like, rather than matching a guess made today.
+
+**Audience Alignment.** The inbound ID-JAG-THV could be presented directly at Exchange-SaaS as `subject_token`. This fails for two independent reasons: XAA §4.3 permits only `id_token`, `saml2`, and `refresh_token` as `subject_token_type` inputs — the `id-jag` URN is an output type, not a valid exchange input; and audience alignment requires the operator to set `client_id` equal to the AS issuer URI, which IdP-managed registration typically does not permit. This is not a temporary spec gap: draft §9.3 explicitly states an ID-JAG "MUST NOT" be reused as the authorization grant for any Resource AS other than the one named in its `aud`, and open WG discussion of delegation semantics (e.g. issue #73 on the oauth-wg tracker) preserves this two-party trust boundary rather than proposing a re-presentable ID-JAG. `audience_alignment` is not implemented and no config surface is reserved for it.
+
+**ToolHive-Issued Internal ID Token.** ToolHive could mint a short-lived OIDC ID token from its own issuer URI and present it at Exchange-SaaS, with the backend IdP configured to trust ToolHive as an OIDC upstream. This fails because IdP "trusted OIDC upstream" configuration is designed for redirect-based user federation, not M2M token exchange — IdPs do not accept machine-minted tokens as `subject_token` at their token exchange endpoint through this trust path. This is architectural, not a maturity gap: the closest real-world analog, Entra ID Workload Identity Federation, authenticates the calling *service* itself via `client_assertion` in a `client_credentials` flow — it carries no user/`subject_token` semantics and explicitly disallows using Entra-issued tokens as the federated credential. `th_issued_id_token` is not implemented and no config surface is reserved for it.
 
 ### 3.4 JWKS Trust Registry
 
-The trust registry is consulted at two points: during Phase 1 inbound assertion validation (to resolve the signing JWKS for ID-JAG-THV), and optionally during Phase 2 Solution B issuance (to determine the `aud` claim for the derived ID token).
+The trust registry is consulted during Phase 1 inbound assertion validation to resolve the signing JWKS for ID-JAG-THV.
 
 The registry is implemented as an in-process map keyed by issuer URI. Each entry holds:
 
@@ -301,7 +322,7 @@ The `jti` replay-prevention cache prevents a presented ID-JAG-THV from being acc
 - TTL per entry equals `exp − now` at insertion time.
 - Must be shared across all instances in a horizontally scaled deployment (§3.6).
 - In single-instance deployments a local in-memory LRU cache (bounded by max-assertions-in-flight × max-assertion-lifetime) is sufficient.
-- In multi-instance deployments the same Redis backend used for upstream token storage ([THV-0035](./THV-0035-auth-server-redis-storage.md)) is used, with a prefixed key space (`th:jti:<iss>:<jti>`).
+- In multi-instance deployments the same Redis backend used for upstream token storage ([THV-0035](./THV-0035-auth-server-redis-storage.md)) is used, with a key shaped to match that backend's existing schema: `thv:auth:{<server-name>}:jti:<iss>:<jti>`, following the same `thv:auth:{<server-name>}:<type>:<identifier>` convention used elsewhere (e.g. the existing client-assertion replay cache at `thv:auth:{<server-name>}:jwt:<jti>`), rather than introducing a differently-shaped prefix.
 
 The cache type (in-memory vs. Redis) is determined by the same `storageConfig` field that governs the rest of the AS session storage; no separate configuration key is introduced.
 
@@ -309,9 +330,7 @@ The cache type (in-memory vs. Redis) is determined by the same `storageConfig` f
 
 [THV-0047](./THV-0047-vmcp-proxyrunner-horizontal-scaling.md) describes the Redis-backed session storage that enables multiple vMCP proxy-runner pods to share session state. Phase 1 of this RFC integrates naturally with that model: the `jti` replay cache (§3.5) uses the same Redis backend, and the vMCP session tokens issued in Phase 1 are validated by the same token-reader used for browser-login sessions. No per-instance state is introduced.
 
-The new `InboundAssertionJWT` session-record field (§3.2, §3.3.1) piggybacks on this same Redis-backed storage; no new storage backend is introduced, and it is subject to the same per-session TTL and eviction behavior already governing OIDC-derived sessions.
-
-Phase 2 Solution B adds one new at-rest artifact: the per-tenant signing key for ToolHive-issued ID tokens (when per-tenant keys are chosen over the per-tenant domain-claim mitigation). These keys must be stored in a location readable by all replicas — Kubernetes Secrets, mounted via the existing signing-key secret mechanism.
+Phase 2 Direct Backend Trust adds one new at-rest artifact per backend: the signing key used to mint RFC 7523 assertions. When per-backend keys are chosen (the recommended configuration for blast-radius limiting), each key must be stored in a location readable by all replicas — Kubernetes Secrets, mounted via the existing signing-key secret mechanism.
 
 ### 3.7 Configuration
 
@@ -321,14 +340,15 @@ New fields introduced by this RFC (full YAML examples are in the operator guide)
 
 **`MCPExternalAuthConfig.spec.xaa.subjectTokenSource`** (Phase 2) — selects the subject token derivation mechanism:
 
-| Value | Solution | Description |
-|---|---|---|
-| `upstream_id_token` | (default, THV-0079) | Browser-login upstream ID token |
-| `audience_alignment` | A | ID-JAG-THV as subject_token (requires `idpClientId = AS issuer URI`) |
-| `th_issued_id_token` | B | ToolHive-issued derived ID token |
-| `okta_agent_to_agent` | C | Okta EA agent-to-agent T3 path |
+| Value | Description |
+|---|---|
+| `upstream_id_token` | (default, THV-0079) Browser-login upstream ID token |
+| `okta_agent_to_agent` | IdP agent-to-agent EA path (§3.3.1); T3 is IdP-issued |
+| `gateway_direct_trust` | ToolHive-minted RFC 7523 assertion (§3.3.2); direct backend trust |
 
-**`MCPExternalAuthConfig.spec.xaa.backendIdpClientId`** (Phase 2 Solution B only) — ToolHive's `client_id` at the backend IdP, used as `aud` in derived ID tokens.
+Two earlier candidates, "audience alignment" and "ToolHive-issued internal ID token," were evaluated and dropped for structural reasons unlikely to change (§3.3.4); no enum values or config fields are reserved for them.
+
+**`MCPExternalAuthConfig.spec.xaa.backendTokenEndpoint`** (Phase 2 Direct Backend Trust) — the backend RS token endpoint URL, used as `aud` in ToolHive-minted RFC 7523 assertions. REQUIRED for `gateway_direct_trust`; must be the full token endpoint URL, not the issuer URI (RFC 7523 §3).
 
 The issued vMCP session token includes an `act` claim tracing back to ID-JAG-THV's `iss` and `sub` so the full delegation chain is auditable.
 
@@ -340,12 +360,12 @@ Identity chaining requires ToolHive to assert user identity it did not directly 
 
 ### 4.1 Identity Authority Without Direct Authentication
 
-**Threat.** ToolHive issues a vMCP session token (Phase 1) and potentially a derived ID token (Phase 2 Solution B) for a user it has never interactively authenticated. Its authority to do so rests entirely on validating ID-JAG-THV. If that validation is incomplete or skipped, ToolHive can be induced to issue tokens for arbitrary users.
+**Threat.** ToolHive issues a vMCP session token (Phase 1) and potentially derived credentials in Phase 2 (RFC 7523 assertions for Direct Backend Trust) for a user it has never interactively authenticated. Its authority to do so rests entirely on validating ID-JAG-THV. If that validation is incomplete or skipped, ToolHive can be induced to issue tokens for arbitrary users.
 
 **Mitigations:**
 - The full validation chain (signature, `aud`, `exp`, `jti`, issuer trust registry) in §3.2 is mandatory. Each step is independently necessary; none may be skipped or soft-degraded.
 - Issuance is gated on a configured trust registry entry for the assertion's `iss`. Assertions from issuers not in the registry are rejected at the first validation step, before any JOSE operation.
-- Derived tokens (Phase 2 Solution B) include the `act` claim tracing back to the original IdP's `iss` and `sub`. An `act`-less derived token MUST NOT be issued; the issuance path fails closed.
+- Phase 2 Direct Backend Trust assertions include the `act` claim identifying ToolHive as the actor. An assertion without `act` MUST NOT be issued; the issuance path fails closed.
 
 ### 4.2 Revocation Gap
 
@@ -353,7 +373,7 @@ Identity chaining requires ToolHive to assert user identity it did not directly 
 
 **Mitigations:**
 - The vMCP session token's `exp` is hard-bound to `min(ID-JAG-THV.exp, now + configured_session_lifetime)`. ToolHive cannot issue a session that outlives the original assertion.
-- Derived tokens in Phase 2 Solution B have `exp = min(ID-JAG-THV.exp, now + 60 s)` — they expire at the earlier of ID-JAG-THV's expiry or 60 seconds. This minimizes the window during which ToolHive can act on behalf of a revoked user at the outbound chain.
+- Phase 2 Direct Backend Trust assertions have `exp = now + 60s` and are single-use — they expire within 60 seconds and carry a unique `jti`. This minimizes the window during which ToolHive can act on behalf of a revoked user at the outbound chain.
 - Operators should configure `configured_session_lifetime` conservatively (e.g., 1 h) relative to their IdP's assertion lifetimes and rotation policy.
 - There is currently no mechanism for the IdP to push revocation events to ToolHive mid-session. This is a known limitation; introspection-based revocation polling is a potential future extension.
 
@@ -366,24 +386,14 @@ Identity chaining requires ToolHive to assert user identity it did not directly 
 - In horizontally scaled deployments, the replay cache uses Redis so that no two instances accept the same `jti` independently.
 - ToolHive's token endpoint MUST be served over TLS only (this is an existing requirement; not changed by this RFC).
 
-### 4.4 Multi-Tenant Scope Confusion (Phase 2 Solution B)
+### 4.4 Additional Controls
 
-**Threat.** When ToolHive issues derived ID tokens (Solution B), the backend IdP trusts ToolHive's JWKS. In a multi-tenant deployment, a user authenticating against one tenant's IdP could receive a ToolHive-issued token that is accepted by the backend IdP configured for a different tenant, if the IdP does not enforce per-tenant claim constraints.
-
-**Mitigations (at least one MUST be implemented for multi-tenant Solution B deployments):**
-- **Per-tenant domain claims.** ToolHive includes a tenant-bound domain claim (e.g., `hd` = Google Workspace domain, or a custom `tenant_id` claim) in derived tokens. The backend IdP MUST be configured to enforce this claim. Tokens without a matching domain claim are rejected.
-- **Per-tenant signing keys.** ToolHive uses a distinct signing key per tenant for derived ID tokens. The backend IdP is registered to trust only the specific tenant's JWKS endpoint (e.g., `https://auth.example.com/vmcp/tenant/acme/.well-known/jwks`). A token signed by the wrong tenant's key fails signature verification.
-
-Single-tenant deployments are not affected by this concern; the mitigation requirement applies only when multiple tenants share the same ToolHive AS instance.
-
-### 4.5 Additional Controls
-
-- **§9.3 compliance.** ToolHive MUST NOT forward ID-JAG-THV as an authorization grant to any downstream AS. All three Phase 2 solutions produce a new credential (ID-JAG-SaaS or T3) for Grant-SaaS; ID-JAG-THV is consumed, not forwarded.
-- **Derived token replay.** Phase 2 Solution B tokens carry a unique `jti` and `exp = min(ID-JAG-THV.exp, now + 60 s)`. Backend IdPs SHOULD maintain a `jti` use cache. Each derivation produces a fresh token; ToolHive does not reuse derived tokens across parallel requests.
+- **§9.3 compliance.** ToolHive MUST NOT forward ID-JAG-THV as an authorization grant to any downstream AS. All Phase 2 solutions produce a new credential for Grant-SaaS (ID-JAG-SaaS for Okta Agent-to-Agent; a ToolHive-minted RFC 7523 assertion for Direct Backend Trust); ID-JAG-THV is never forwarded.
+- **Derived token replay.** Phase 2 Direct Backend Trust assertions carry a unique `jti` and `exp = now + 60s`. Backend resource servers SHOULD maintain a `jti` use cache (RFC 7523 §3). Each tool call produces a fresh assertion; ToolHive does not reuse minted assertions across parallel requests.
 - **Audit logging.** The following events MUST be emitted as structured records: ID-JAG-THV accepted/rejected (with `iss`, `sub`, `jti`); subject token derived (with solution used); Exchange-SaaS/B' succeeded/failed (with `sub`, target IdP/AS, scopes or error code). Token values MUST NOT appear in logs.
 - **JWKS SSRF.** `jwksUri` entries in the trust registry are HTTPS-only; this is enforced at config validation time. Consistent with the `idpTokenUrl` posture in [THV-0079](./THV-0079-cross-app-access-grant.md) §4.8.
 - **Clock skew.** `exp`/`nbf` validation uses a configurable tolerance (default 60 s, maximum 300 s).
-- **Session-store isolation for ID-JAG-THV.** ID-JAG-THV is stored server-side in the Phase 1 session record, referenced by `tsid`, and is never embedded in the vMCP session token handed to the external client. A compromised or leaked vMCP session token therefore does not by itself disclose ID-JAG-THV — a second, independent compromise (the session store) is required. This is a deliberate design choice, not an incidental property.
+- **No at-rest copy of ID-JAG-THV.** ID-JAG-THV is validated in process memory during Grant-THV and discarded once the vMCP session token is issued (§3.2 step 8) — it is never written to session storage and never embedded in the vMCP session token handed to the external client. A compromised or leaked vMCP session token, or a compromised session store, therefore cannot disclose ID-JAG-THV: there is no persisted copy to disclose. This is a deliberate design choice, not an incidental property.
 
 ---
 
@@ -399,7 +409,7 @@ Rather than deriving a subject token, require the external client to also includ
 
 ### 5.3 Store ID-JAG-THV and Use It Directly at Exchange-SaaS
 
-Store ID-JAG-THV in the session record and present it as `subject_token` at Exchange-SaaS with a new `subject_token_type` URN. This conflates the use of ID-JAG-THV as a session-establishment credential with its use as a step-A' input. The draft defines no `subject_token_type` URN for ID-JAGs, so IdPs would need to be extended to accept a non-standard type. Solution A achieves the same result with a standard §4.3.3 audience-alignment approach that requires no IdP extension and produces a well-formed RFC 8693 request.
+Store ID-JAG-THV in the session record and present it as `subject_token` at Exchange-SaaS with a new `subject_token_type` URN. This conflates the use of ID-JAG-THV as a session-establishment credential with its use as a step-A' input. The draft defines no `subject_token_type` URN for ID-JAGs; XAA draft §4.3 accepts only `id_token`, `saml2`, and `refresh_token` as input types, so IdPs reject requests carrying the `id-jag` type with `invalid_grant`. This approach is not viable as either a production path or an alternative to the implemented solutions.
 
 ### 5.4 OAuth 2.0 Token Introspection for Revocation
 
@@ -420,9 +430,9 @@ This RFC is strictly additive:
 
 ### 6.2 Forward Compatibility
 
-- The three Phase 2 solutions (A, B, C) are selected via a `subjectTokenSource` string field. Additional solutions can be added as new enum values without breaking existing configurations.
+- The Phase 2 solution is selected via a `subjectTokenSource` string field. Additional solutions can be added as new enum values without breaking existing configurations — adding a value later is non-breaking regardless of whether it was pre-reserved, so the two dropped candidates in §3.3.4 do not need reserved placeholders today.
 - The trust registry `InboundJWKSTrustEntry` struct is extensible: additional filtering fields (e.g., `allowedScopes`, `allowedSubjectPatterns`) can be added without breaking existing entries.
-- If `draft-ietf-oauth-identity-assertion-authz-grant` gains a defined `subject_token_type` URN for ID-JAGs, Solution A's wire format can be updated to use it without breaking the `audience_alignment` configuration surface.
+- If `draft-ietf-oauth-identity-assertion-authz-grant` or RFC 8693 ever gains a standardized way to re-present an ID-JAG as exchange input, adopting it would need its own design work informed by that mechanism's actual shape (draft §9.3's current MUST-NOT-reuse language makes this unlikely — see §3.3.4) — a new `subjectTokenSource` value at that point is a non-breaking addition, not a migration.
 
 ---
 
@@ -432,7 +442,7 @@ This RFC is strictly additive:
 
 Goal: ToolHive accepts ID-JAG-THV as a grant and issues a vMCP session token. No browser login required.
 
-- Implement `InboundTrustKeyStorage` (fosite's `rfc7523.RFC7523KeyStorage`) against the trust registry, and the `fosite.TokenEndpointHandler` decorator that wraps `*rfc7523.Handler` with the `typ`/`allowedClientIDs` pre-checks (§3.2.2). Register the decorator's `Factory` in the fosite token endpoint configuration — not `compose.RFC7523AssertionGrantFactory` unmodified.
+- Implement `InboundTrustKeyStorage` (fosite's `rfc7523.RFC7523KeyStorage`) against the trust registry, and the `fosite.TokenEndpointHandler` decorator that wraps `*rfc7523.Handler` with the `typ`/`allowedClientIDs` pre-checks (§3.2.2). Register the decorator's factory in `pkg/authserver/server_impl.go`'s `createProvider()` `compose.Compose(...)` call, alongside the existing grant-handler factories — not `compose.RFC7523AssertionGrantFactory` unmodified, and not `pkg/authserver/server/provider.go`'s `NewAuthorizationServer`/`Factory` abstraction, which is unused outside its own tests. Confirm the storage value passed to `compose.Compose` satisfies `rfc7523.RFC7523KeyStorage` (directly or via a wrapper) — see §3.2.2.
 - Override `AuthorizationServerConfig.GetTokenURLs()` to accept both the token endpoint URL and the bare AS issuer URI as valid `aud` values (§3.2, Critical Issue resolved in review).
 - Implement `InboundJWKSTrust` config parsing and JWKS-fetch/cache machinery.
 - Wire `IsJWTUsed`/`MarkJWTUsedForTime` on `InboundTrustKeyStorage` to the `jti` replay store (in-memory for single-instance; §3.5 describes the Redis path for multi-instance) — this *is* the replay cache, not an add-on.
@@ -442,30 +452,28 @@ Goal: ToolHive accepts ID-JAG-THV as a grant and issues a vMCP session token. No
 
 #### Dependencies
 
-- [THV-0053](./THV-0053-vmcp-embedded-authserver.md) — embedded AS; fosite token endpoint, `pkg/authserver/server/provider.go`'s `Factory` mechanism.
-- [THV-0035](./THV-0035-auth-server-redis-storage.md) — Redis session storage; used for the multi-instance replay cache and the new `InboundAssertionJWT` session-record field.
-- `github.com/ory/fosite/handler/rfc7523` (already a transitive dependency via `ory/fosite`) — the server-side JWT-bearer grant handler this RFC wraps. Not to be confused with `pkg/oauthproto/jwtbearer` (THV-0079), which is a *client* package for outbound Step B and is not reused on this inbound path.
+- [THV-0053](./THV-0053-vmcp-embedded-authserver.md) — embedded AS; fosite token endpoint, `pkg/authserver/server_impl.go`'s `createProvider()`/`compose.Compose(...)` construction.
+- [THV-0035](./THV-0035-auth-server-redis-storage.md) — Redis session storage; used for the multi-instance replay cache (§3.5).
+- `github.com/ory/fosite/handler/rfc7523` (a subpackage of `ory/fosite`, already a direct dependency) — the server-side JWT-bearer grant handler this RFC wraps. Not to be confused with `pkg/oauthproto/jwtbearer` (THV-0079), which is a *client* package for outbound Step B and is not reused on this inbound path.
 
 ### Phase 2 — Identity Chaining Intermediary (Client + Resource AS)
 
 Goal: inbound sessions can drive outbound `xaa` by deriving a valid subject token.
 
-- Add `subjectTokenSource` field to `XAAConfig` and CRD `XAASpec`.
-- Extend the Phase 1 session record (§3.2) with an `InboundAssertionJWT` field, written at Grant-THV time and keyed by the same `tsid` claim carried on the issued vMCP session token. Solution A reads it via the existing tsid-keyed session lookup — no new storage backend.
-- Implement Solution A: read `InboundAssertionJWT` from the session record via the identity's `tsid`, populate `subject_token`/`subject_token_type` for Exchange-SaaS.
-- Implement Solution B: OIDC ID-token issuance from ToolHive's AS, `act` claim injection, per-tenant key/claim selection.
-- Implement Solution C: Okta-specific T3 subject token path (can be shipped after A and B).
-- Unit tests covering all three solutions with mock IdP / backend AS servers.
+- Add `subjectTokenSource` field to `XAAConfig` and CRD `XAASpec`, with `okta_agent_to_agent` and `gateway_direct_trust` as the only accepted values.
+- Implement Okta Agent-to-Agent: IdP-specific agent-to-agent EA path; T3 is validated by ToolHive's OIDC middleware (ToolHive is a resource server, not the token issuer); T3 presented as `access_token` at Exchange-SaaS.
+- Implement Direct Backend Trust: ToolHive AS mints short-lived RFC 7523 JWT assertions per tool call; per-backend signing key management; `kid`-keyed JWKS publication; `jti` generation and scope injection from `MCPExternalAuthConfig`.
+- Unit tests covering Okta Agent-to-Agent and Direct Backend Trust with mock IdP / backend AS servers.
 
 #### Dependencies
 
-- Phase 1 of this RFC (inbound acceptance, `inboundAssertionJWT` session field).
+- Phase 1 of this RFC (inbound acceptance).
 - [THV-0079](./THV-0079-cross-app-access-grant.md) — `xaa` outgoing strategy; Phase 2 extends its `XAAConfig`, not replaces it.
 
 #### Documentation
 
 - Update the vMCP embedded AS operator guide to document `inboundJWKSTrust` configuration.
-- Add `docs/arch/xaa-identity-chaining-intermediary.md` covering the dual-role topology, the three Phase 2 solutions, and the per-IdP compatibility table.
+- Add `docs/arch/xaa-identity-chaining-intermediary.md` covering the dual-role topology, the Phase 2 solutions (C and D), and the deployment compatibility table.
 - Add a runbook section covering `jti` replay cache eviction for Redis deployments and JWKS endpoint failure response.
 
 ---
@@ -479,34 +487,35 @@ Goal: inbound sessions can drive outbound `xaa` by deriving a valid subject toke
 - Decorator pre-checks: assertion with wrong `typ` header rejected before signature verification; assertion whose `client_id` is absent from a configured `allowedClientIDs` rejected; both checks are bypassed correctly when `allowedClientIDs` is empty.
 - `GetTokenURLs()` override: assertions with `aud` = token endpoint URL and `aud` = bare issuer URI both accepted; an unrelated `aud` rejected.
 - JWKS cache: TTL expiry triggers refresh, refresh-on-verify-failure, stale-cache grace period during outage.
-- Phase 2 Solution A: session record retrieval via `tsid`, correct `subject_token_type` in Exchange-SaaS request.
-- Phase 2 Solution B: derived token claims (`act`, `exp` bound, `jti` uniqueness, `aud` = `backendIdpClientId`), multi-tenant domain claim inclusion, fail-closed on missing `act`.
+- Phase 2 Okta Agent-to-Agent: T3 validated by OIDC middleware rather than fosite embedded AS; T3 presented with `subject_token_type=access_token` in Exchange-SaaS request.
+- Phase 2 Direct Backend Trust: minted assertion claims (`iss`, `sub`, `aud` = token endpoint URL, `act`, `scope`, `exp`, `jti`); `exp` pinned to 60 s; `jti` uniqueness across parallel tool calls; per-backend signing key selection.
 - vMCP session token `act` claim round-trip: accept inbound → issue session → validate session in middleware, `act` preserved.
 
 ### 8.2 Integration Tests
 
 - Phase 1 end-to-end against the xaa.dev sandbox: external agent obtains ID-JAG-THV from `idp.xaa.dev`, presents to ToolHive's AS, receives session token, calls `tools/list`.
-- Phase 2 Solution A end-to-end: same session calls a backend configured with `subjectTokenSource: audience_alignment`; assert that the backend returns a tool result and that Exchange-SaaS logs include the correct IdP audience.
+- Phase 2 Direct Backend Trust end-to-end: same session calls a backend configured with `subjectTokenSource: gateway_direct_trust`; assert that the backend returns a tool result and that the jwt-bearer grant request to the backend RS includes correct `sub`, `aud` (token endpoint URL), `scope`, and `act` claims.
 
 ### 8.3 Security Tests
 
 - `jti` replay: present the same ID-JAG-THV twice in rapid succession; the second must be rejected.
 - Expired ID-JAG-THV (1 s past `exp`, zero clock-skew tolerance): rejected.
 - Wrong `aud` (ID-JAG-THV addressed to a different AS): rejected.
-- Derived ID token `exp` > ID-JAG-THV `exp`: issuance path returns error (not a silent override).
-- Solution B token without `act` claim: issuance path fails closed.
+- Direct Backend Trust assertion `aud` set to issuer URI instead of token endpoint URL: configuration validation returns error before issuance.
+- Direct Backend Trust assertion configured without `scope`: configuration validation returns error.
+- Direct Backend Trust `jti` replay: backend RS receives the same assertion `jti` twice within 60 s; second presentation MUST be rejected (requires RS-side test harness).
 
 ---
 
 ## Open Questions
 
-1. **Okta §4.3.3 testing.** Does Okta's XAA AS accept ID-JAG-THV as `subject_token` when ToolHive's `client_id` equals its AS issuer URI? This would enable Solution A for Okta, avoiding the Early Access dependency on agent-to-agent. Needs testing against `integrator-3683736.okta.com`.
+1. **Direct Backend Trust per-backend key management UX.** The recommended configuration uses per-backend signing keys to limit blast radius; this requires operators to configure and rotate multiple JWKS endpoints. Should ToolHive provide tooling (CLI subcommand or operator controller) to automate per-backend JWKS endpoint publication and `kid`-keyed key rotation, or is a single shared signing key the default with per-backend keys as an explicit opt-in?
 
-2. **Solution B token lifetime.** Security review suggests `min(ID-JAG-THV.exp, now + 60 s)`. Is 60 s too short for high-latency Exchange-SaaS calls in some deployments? A configurable ceiling (default 60 s) is proposed; feedback welcome.
+2. **Direct Backend Trust assertion lifetime.** The minted assertion `exp` is fixed at `now + 60s`. Is 60 s too short for high-latency backend token endpoint calls in some deployments? A configurable ceiling (default 60 s) is proposed; feedback welcome.
 
 3. **Phase 1 with plain OIDC ID tokens.** Should the Phase 1 handler also accept a standard OIDC `id_token` (not an ID-JAG)? This would enable browser-less access for clients whose IdP cannot issue ID-JAGs. It deviates from strict XAA semantics but is valid under RFC 7523.
 
-4. **Repeated presentation of ID-JAG-THV as `subject_token`.** Solution A presents the same ID-JAG-THV at Exchange-SaaS on every Phase 2 tool call within the session's lifetime — potentially many times. This is not a jwt-bearer grant replay (RFC 8693 token exchange is designed for repeated presentation of a `subject_token`), but individual IdPs may apply their own rate-limiting or replay heuristics to repeated exchange requests carrying the same `subject_token` `jti`. Untested against xaa.dev, Okta, or Keycloak; needs validation during Phase 2 implementation.
+4. **Okta Agent-to-Agent T3 re-authentication signal.** When T3 expires, the MCP client must re-run the full Phase 1 exchange to obtain a new T3. Should ToolHive's OIDC middleware return a specific `WWW-Authenticate` challenge (e.g., with `error=invalid_token` and a machine-readable hint) to trigger MCP client re-authentication proactively, rather than returning a generic `401 Unauthorized` that the client cannot distinguish from authorization failure?
 
 ---
 
