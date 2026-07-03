@@ -1,7 +1,7 @@
 # RFC-0080: Project-Level Skills Lock File
 
 - **Status**: Draft
-- **Author(s)**: Samu Vannier (@samuv)
+- **Author(s)**: Samuele Verzi (@samuv)
 - **Created**: 2026-07-03
 - **Last Updated**: 2026-07-03
 - **Target Repository**: toolhive
