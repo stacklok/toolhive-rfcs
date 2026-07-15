@@ -1,4 +1,4 @@
-# RFC-XXXX: Stateless Transport Proxy Support (MCP 2026-07-28)
+# RFC-0081: Stateless Transport Proxy Support (MCP 2026-07-28)
 
 - **Status**: Draft
 - **Author(s)**: Jakub Hrozek (@jhrozek)
