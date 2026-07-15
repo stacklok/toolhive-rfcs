@@ -51,7 +51,9 @@ front of MCP servers is affected once either side of the connection upgrades.
 ## Non-Goals
 
 - vMCP stateless support and the cross-generation bridge (a client on either revision
-  reaching a backend on either revision) — tracked separately ([toolhive#5756]).
+  reaching a backend on either revision) — tracked separately ([toolhive#5756]). This
+  includes vMCP's per-session backend MCP client connections (`pkg/vmcp/session/`), which
+  would churn per request under stateless unless pooled by a stable key.
 - The go-sdk v1.7 adoption / `mcpcompat` stateless plumbing ([toolhive#5754]). This RFC
   argues the transport-proxy work is independent of it (see Compatibility / Alternatives).
 - OAuth RFC 9207 `iss` validation ([toolhive#5760]) — genuine but unrelated work in
@@ -132,7 +134,7 @@ which would start the monitor before the backend is warm and risk self-stopping 
 empty resource ID) and the Modern request headers `Mcp-Method` (required on all requests)
 / `Mcp-Name` (required for `tools/call`, `resources/read`, `prompts/get`) so they are
 labeled for authz/audit; source `clientInfo`/protocolVersion from `_meta`
-for Modern requests.
+for Modern requests (consumed by telemetry — see Middleware and Observability).
 
 #### API Changes
 
@@ -164,6 +166,42 @@ Compatibility).
 
 None. The session manager (`pkg/transport/session`) is trigger-agnostic and unchanged;
 only the proxy call sites that create sessions move behind the Legacy branch.
+
+#### Middleware and Observability
+
+The middleware chain is session-agnostic and needs no structural change. Authentication,
+token exchange, tool filtering, authorization, audit, and rate limiting all operate on the
+raw request plus the authenticated identity reconstructed from the token per request; none
+requires a session object or keys state on the MCP protocol session id (`Mcp-Session-Id`):
+
+- **Authorization (Cedar)** reconstructs its principal from the token per request. The
+  tool-annotation cache is keyed by tool name (not session) and full-replaced on each
+  `tools/list`, so the per-request routing token never touches it.
+- **Rate limiting** is keyed on principal and tool, so it does not collapse into per-request
+  buckets when sessions disappear.
+- **Audit** derives its subject client name/version from token claims, not the handshake (the
+  `mcp_initialize` event's target name still reflects the handshake `clientInfo`, but no
+  subject/identity field depends on it).
+
+Note the codebase has two distinct "session" concepts: token exchange keys on the JWT `tsid`
+claim — the embedded auth server's upstream-token session — which is independent of the MCP
+protocol session and unaffected by this change.
+
+The one observability touchpoint is telemetry span attributes, and the new revision supplies
+them per request rather than losing them:
+
+- `mcp.protocol.version` is read from the `MCP-Protocol-Version` header, which is mandatory on
+  every Modern POST — present, and more reliably than under Legacy where the header was optional.
+- `mcp.client.name` is today set only on the `initialize` span. Under Modern, telemetry instead
+  reads `clientInfo` from per-request `_meta` (surfaced by the parser) and sets the attribute on
+  every span — richer per-request attribution than Legacy, where the name appeared only on the
+  `initialize` span.
+- `mcp.session.id` is intentionally absent under Modern; W3C trace context carried in `_meta`
+  (already consumed per request by the telemetry middleware) is the cross-request correlation
+  mechanism.
+
+The only code change is telemetry-side: consume `clientInfo` from the parser's `_meta` fields and
+set `mcp.client.name` on all spans instead of only on `initialize`.
 
 ## Security Considerations
 
