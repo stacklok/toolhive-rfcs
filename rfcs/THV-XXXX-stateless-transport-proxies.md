@@ -86,17 +86,19 @@ independent revisions, giving a client × backend matrix:
 |--------|---------|----------------|
 | Legacy | Legacy | Today's path, unchanged. |
 | Modern | Modern | Stateless pass-through. |
-| Legacy | Modern | Gateway must terminate the handshake itself (deferred). |
-| Modern | Legacy | Gateway must synthesize `initialize` toward the backend (deferred). |
+| Legacy | Modern | Unbridged — spec marks this "Fails" (no client fall-forward). Deferred to vMCP. |
+| Modern | Legacy | Client's probe-then-fallback downgrades to `initialize`; the pass-through proxy forwards and classifies it Legacy. No new proxy work. |
 
-The two diagonal cells are the scope of this RFC. The off-diagonal cells require the
-gateway to translate between eras; they are deferred (see Alternatives). The MCP
-specification's probe-then-fallback mechanism is normative but only protects a client
-talking *directly* to a server — its compatibility matrix marks the Legacy-client /
-Modern-server case as "Fails" — so only a gateway could bridge it. The agentgateway
-project reached the same conclusion: it ships the diagonals and the Modern-client /
-Legacy-server synthetic-initialize path, and deliberately declined the Legacy-client /
-Modern-server case as unsound.
+The two diagonal cells are the scope of this RFC. The **Modern-client / Legacy-server**
+cell needs no proxy work either: the MCP-normative probe-then-fallback runs client-side,
+so the client downgrades to an `initialize` handshake that the transparent proxy forwards
+to the Legacy backend and classifies as Legacy. That leaves only the **Legacy-client /
+Modern-server** cell genuinely unbridged — the spec's compatibility matrix marks it
+"Fails" ("Legacy clients have no fall-forward mechanism"), so only a gateway could bridge
+it, and that work belongs to vMCP. The agentgateway project, as an aggregator that cannot
+rely on transparent pass-through, instead actively synthesizes the handshake for the
+Modern-client / Legacy-server cell (`stateless_send_and_initialize`); it likewise leaves
+Legacy-client / Modern-server unbridged.
 
 ### Detailed Design
 
@@ -120,13 +122,16 @@ not consulted.
 sticky-session machinery (session guard, pod-pinning, init-body storage, re-init replay,
 backend-SID rewrite) simply does not engage. Because there is no shared pipe, Go's
 `http.Transport` correlates responses to requests natively and the Modern path collapses
-to a plain reverse proxy. The internal health-monitor gate must not "default ready" for
-Modern (that would start the monitor before the backend is warm and risk self-stopping
-the proxy); it should gate off the first successful backend contact.
+to a plain reverse proxy. The internal health-monitor gate today flips ready on the `initialize` 200 or a
+`Mcp-Session-Id` response header — neither of which occurs on the Modern path, so the
+gate would never open. The Modern path must therefore acquire an alternate readiness
+trigger: gate off the first successful backend contact (and never default the gate ready,
+which would start the monitor before the backend is warm and risk self-stopping the proxy).
 
 **Parser vocabulary.** Register `server/discover` (currently unlabeled, yielding an
-empty resource ID) and the mandatory Modern request headers `Mcp-Method` / `Mcp-Name`
-so they are labeled for authz/audit; source `clientInfo`/protocolVersion from `_meta`
+empty resource ID) and the Modern request headers `Mcp-Method` (required on all requests)
+/ `Mcp-Name` (required for `tools/call`, `resources/read`, `prompts/get`) so they are
+labeled for authz/audit; source `clientInfo`/protocolVersion from `_meta`
 for Modern requests.
 
 #### API Changes
@@ -197,7 +202,8 @@ uniqueness is what prevents the cross-delivery leak described in the threat mode
 
 - `_meta` is decoded with guarded type assertions; malformed or absent metadata
   classifies as Legacy, preserving the existing session guard (fail-safe direction).
-- `Mcp-Method` / `Mcp-Name` (and `MCP-Protocol-Version`) are validated against the body;
+- `Mcp-Method` (all requests) / `Mcp-Name` (`tools/call`, `resources/read`, `prompts/get`)
+  and `MCP-Protocol-Version` are validated against the body;
   mismatch is rejected with `-32020`. As an intermediary that reads bodies for
   authz/audit, the proxy should verify that the protocol version indicates a
   header-validation-required revision before trusting any mirrored header value.
@@ -258,9 +264,10 @@ field. Audit labeling must source it per request. It remains a structured log fi
   Legacy-client / Modern-server and Modern-client / Legacy-server.
 - Pros: any client reaches any backend regardless of era.
 - Cons: the Legacy-client / Modern-server cell requires the gateway to synthesize and
-  hold session state the spec has no client-side fallback for; agentgateway assessed the
-  equivalent as "theoretically unsound" and declined it. It is also more naturally a
-  gateway-aggregation concern than a transport-proxy one.
+  hold session state the spec has no client-side fallback for — the spec's own
+  compatibility matrix marks this cell "Fails" ("Legacy clients have no fall-forward
+  mechanism"). It is also more naturally a gateway-aggregation concern than a
+  transport-proxy one.
 - Why not chosen: deferred; the cross-generation bridge belongs to vMCP ([toolhive#5756]).
   This RFC scopes to the diagonal cells and relies on the spec-normative client fallback
   for Modern-client / Legacy-server.
@@ -284,8 +291,9 @@ depend on it and this RFC proposes decoupling that edge.
 The binary Modern/Legacy classification suffices while there is a single Modern revision.
 When a second ships, `DiscoverResult.supportedVersions` and
 `UnsupportedProtocolVersionError.data.supported` are version lists, so the classifier
-would need real version-string negotiation rather than a boolean; the `ClassifyRevision`
-signature accommodates this by returning a richer `Revision` if needed.
+would need real version-string negotiation rather than a boolean. `ClassifyRevision` is
+the single extension point for that: `Revision` would grow from an enum into a type that
+carries the negotiated version string — a signature-level change, not a drop-in.
 
 ## Implementation Plan
 
