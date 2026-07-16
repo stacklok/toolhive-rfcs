@@ -82,25 +82,29 @@ flowchart TD
 ```
 
 The proxy fronts one backend and serves whatever client connects; the two sides have
-independent revisions, giving a client × backend matrix:
+independent revisions. The draft spec defines three client kinds — Legacy, Modern
+(Modern-only, no fallback), and Dual-era (probe-then-fallback) — giving:
 
-| Client | Backend | Proxy behavior |
-|--------|---------|----------------|
-| Legacy | Legacy | Today's path, unchanged. |
-| Modern | Modern | Stateless pass-through. |
-| Legacy | Modern | Unbridged — spec marks this "Fails" (no client fall-forward). Deferred to vMCP. |
-| Modern | Legacy | Client's probe-then-fallback downgrades to `initialize`; the pass-through proxy forwards and classifies it Legacy. No new proxy work. |
+| Client          | Backend | Proxy behavior |
+|-----------------|---------|----------------|
+| Legacy          | Legacy  | Today's path, unchanged. |
+| Modern/Dual-era | Modern  | Stateless pass-through. |
+| Legacy          | Modern  | Unbridged — spec marks "Fails" (no client fall-forward). Deferred to vMCP. |
+| Dual-era        | Legacy  | Client probes, falls back to `initialize`; proxy forwards and classifies Legacy. No new proxy work. |
+| Modern-only     | Legacy  | Spec marks "Fails" — client has no fallback. Client-side gap, outside proxy scope. |
 
-The two diagonal cells are the scope of this RFC. The **Modern-client / Legacy-server**
-cell needs no proxy work either: the MCP-normative probe-then-fallback runs client-side,
-so the client downgrades to an `initialize` handshake that the transparent proxy forwards
-to the Legacy backend and classifies as Legacy. That leaves only the **Legacy-client /
-Modern-server** cell genuinely unbridged — the spec's compatibility matrix marks it
-"Fails" ("Legacy clients have no fall-forward mechanism"), so only a gateway could bridge
-it, and that work belongs to vMCP. The agentgateway project, as an aggregator that cannot
-rely on transparent pass-through, instead actively synthesizes the handshake for the
-Modern-client / Legacy-server cell (`stateless_send_and_initialize`); it likewise leaves
-Legacy-client / Modern-server unbridged.
+The era-matched cells are the scope of this RFC. The **Dual-era-client / Legacy-server**
+cell needs no proxy work either: the MCP-normative probe-then-fallback runs client-side, so a
+dual-era client downgrades to an `initialize` handshake that the transparent proxy forwards to
+the Legacy backend and classifies as Legacy. In practice this is the common transition case —
+the go-sdk and TS SDK both act as dual-era clients. A *Modern-only* client against a Legacy
+server has no fallback and the spec marks it "Fails"; that is a client-side gap, outside proxy
+scope. That leaves the **Legacy-client / Modern-server** cell genuinely unbridged on the proxy
+side — the spec marks it "Fails" ("Legacy clients have no fall-forward mechanism"), so only a
+gateway could bridge it, and that work belongs to vMCP. The agentgateway project, as an
+aggregator that cannot rely on transparent pass-through, instead actively synthesizes the
+handshake when fronting a Legacy server for a Modern/dual-era client
+(`stateless_send_and_initialize`); it likewise leaves Legacy-client / Modern-server unbridged.
 
 ### Detailed Design
 
@@ -129,12 +133,30 @@ to a plain reverse proxy. The internal health-monitor gate today flips ready on 
 gate would never open. The Modern path must therefore acquire an alternate readiness
 trigger: gate off the first successful backend contact (and never default the gate ready,
 which would start the monitor before the backend is warm and risk self-stopping the proxy).
+This gate is the internal monitor's start condition and its shutdown-on-failure trigger — it is
+distinct from the `/health` endpoint served to Kubernetes probes, which pings the backend
+independently and is unaffected.
+Note the existing `StatelessMCPPinger` POSTs a JSON-RPC `ping`, which is **removed in 2026-07-28** —
+a Modern-only backend rejects it, so the Modern readiness signal must use `server/discover` or plain
+successful backend contact, not the current pinger.
 
-**Parser vocabulary.** Register `server/discover` (currently unlabeled, yielding an
-empty resource ID) and the Modern request headers `Mcp-Method` (required on all requests)
-/ `Mcp-Name` (required for `tools/call`, `resources/read`, `prompts/get`) so they are
-labeled for authz/audit; source `clientInfo`/protocolVersion from `_meta`
-for Modern requests (consumed by telemetry — see Middleware and Observability).
+**Modern message-shape enforcement.** For Modern-classified traffic (Legacy unchanged), reject
+JSON-RPC batches (accepted today via `resolveSessionForBatch`) and client-sent responses (accepted
+today via `handleNotificationOrClientResponse`); `GET`/`DELETE`→405; ignore `Mcp-Session-Id` and
+`Last-Event-ID` (not errors). Enforcement is driven off the validated `Revision` that
+`ClassifyRevision` returns for the request — **not** a re-read of the client-controlled
+`MCP-Protocol-Version` header — so a client cannot flip enforcement by spoofing the header.
+Because `ClassifyRevision` already rejects a header/`_meta` mismatch with `-32020`, the value
+enforced against is trusted rather than raw.
+
+**Parser vocabulary and authz registration.** Register `server/discover` (currently unlabeled,
+yielding an empty resource ID) and the Modern request headers `Mcp-Method` (required on all
+requests) / `Mcp-Name` (required for `tools/call`, `resources/read`, `prompts/get`); source
+`clientInfo`/protocolVersion from `_meta` (consumed by telemetry — see Middleware and Observability).
+Parser labeling is **not sufficient for authorization**: `server/discover` and `subscriptions/listen`
+are absent from `pkg/authz/middleware.go`'s `MCPMethodToFeatureOperation` and unknown methods are
+default-denied there, so both must also be added to the authz map (`server/discover` allowed;
+`subscriptions/listen` recognized so it is not 403'd, even though its delivery is deferred).
 
 #### API Changes
 
@@ -149,12 +171,23 @@ type Revision int // Legacy, Modern
 func ClassifyRevision(method string, meta map[string]any, protoHeader string) (Revision, error)
 ```
 
-Classification rule: **Modern** iff `_meta` carries
-`io.modelcontextprotocol/protocolVersion` (required on every Modern request); on
-Streamable HTTP that value is mirrored into the `MCP-Protocol-Version` header, and a
-header/body mismatch is rejected with `400` and JSON-RPC error `-32020` (the body is
-authoritative). **Legacy** otherwise, with `method == "initialize"` marking session
-start. A malformed or absent `_meta` classifies as Legacy — the safe direction.
+A committed but unwired starting point exists — `pkg/mcp/revision.go`'s `ClassifyRevision`
+implements the basic decision and the `-32020` header check (unit-tested, called nowhere). This
+RFC wires it in and **deepens it** into validation, not key-sniffing:
+
+- **Modern** iff `_meta` carries `io.modelcontextprotocol/protocolVersion`; **Legacy** otherwise,
+  with `method == "initialize"` marking session start.
+- **Version match, not presence.** An unknown/future version → `-32022 UnsupportedProtocolVersion`
+  (not implemented in `revision.go` today).
+- **Required metadata.** Modern requests must carry `clientInfo` and `clientCapabilities`; a
+  missing required capability → `-32021 MissingRequiredClientCapability`.
+- **No silent downgrade.** A request whose `MCP-Protocol-Version` header claims Modern but whose
+  `_meta` is absent/malformed is an **error**, not a Legacy fallback. "Malformed → Legacy" applies
+  only when there is *no* Modern signal at all; a request that claims Modern then fails validation
+  must not be downgraded (or a client could dodge Modern enforcement with broken metadata).
+- **Header/body: neither wins.** On Streamable HTTP the version is mirrored into the
+  `MCP-Protocol-Version` header; a mismatch is rejected with `400` + `-32020 HeaderMismatch`. Do not
+  treat the body as authoritative and proceed.
 
 #### Configuration Changes
 
@@ -202,6 +235,43 @@ them per request rather than losing them:
 
 The only code change is telemetry-side: consume `clientInfo` from the parser's `_meta` fields and
 set `mcp.client.name` on all spans instead of only on `initialize`.
+
+#### Request-scoped streaming (designed, deferred)
+
+In 2026-07-28 the standalone GET SSE stream is gone but streaming is not: one POST request may
+return an SSE stream of N server→client notifications (`notifications/progress`,
+`notifications/message`) then a single terminal response. The in-scope changes forward only the
+terminal response; this deferred work forwards the notifications too. This is **stdio-only** — the transparent proxy
+(HTTP/remote, k8s) already streams N-message POST responses natively (`FlushInterval:-1`). The stdio
+streamable proxy is one-request-one-response and drops notifications at `dispatcher.go:23`; note
+this is a **pre-existing gap**, dropped on 2025-11-25 too, not Modern-specific.
+
+Shape (extends, not replaces, the existing rewrite/waiter seam): replace the buffer-1 waiter with a
+per-request stream registered under two keys — the composite id (terminal) and a proxy-rewritten
+`progressToken` (client-chosen, collides across sessions, so rewritten/restored like the request id);
+turn the one-shot handler into a loop that forwards each notification as an SSE event and closes on
+the terminal response; stop dropping notifications in dispatch; hand off to a per-stream bounded
+buffer so a slow client cannot head-of-line-block others (drop oldest *progress* under pressure,
+never the terminal); propagate a downstream disconnect as upstream cancellation.
+
+Two constraints make this a distinct, deferred piece:
+- **Test inversion (required).** `TestHTTPRequestIgnoresNotifications` and the batch spec tests
+  currently *assert* notifications are dropped; the fix must invert them — the notification-delivery
+  test is the acceptance criterion.
+- **Logging attribution is a protocol-level limit.** `notifications/progress` carries a
+  `progressToken` and routes cleanly; `notifications/message` (logging) carries no correlation
+  token, so over multiplexed stdio it cannot be attributed per-request — broadcast-or-drop only.
+  Progress works; logging is best-effort. This bounds what "streaming works" can mean for stdio.
+
+#### Deferred: subscriptions
+
+`subscriptions/listen` (replaces `resources/subscribe` + the GET SSE stream) is a long-lived
+POST-response stream: an `acknowledged` first frame carrying a `subscriptionId`, then unbounded
+change notifications until disconnect. Additive on the request-scoped streaming work (a third demux key; a generalized close
+predicate; indefinite lifetime), but with two genuinely new and costly pieces — disconnect-driven
+teardown of many concurrent indefinite streams (leak risk), and a **streaming authorization filter**
+(the buffer-then-filter `ResponseFilteringWriter` cannot filter a live stream; per-message policy is
+a new enforcement mode). Deferred until subscription demand is demonstrated.
 
 ## Security Considerations
 
@@ -335,58 +405,69 @@ carries the negotiated version string — a signature-level change, not a drop-i
 
 ## Implementation Plan
 
-### Phase 1: Classifier and parser vocabulary (no behavior change)
+The in-scope changes are grouped by component; each is independently shippable, and everything
+classifies as Legacy by default so existing traffic is unchanged until a Modern request arrives.
 
-- Add `ClassifyRevision`; wire it at the decode points; store `Revision` in transparent-proxy
-  session metadata.
-- Register `server/discover`, `Mcp-Method`, `Mcp-Name` in the parser; source `clientInfo`
-  from `_meta` for Modern requests.
+### In scope — changes to make
 
-### Phase 2: Streamable proxy — Modern is stateless
+- **Revision classifier, parser, authz.** Wire the committed `ClassifyRevision`
+  (`pkg/mcp/revision.go`) at the decode points and deepen it (`-32022` unsupported version, required
+  `clientInfo`/`clientCapabilities`, no silent downgrade, `-32020` on mismatch); store `Revision` in
+  transparent-proxy session metadata. Register `server/discover`, `Mcp-Method`, `Mcp-Name` in the
+  parser; source `clientInfo` from `_meta`. Add authz-map (`MCPMethodToFeatureOperation`) entries for
+  `server/discover` + `subscriptions/listen` — parser labeling alone leaves them default-denied.
+- **Streamable proxy (Modern stateless + shape enforcement).** For Modern, unconditionally mint a
+  per-request routing token and ignore client `Mcp-Session-Id`; do not mint a session. Behind the
+  Legacy/Modern mode flag, reject Modern batches and client-sent responses; GET/DELETE→405.
+- **Transparent proxy.** Gate the session guard, pod-pinning, re-init replay, and backend-SID rewrite
+  on Legacy; give the health monitor a Modern readiness trigger (first backend contact /
+  `server/discover`), not the `ping`-based `StatelessMCPPinger`.
+- **Telemetry.** Set `mcp.client.name` on all spans from `_meta.clientInfo`.
 
-- Unconditionally mint a per-request routing token and ignore client `Mcp-Session-Id`
-  for Modern; do not mint a session.
+### Deferred (designed above, built separately)
 
-### Phase 3: Transparent proxy — gate the initialize-triggered machinery
-
-- Gate the session guard, pod-pinning, re-init replay, and backend-SID rewrite on Legacy;
-  gate the health monitor off first backend contact rather than defaulting ready.
-
-### Phase 4 (deferred): Off-diagonal translation
-
-- Only if the cross-era cells are taken on for the transport proxies; otherwise this stays
-  with vMCP.
+- **Request-scoped streaming** (stdio streamable proxy): the one-shot→streaming dispatcher rework,
+  `progressToken` demux, backpressure, and the test inversion. Lower-impact, stdio-only.
+- **Subscriptions** (`subscriptions/listen` + streaming authz filter): gated on demand.
+- **Legacy-client/Modern-server bridge**: belongs to vMCP ([toolhive#5756]); needs backend-revision
+  detection (probe `server/discover` on stdio; inspect the `400` body on HTTP).
 
 ### Dependencies
 
-None blocking. Independent of [toolhive#5754] (see Compatibility). Off-diagonal work, if
-pursued, needs backend-revision detection (probe `server/discover` on stdio backends;
-inspect the `400` body on HTTP backends).
+None blocking. Independent of [toolhive#5754] (see Compatibility).
 
 ## Testing Strategy
 
-- **Unit**: `ClassifyRevision` truth table (Modern `_meta`, absent/malformed `_meta`,
-  `initialize`, header/body mismatch → `-32020`).
+- **Unit**: `ClassifyRevision` truth table — Modern `_meta`, absent/malformed `_meta`,
+  `initialize`, header/body mismatch → `-32020`, unsupported version → `-32022`, and
+  Modern-header-with-broken-`_meta` → error (not Legacy downgrade).
 - **Integration**: dual-era matrix — Legacy and Modern requests against the same endpoint;
   verify Legacy session behavior is unchanged and Modern requests mint no session and emit
-  no `Mcp-Session-Id`.
+  no `Mcp-Session-Id`; Modern batches / client-sent responses rejected.
 - **Security**: concurrency test asserting no response cross-delivery for concurrent Modern
   requests sharing a JSON-RPC id, one carrying a foreign session header.
 - **Kubernetes**: Modern request to a multi-replica backend routes without pod-pinning and
   does not re-initialize on backend `404`; the internal monitor does not self-stop on a
   cold-starting Modern backend.
+- **Health**: pinger against a Modern backend that rejects `ping` (the removed-method case).
+- **Conformance**: the existing job (`test/conformance/`, #5806) runs the upstream suite against
+  the **HTTP/transparent** path on spec `2025-06-18`, so it does **not** cover the stdio streamable
+  proxy or 2026-07-28 — it is not a safety net for this work. A stdio-backend run and a
+  2026-07-28-capable upstream version are deferred as a separate testing item.
+- **Streaming (when built)**: the notification-delivery test that **inverts**
+  `TestHTTPRequestIgnoresNotifications` and the batch spec tests, which today assert the drop.
 
 ## Documentation
 
 - Architecture doc: `docs/arch/stateless-transport-proxies-design.md` (already drafted,
   [toolhive#5808]) — this RFC is its decision-level counterpart.
-- Update `docs/arch/03-transport-architecture.md` when Phase 2/3 land.
+- Update `docs/arch/03-transport-architecture.md` when the proxy changes land.
 
 ## Open Questions
 
 1. Should the revision-aware GET/DELETE gate on the transparent proxy be a refinement of
    the existing `statelessMethodGate`, or a distinct mechanism keyed on `MCP-Protocol-Version`?
-2. Timing: file the Phase 1–3 implementation issues on acceptance, or after go-sdk v1.7
+2. Timing: file the implementation issues on acceptance, or after go-sdk v1.7
    final (given the spec is still finalizing)?
 3. Do we want the optional future tie-in where `--stateless` implies an "assume Modern"
    fast-path, or keep the two strictly orthogonal?
